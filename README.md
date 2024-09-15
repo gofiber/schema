@@ -1,14 +1,6 @@
-# gorilla/schema
+# gofiber/schema
 
-![testing](https://github.com/gorilla/schema/actions/workflows/test.yml/badge.svg)
-[![codecov](https://codecov.io/github/gorilla/schema/branch/main/graph/badge.svg)](https://codecov.io/github/gorilla/schema)
-[![godoc](https://godoc.org/github.com/gorilla/schema?status.svg)](https://godoc.org/github.com/gorilla/schema)
-[![sourcegraph](https://sourcegraph.com/github.com/gorilla/schema/-/badge.svg)](https://sourcegraph.com/github.com/gorilla/schema?badge)
-
-
-![Gorilla Logo](https://github.com/gorilla/.github/assets/53367916/d92caabf-98e0-473e-bfbf-ab554ba435e5)
-
-Package gorilla/schema converts structs to and from form values.
+Package gofiber/schema converts structs to and from form values.
 
 ## Example
 
