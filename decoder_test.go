@@ -1604,6 +1604,23 @@ func TestRequiredStructFiled(t *testing.T) {
 	}
 }
 
+type Node struct {
+	Value int   `schema:"val,required"`
+	Next  *Node `schema:"next,required"`
+}
+
+func TestRecursiveStruct(t *testing.T) {
+	v := map[string][]string{
+		"val":      {"1"},
+		"next.val": {"2"},
+	}
+	var a Node
+	err := NewDecoder().Decode(&a, v)
+	if err != nil {
+		t.Errorf("error: %v", err)
+	}
+}
+
 func TestRequiredFieldIsMissingCorrectError(t *testing.T) {
 	type RM1S struct {
 		A string `schema:"rm1aa,required"`
