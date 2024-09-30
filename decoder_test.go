@@ -2527,3 +2527,61 @@ func TestDecoder_SetMaxSize(t *testing.T) {
 		}
 	})
 }
+
+func BenchmarkSimpleStructDecode(b *testing.B) {
+	type S struct {
+		A string  `schema:"a"`
+		B int     `schema:"b"`
+		C bool    `schema:"c"`
+		D float64 `schema:"d"`
+		E struct {
+			F float64 `schema:"f"`
+		} `schema:"e"`
+	}
+	s := S{}
+	data := map[string][]string{
+		"a":   {"abc"},
+		"b":   {"123"},
+		"c":   {"true"},
+		"d":   {"3.14"},
+		"e.f": {"3.14"},
+	}
+	decoder := NewDecoder()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		decoder.Decode(&s, data)
+	}
+}
+
+func BenchmarkCheckRequiredFields(b *testing.B) {
+	type S struct {
+		A string `schema:"a,required"`
+		B int    `schema:"b,required"`
+		C bool   `schema:"c,required"`
+		D struct {
+			E float64 `schema:"e,required"`
+		} `schema:"d,required"`
+	}
+	s := S{}
+	data := map[string][]string{
+		"a":   {"abc"},
+		"b":   {"123"},
+		"c":   {"true"},
+		"d.e": {"3.14"},
+	}
+	decoder := NewDecoder()
+	b.ResetTimer()
+
+	v := reflect.ValueOf(s)
+	//v = v.Elem()
+	t := v.Type()
+	var errs MultiError
+	for i := 0; i < b.N; i++ {
+		errs = decoder.checkRequired(t, data)
+	}
+
+	if len(errs) != 0 {
+		b.Fatalf("unexpected errors: %v", errs)
+	}
+}
