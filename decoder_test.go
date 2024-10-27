@@ -2567,7 +2567,7 @@ func BenchmarkSimpleStructDecode(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		decoder.Decode(&s, data)
+		_ = decoder.Decode(&s, data)
 	}
 }
 
