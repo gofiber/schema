@@ -24,6 +24,16 @@ type inner struct {
 	F12 int
 }
 
+type SimpleStructForBenchmarkEncode struct {
+	A string  `schema:"a"`
+	B int     `schema:"b"`
+	C bool    `schema:"c"`
+	D float64 `schema:"d"`
+	E struct {
+		F float64 `schema:"f"`
+	} `schema:"e"`
+}
+
 func TestFilled(t *testing.T) {
 	f07 := "seven"
 	var f08 int8 = 8
@@ -522,4 +532,266 @@ func TestRegisterEncoderWithPtrType(t *testing.T) {
 	valsLength(t, 2, vals)
 	valExists(t, "DateStart", ss.DateStart.time.String(), vals)
 	valExists(t, "DateEnd", "", vals)
+}
+
+func TestTimeDurationEncoding(t *testing.T) {
+	type DurationStruct struct {
+		Timeout time.Duration `schema:"timeout"`
+	}
+
+	vals := map[string][]string{}
+	testData := DurationStruct{
+		Timeout: 3 * time.Minute,
+	}
+
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
+		d := v.Interface().(time.Duration)
+		return d.String() // "3m0s"
+	})
+
+	err := enc.Encode(&testData, vals)
+	if err != nil {
+		t.Fatalf("Failed to encode time.Duration: %v", err)
+	}
+
+	got, ok := vals["timeout"]
+	if !ok || len(got) < 1 {
+		t.Fatalf("Encoded map missing key 'timeout'")
+	}
+	if got[0] != (3 * time.Minute).String() {
+		t.Errorf("Expected %q, got %q", (3 * time.Minute).String(), got[0])
+	}
+}
+
+// Test for omitempty with zero time.Duration.
+func TestTimeDurationOmitEmpty(t *testing.T) {
+	type DurationStruct struct {
+		Timeout time.Duration `schema:"timeout,omitempty"`
+	}
+
+	vals := map[string][]string{}
+	testData := DurationStruct{
+		Timeout: 0,
+	}
+
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
+		return v.Interface().(time.Duration).String()
+	})
+
+	err := enc.Encode(&testData, vals)
+	if err != nil {
+		t.Fatalf("Failed to encode time.Duration: %v", err)
+	}
+	// Should be omitted since 0 for time.Duration is "zero" and tagged as omitempty
+	if _, found := vals["timeout"]; found {
+		t.Errorf("Expected 'timeout' to be omitted, but it was present: %v", vals["timeout"])
+	}
+}
+
+func TestEncoderZeroAndNonZeroFields(t *testing.T) {
+	type ZeroTestStruct struct {
+		A string  `schema:"a,omitempty"`
+		B int     `schema:"b,omitempty"`
+		C float64 `schema:"c,omitempty"`
+		D bool    `schema:"d,omitempty"`
+		E *int    `schema:"e,omitempty"`
+		F *string `schema:"f,omitempty"`
+		G string  `schema:"g"` // no omitempty
+	}
+
+	vals := map[string][]string{}
+	intVal := 42
+	strVal := "Hello"
+	s := ZeroTestStruct{
+		A: "",
+		B: 0,
+		C: 0.0,
+		D: false,
+		E: &intVal,
+		F: &strVal,
+		G: "MustEncode",
+	}
+
+	enc := NewEncoder()
+	err := enc.Encode(&s, vals)
+	if err != nil {
+		t.Fatalf("Encoding error: %v", err)
+	}
+
+	// Fields A, B, C, D are zero and should be omitted
+	if _, found := vals["a"]; found {
+		t.Errorf("Expected 'a' to be omitted for zero string")
+	}
+	if _, found := vals["b"]; found {
+		t.Errorf("Expected 'b' to be omitted for zero int")
+	}
+	if _, found := vals["c"]; found {
+		t.Errorf("Expected 'c' to be omitted for zero float")
+	}
+	if _, found := vals["d"]; found {
+		t.Errorf("Expected 'd' to be omitted for false bool")
+	}
+
+	// E is a pointer to an int, so it should appear
+	gotE, found := vals["e"]
+	if !found {
+		t.Error("Expected 'e' to be present")
+	} else if len(gotE) != 1 || gotE[0] != "42" {
+		t.Errorf("Expected '42', got %v", gotE)
+	}
+
+	// F is a pointer to string, so it should appear
+	gotF, found := vals["f"]
+	if !found {
+		t.Error("Expected 'f' to be present")
+	} else if len(gotF) != 1 || gotF[0] != "Hello" {
+		t.Errorf("Expected 'Hello', got %v", gotF)
+	}
+
+	// G has no omitempty tag and must be encoded
+	gotG, found := vals["g"]
+	if !found {
+		t.Error("Expected 'g' to be present")
+	} else if len(gotG) != 1 || gotG[0] != "MustEncode" {
+		t.Errorf("Expected 'MustEncode', got %v", gotG)
+	}
+}
+
+func BenchmarkSimpleStructEncode(b *testing.B) {
+	s := SimpleStructForBenchmarkEncode{
+		A: "abc",
+		B: 123,
+		C: true,
+		D: 3.14,
+		E: struct {
+			F float64 `schema:"f"`
+		}{F: 6.28},
+	}
+	enc := NewEncoder()
+
+	vals := map[string][]string{}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = enc.Encode(&s, vals)
+	}
+}
+
+func BenchmarkSimpleStructEncodeParallel(b *testing.B) {
+	s := SimpleStructForBenchmarkEncode{
+		A: "abc",
+		B: 123,
+		C: true,
+		D: 3.14,
+		E: struct {
+			F float64 `schema:"f"`
+		}{F: 6.28},
+	}
+	enc := NewEncoder()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		vals := map[string][]string{}
+		for pb.Next() {
+			_ = enc.Encode(&s, vals)
+		}
+	})
+}
+
+type LargeStructForBenchmarkEncode struct {
+	F1 string   `schema:"f1"`
+	F2 string   `schema:"f2"`
+	F3 int      `schema:"f3"`
+	F4 int      `schema:"f4"`
+	F5 []string `schema:"f5"`
+	F6 []int    `schema:"f6"`
+	F7 float64  `schema:"f7"`
+	F8 bool     `schema:"f8"`
+	F9 struct {
+		N1 time.Time `schema:"n1"`
+		N2 string    `schema:"n2"`
+	} `schema:"f9"`
+}
+
+func BenchmarkLargeStructEncode(b *testing.B) {
+	s := LargeStructForBenchmarkEncode{
+		F1: "Lorem", F2: "Ipsum", F3: 123, F4: 456,
+		F5: []string{"A", "B", "C", "D"},
+		F6: []int{10, 20, 30, 40},
+		F7: 3.14159, F8: true,
+		F9: struct {
+			N1 time.Time `schema:"n1"`
+			N2 string    `schema:"n2"`
+		}{
+			N1: time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			N2: "NestedStringValue",
+		},
+	}
+	enc := NewEncoder()
+
+	// Optionally register a custom encoder for time.Time
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tVal := v.Interface().(time.Time)
+		return tVal.Format(time.RFC3339)
+	})
+
+	vals := map[string][]string{}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = enc.Encode(&s, vals)
+	}
+}
+
+func BenchmarkLargeStructEncodeParallel(b *testing.B) {
+	s := LargeStructForBenchmarkEncode{
+		F1: "Lorem", F2: "Ipsum", F3: 123, F4: 456,
+		F5: []string{"A", "B", "C", "D"},
+		F6: []int{10, 20, 30, 40},
+		F7: 3.14159, F8: true,
+		F9: struct {
+			N1 time.Time `schema:"n1"`
+			N2 string    `schema:"n2"`
+		}{
+			N1: time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC),
+			N2: "NestedStringValue",
+		},
+	}
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tVal := v.Interface().(time.Time)
+		return tVal.Format(time.RFC3339)
+	})
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		vals := map[string][]string{}
+		for pb.Next() {
+			_ = enc.Encode(&s, vals)
+		}
+	})
+}
+
+func BenchmarkTimeDurationEncoding(b *testing.B) {
+	type DurationStruct struct {
+		Timeout time.Duration `schema:"timeout"`
+	}
+
+	testData := DurationStruct{
+		Timeout: 5 * time.Second,
+	}
+
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
+		return v.Interface().(time.Duration).String()
+	})
+
+	vals := map[string][]string{}
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = enc.Encode(&testData, vals)
+	}
 }
