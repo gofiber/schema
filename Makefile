@@ -14,7 +14,7 @@ audit:
 ## benchmark: 📈 Benchmark code performance
 .PHONY: benchmark
 benchmark:
-	go test ./... -benchmem -bench=. -run=^Benchmark_$
+	go test ./... -benchmem -bench=. -count=4 -run=^Benchmark_$
 
 ## coverage: ☂️  Generate coverage report
 .PHONY: coverage
