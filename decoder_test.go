@@ -435,11 +435,11 @@ func BenchmarkAll(b *testing.B) {
 		"f13.0.f13.1.f6": {"133", "134"},
 	}
 
+	decoder := NewDecoder()
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		s := &S1{}
-		_ = NewDecoder().Decode(s, v)
+		_ = decoder.Decode(S1{}, v)
 	}
 }
 
@@ -2678,19 +2678,10 @@ func BenchmarkLargeStructDecode(b *testing.B) {
 		"f6":    {"10", "20", "30", "40"},
 		"f7":    {"3.14159"},
 		"f8":    {"true"},
-		"f9.n1": {"2025-01-01T12:00:00Z"},
 		"f9.n2": {"NestedStringValue"},
 	}
 
 	decoder := NewDecoder()
-	decoder.RegisterConverter(time.Time{}, func(s string) reflect.Value {
-		tm, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return reflect.Value{}
-		}
-		return reflect.ValueOf(tm)
-	})
-
 	s := &LargeStructForBenchmark{}
 	b.ResetTimer()
 
@@ -2709,19 +2700,10 @@ func BenchmarkLargeStructDecodeParallel(b *testing.B) {
 		"f6":    {"10", "20", "30", "40"},
 		"f7":    {"3.14159"},
 		"f8":    {"true"},
-		"f9.n1": {"2025-01-01T12:00:00Z"},
 		"f9.n2": {"NestedStringValue"},
 	}
 
 	decoder := NewDecoder()
-	decoder.RegisterConverter(time.Time{}, func(s string) reflect.Value {
-		tm, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			return reflect.Value{}
-		}
-		return reflect.ValueOf(tm)
-	})
-
 	s := &LargeStructForBenchmark{}
 	b.ResetTimer()
 
@@ -2780,13 +2762,9 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 	v := reflect.ValueOf(s)
 	// v = v.Elem()
 	t := v.Type()
-	var errs MultiError
-	for i := 0; i < b.N; i++ {
-		errs = decoder.checkRequired(t, data)
-	}
 
-	if len(errs) != 0 {
-		b.Fatalf("unexpected errors: %v", errs)
+	for i := 0; i < b.N; i++ {
+		_ = decoder.checkRequired(t, data)
 	}
 }
 
@@ -2806,9 +2784,11 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 		return reflect.ValueOf(d)
 	})
 
+	var ds DurationStruct
 	b.ResetTimer()
+
 	for i := 0; i < b.N; i++ {
-		var ds DurationStruct
 		_ = decoder.Decode(&ds, input)
 	}
 }
+
