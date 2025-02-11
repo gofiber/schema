@@ -8,6 +8,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"reflect"
 	"strings"
 )
@@ -79,7 +80,18 @@ func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) 
 // Keys are "paths" in dotted notation to the struct fields and nested structs.
 //
 // See the package documentation for a full explanation of the mechanics.
-func (d *Decoder) Decode(dst interface{}, src map[string][]string) error {
+func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) error {
+	var multipartFiles map[string][]*multipart.FileHeader
+
+	if len(files) > 0 {
+		multipartFiles = files[0]
+	}
+
+	// Add files as empty string values to src in order to make path parsing work easily
+	for path := range multipartFiles {
+		src[path] = []string{""}
+	}
+
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
 		return errors.New("schema: interface must be a pointer to struct")
@@ -89,10 +101,18 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string) error {
 	errors := MultiError{}
 	for path, values := range src {
 		if parts, err := d.cache.parsePath(path, t); err == nil {
-			if err = d.decode(v, path, parts, values); err != nil {
-				errors[path] = err
+			fmt.Println(parts)
+			if filesSlice, ok := multipartFiles[path]; ok {
+				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
+					errors[path] = err
+				}
+			} else {
+				if err = d.decode(v, path, parts, values, nil); err != nil {
+					errors[path] = err
+				}
 			}
 		} else if !d.ignoreUnknownKeys {
+			fmt.Print(err)
 			errors[path] = UnknownKeyError{Key: path}
 		}
 	}
@@ -283,8 +303,73 @@ func isEmpty(t reflect.Type, value []string) bool {
 	return false
 }
 
+var (
+	multipartFileHeaderPointerType      = reflect.TypeOf(&multipart.FileHeader{})
+	sliceMultipartFileHeaderPointerType = reflect.TypeOf([]*multipart.FileHeader{})
+)
+
+// Supported multiple types:
+// *multipart.FileHeader, *[]multipart.FileHeader, []*multipart.FileHeader
+func handleMultipartField(field reflect.Value, files []*multipart.FileHeader) bool {
+	fieldType := field.Type()
+
+	// Check for *multipart.FileHeader
+	if fieldType == multipartFileHeaderPointerType {
+		field.Set(reflect.ValueOf(files[0]))
+		return true
+	}
+	fmt.Println(fieldType)
+
+	// Check for []*multipart.FileHeader
+	if fieldType == sliceMultipartFileHeaderPointerType {
+		field.Set(reflect.ValueOf(files))
+		return true
+	}
+
+	// Check for *[]*multipart.FileHeader
+	if fieldType.Kind() == reflect.Pointer {
+		fieldType = fieldType.Elem()
+
+		if field.IsNil() {
+			field.Set(reflect.New(fieldType))
+		}
+
+		if fieldType == sliceMultipartFileHeaderPointerType {
+			field.Elem().Set(reflect.ValueOf(files))
+			return true
+		}
+	}
+
+	return false
+}
+
+// Supported multiple types:
+// *multipart.FileHeader, *[]multipart.FileHeader, []*multipart.FileHeader
+func isMultipartField(typ reflect.Type) bool {
+	// Check for *multipart.FileHeader
+	if typ == multipartFileHeaderPointerType {
+		return true
+	}
+
+	// Check for []*multipart.FileHeader
+	if typ == sliceMultipartFileHeaderPointerType {
+		return true
+	}
+
+	// Check for *[]*multipart.FileHeader
+	if typ.Kind() == reflect.Ptr {
+		typ = typ.Elem()
+
+		if typ == sliceMultipartFileHeaderPointerType {
+			return true
+		}
+	}
+
+	return false
+}
+
 // decode fills a struct field using a parsed path.
-func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string) error {
+func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
 	// Get the field walking the struct fields by index.
 	for _, name := range parts[0].path {
 		if v.Type().Kind() == reflect.Ptr {
@@ -306,8 +391,14 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 
 		v = v.FieldByName(name)
 	}
+
 	// Don't even bother for unexported fields.
 	if !v.CanSet() {
+		return nil
+	}
+
+	// Check multipart files
+	if mp := handleMultipartField(v, files); mp {
 		return nil
 	}
 
@@ -336,7 +427,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			}
 			v.Set(value)
 		}
-		return d.decode(v.Index(idx), path, parts[1:], values)
+		return d.decode(v.Index(idx), path, parts[1:], values, files)
 	}
 
 	// Get the converter early in case there is one for a slice type.

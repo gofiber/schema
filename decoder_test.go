@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"mime/multipart"
 	"reflect"
 	"strings"
 	"testing"
@@ -2668,6 +2669,131 @@ func TestMultipleConversionErrors(t *testing.T) {
 	}
 }
 
+func TestDecoderMultipartFiles(t *testing.T) {
+	type S struct {
+		A string `schema:"a,required"`
+		B int    `schema:"b,required"`
+		C bool   `schema:"c,required"`
+		D struct {
+			E  float64                  `schema:"e,required"`
+			F  *multipart.FileHeader    `schema:"f,required"`
+			F2 []*multipart.FileHeader  `schema:"f2,required"`
+			F3 *[]*multipart.FileHeader `schema:"f3,required"`
+		} `schema:"d,required"`
+		G *[]*multipart.FileHeader `schema:"g,required"`
+	}
+	s := S{}
+	data := map[string][]string{
+		"a":   {"abc"},
+		"b":   {"123"},
+		"c":   {"true"},
+		"d.e": {"3.14"},
+	}
+
+	// Create dummy file headers for testing
+	dummyFile := &multipart.FileHeader{
+		Filename: "test.txt",
+		Size:     4,
+	}
+
+	dummyFile2 := &multipart.FileHeader{
+		Filename: "test2.txt",
+		Size:     4,
+	}
+
+	dummyFile3 := &multipart.FileHeader{
+		Filename: "test3.txt",
+		Size:     4,
+	}
+
+	// Create slice for file headers
+	fileHeaders := map[string][]*multipart.FileHeader{
+		"d.f":  {dummyFile, dummyFile2},
+		"d.f2": {dummyFile2, dummyFile3},
+		"d.f3": {dummyFile, dummyFile2, dummyFile3},
+		"g":    {dummyFile, dummyFile2},
+	}
+
+	decoder := NewDecoder()
+	decoder.Decode(&s, data, fileHeaders)
+
+	if s.A != "abc" {
+		t.Errorf("Expected A to be 'abc', got %s", s.A)
+	}
+
+	if s.B != 123 {
+		t.Errorf("Expected B to be 123, got %d", s.B)
+	}
+
+	if s.C != true {
+		t.Errorf("Expected C to be true, got %t", s.C)
+	}
+
+	if s.D.E != 3.14 {
+		t.Errorf("Expected D.E to be 3.14, got %f", s.D.E)
+	}
+
+	if s.D.F == nil {
+		t.Error("Expected D.F to be a file header, got nil")
+	}
+
+	if s.D.F2 == nil {
+		t.Error("Expected D.F2 to be a slice of file headers, got nil")
+	}
+
+	if s.D.F3 == nil {
+		t.Error("Expected D.F3 to be a pointer to a slice of file headers, got nil")
+	}
+
+	if s.G == nil {
+		t.Error("Expected G to be a pointer to a slice of file headers, got nil")
+	}
+
+	if len(s.D.F2) != 2 {
+		t.Errorf("Expected D.F2 to have 2 file headers, got %d", len(s.D.F2))
+	}
+
+	if len(*s.D.F3) != 3 {
+		t.Errorf("Expected D.F3 to have 3 file headers, got %d", len(*s.D.F3))
+	}
+
+	if len(*s.G) != 2 {
+		t.Errorf("Expected G to have 2 file headers, got %d", len(*s.G))
+	}
+
+	if s.D.F.Filename != "test.txt" {
+		t.Errorf("Expected D.F.Filename to be 'test.txt', got %s", s.D.F.Filename)
+	}
+
+	if s.D.F2[0].Filename != "test2.txt" {
+		t.Errorf("Expected D.F2[0].Filename to be 'test2.txt', got %s", s.D.F2[0].Filename)
+	}
+
+	if s.D.F2[1].Filename != "test3.txt" {
+		t.Errorf("Expected D.F2[1].Filename to be 'test3.txt', got %s", s.D.F2[1].Filename)
+	}
+
+	if (*s.D.F3)[0].Filename != "test.txt" {
+		t.Errorf("Expected D.F3[0].Filename to be 'test.txt', got %s", (*s.D.F3)[0].Filename)
+	}
+
+	if (*s.D.F3)[1].Filename != "test2.txt" {
+		t.Errorf("Expected D.F3[1].Filename to be 'test2.txt', got %s", (*s.D.F3)[1].Filename)
+	}
+
+	if (*s.D.F3)[2].Filename != "test3.txt" {
+		t.Errorf("Expected D.F3[2].Filename to be 'test3.txt', got %s", (*s.D.F3)[2].Filename)
+	}
+
+	if (*s.G)[0].Filename != "test.txt" {
+		t.Errorf("Expected G[0].Filename to be 'test.txt', got %s", (*s.G)[0].Filename)
+	}
+
+	if (*s.G)[1].Filename != "test2.txt" {
+		t.Errorf("Expected G[1].Filename to be 'test2.txt', got %s", (*s.G)[1].Filename)
+	}
+}
+
 func BenchmarkLargeStructDecode(b *testing.B) {
 	data := map[string][]string{
 		"f1":    {"Lorem"},
@@ -2791,4 +2917,3 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 		_ = decoder.Decode(&ds, input)
 	}
 }
-
