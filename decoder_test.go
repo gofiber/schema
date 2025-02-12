@@ -2887,8 +2887,13 @@ func BenchmarkDecoderMultipartFiles(b *testing.B) {
 	decoder := NewDecoder()
 	b.ResetTimer()
 
+	var err error
 	for i := 0; i < b.N; i++ {
-		decoder.Decode(&s, data, fileHeaders)
+		err = decoder.Decode(&s, data, fileHeaders)
+	}
+
+	if err != nil {
+		b.Fatalf("Failed to decode: %v", err)
 	}
 }
 
