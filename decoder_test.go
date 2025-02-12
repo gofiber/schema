@@ -2679,8 +2679,12 @@ func TestDecoderMultipartFiles(t *testing.T) {
 			F  *multipart.FileHeader    `schema:"f,required"`
 			F2 []*multipart.FileHeader  `schema:"f2,required"`
 			F3 *[]*multipart.FileHeader `schema:"f3,required"`
+			F4 *multipart.FileHeader    `schema:"f4,required"`
 		} `schema:"d,required"`
 		G *[]*multipart.FileHeader `schema:"g,required"`
+		J []struct {
+			K *[]*multipart.FileHeader `schema:"k,required"`
+		} `schema:"j,required"`
 	}
 	s := S{}
 	data := map[string][]string{
@@ -2708,14 +2712,20 @@ func TestDecoderMultipartFiles(t *testing.T) {
 
 	// Create slice for file headers
 	fileHeaders := map[string][]*multipart.FileHeader{
-		"d.f":  {dummyFile, dummyFile2},
-		"d.f2": {dummyFile2, dummyFile3},
-		"d.f3": {dummyFile, dummyFile2, dummyFile3},
-		"g":    {dummyFile, dummyFile2},
+		"d.f":   {dummyFile, dummyFile2},
+		"d.f2":  {dummyFile2, dummyFile3},
+		"d.f3":  {dummyFile, dummyFile2, dummyFile3},
+		"d.f4":  {},
+		"g":     {dummyFile, dummyFile2},
+		"j.0.k": {dummyFile, dummyFile2},
+		"j.1.k": {dummyFile2, dummyFile3},
 	}
 
 	decoder := NewDecoder()
-	decoder.Decode(&s, data, fileHeaders)
+	err := decoder.Decode(&s, data, fileHeaders)
+	if err != nil {
+		t.Fatalf("Failed to decode: %v", err)
+	}
 
 	if s.A != "abc" {
 		t.Errorf("Expected A to be 'abc', got %s", s.A)
@@ -2743,6 +2753,11 @@ func TestDecoderMultipartFiles(t *testing.T) {
 
 	if s.D.F3 == nil {
 		t.Error("Expected D.F3 to be a pointer to a slice of file headers, got nil")
+	}
+
+	if s.D.F4 != nil {
+		fmt.Print(s.D.F4)
+		t.Error("Expected D.F4 to be nil, got a file header")
 	}
 
 	if s.G == nil {
@@ -2791,6 +2806,282 @@ func TestDecoderMultipartFiles(t *testing.T) {
 
 	if (*s.G)[1].Filename != "test2.txt" {
 		t.Errorf("Expected G[1].Filename to be 'test2.txt', got %s", (*s.G)[1].Filename)
+	}
+
+	if s.J[0].K == nil {
+		t.Error("Expected J[0].K to be a pointer to a slice of file headers, got nil")
+	}
+
+	if s.J[1].K == nil {
+		t.Error("Expected J[1].K to be a pointer to a slice of file headers, got nil")
+	}
+
+	if len(*s.J[0].K) != 2 {
+		t.Errorf("Expected J[0].K to have 2 file headers, got %d", len(*s.J[0].K))
+	}
+
+	if len(*s.J[1].K) != 2 {
+		t.Errorf("Expected J[1].K to have 2 file headers, got %d", len(*s.J[1].K))
+	}
+
+	if (*s.J[0].K)[0].Filename != "test.txt" {
+		t.Errorf("Expected J[0].K[0].Filename to be 'test.txt', got %s", (*s.J[0].K)[0].Filename)
+	}
+
+	if (*s.J[0].K)[1].Filename != "test2.txt" {
+		t.Errorf("Expected J[0].K[1].Filename to be 'test2.txt', got %s", (*s.J[0].K)[1].Filename)
+	}
+
+	if (*s.J[1].K)[0].Filename != "test2.txt" {
+		t.Errorf("Expected J[1].K[0].Filename to be 'test2.txt', got %s", (*s.J[1].K)[0].Filename)
+	}
+
+	if (*s.J[1].K)[1].Filename != "test3.txt" {
+		t.Errorf("Expected J[1].K[1].Filename to be 'test3.txt', got %s", (*s.J[1].K)[1].Filename)
+	}
+}
+
+func BenchmarkDecoderMultipartFiles(b *testing.B) {
+	type S struct {
+		A string `schema:"a,required"`
+		B int    `schema:"b,required"`
+		C bool   `schema:"c,required"`
+		D struct {
+			E  float64                 `schema:"e,required"`
+			F  *multipart.FileHeader   `schema:"f,required"`
+			F2 []*multipart.FileHeader `schema:"f2,required"`
+		} `schema:"d,required"`
+		G *[]*multipart.FileHeader `schema:"g,required"`
+	}
+	s := S{}
+	data := map[string][]string{
+		"a":   {"abc"},
+		"b":   {"123"},
+		"c":   {"true"},
+		"d.e": {"3.14"},
+	}
+
+	// Create dummy file headers for testing
+	dummyFile := &multipart.FileHeader{
+		Filename: "test.txt",
+		Size:     4,
+	}
+
+	dummyFile2 := &multipart.FileHeader{
+		Filename: "test2.txt",
+		Size:     4,
+	}
+
+	dummyFile3 := &multipart.FileHeader{
+		Filename: "test3.txt",
+		Size:     4,
+	}
+
+	// Create slice for file headers
+	fileHeaders := map[string][]*multipart.FileHeader{
+		"d.f":  {dummyFile, dummyFile2},
+		"d.f2": {dummyFile2, dummyFile3},
+		"g":    {dummyFile, dummyFile2},
+	}
+
+	decoder := NewDecoder()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		decoder.Decode(&s, data, fileHeaders)
+	}
+}
+
+func TestIsMultipartFile(t *testing.T) {
+	t.Parallel()
+
+	tc := []struct {
+		typ      reflect.Type
+		input    map[string][]string
+		expected bool
+	}{
+		{
+			typ:      reflect.TypeOf(string("")),
+			expected: false,
+		},
+		{
+			typ:      reflect.TypeOf([]string{}),
+			expected: false,
+		},
+		{
+			typ:      reflect.TypeOf([]*multipart.FileHeader{}),
+			expected: true,
+		},
+		{
+			typ:      reflect.TypeOf(multipart.FileHeader{}),
+			expected: false,
+		},
+		{
+			typ:      reflect.TypeOf(&multipart.FileHeader{}),
+			expected: true,
+		},
+		{
+			typ:      reflect.TypeOf([]multipart.FileHeader{}),
+			expected: false,
+		},
+		{
+			typ:      reflect.TypeOf(&[]*multipart.FileHeader{}),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tc {
+		if isMultipartField(tt.typ) != tt.expected {
+			t.Errorf("Expected %v, got %v", tt.expected, isMultipartField(tt.typ))
+		}
+	}
+}
+
+func BenchmarkIsMultipartFile(b *testing.B) {
+	cases := []struct {
+		typ reflect.Type
+	}{
+		{
+			typ: reflect.TypeOf(string("")),
+		},
+		{
+			typ: reflect.TypeOf([]string{}),
+		},
+		{
+			typ: reflect.TypeOf([]*multipart.FileHeader{}),
+		},
+		{
+			typ: reflect.TypeOf(multipart.FileHeader{}),
+		},
+		{
+			typ: reflect.TypeOf(&multipart.FileHeader{}),
+		},
+		{
+			typ: reflect.TypeOf([]multipart.FileHeader{}),
+		},
+		{
+			typ: reflect.TypeOf(&[]*multipart.FileHeader{}),
+		},
+	}
+
+	for i, bc := range cases {
+		b.Run(fmt.Sprintf("IsMultipartFile-%d", i), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				isMultipartField(bc.typ)
+			}
+		})
+	}
+}
+
+func TestHandleMultipartField(t *testing.T) {
+	t.Parallel()
+
+	// Create dummy file headers for testing
+	dummyFile := &multipart.FileHeader{
+		Filename: "test.txt",
+		Size:     4,
+	}
+
+	files := map[string][]*multipart.FileHeader{
+		"f": {dummyFile},
+	}
+
+	type S struct {
+		F  *multipart.FileHeader    `schema:"f,required"`
+		F2 []*multipart.FileHeader  `schema:"f2,required"`
+		F3 *[]*multipart.FileHeader `schema:"f3,required"`
+		F4 string                   `schema:"f4,required"`
+	}
+
+	s := S{}
+	rv := reflect.ValueOf(&s).Elem()
+
+	ok := handleMultipartField(rv.FieldByName("F"), files["f"])
+	if !ok {
+		t.Error("Expected handleMultipartField to return true")
+	}
+
+	ok = handleMultipartField(rv.FieldByName("F2"), files["f"])
+	if !ok {
+		t.Error("Expected handleMultipartField to return true")
+	}
+
+	ok = handleMultipartField(rv.FieldByName("F3"), files["f"])
+	if !ok {
+		t.Error("Expected handleMultipartField to return true")
+	}
+
+	ok = handleMultipartField(rv.FieldByName("F4"), files["f"])
+	if ok {
+		t.Error("Expected handleMultipartField to return false")
+	}
+
+	if s.F == nil {
+		t.Error("Expected F to be a file header, got nil")
+	}
+
+	if s.F2 == nil {
+		t.Error("Expected F2 to be a slice of file headers, got nil")
+	}
+
+	if s.F3 == nil {
+		t.Error("Expected F3 to be a pointer to a slice of file headers, got nil")
+	}
+
+	if len(s.F2) != 1 {
+		t.Errorf("Expected F2 to have 1 file header, got %d", len(s.F2))
+	}
+
+	if len(*s.F3) != 1 {
+		t.Errorf("Expected F3 to have 1 file header, got %d", len(*s.F3))
+	}
+
+	if s.F.Filename != "test.txt" {
+		t.Errorf("Expected F.Filename to be 'test.txt', got %s", s.F.Filename)
+	}
+
+	if s.F2[0].Filename != "test.txt" {
+		t.Errorf("Expected F2[0].Filename to be 'test.txt', got %s", s.F2[0].Filename)
+	}
+
+	if (*s.F3)[0].Filename != "test.txt" {
+		t.Errorf("Expected F3[0].Filename to be 'test.txt', got %s", (*s.F3)[0].Filename)
+	}
+}
+
+func BenchmarkHandleMultipartField(b *testing.B) {
+	// Create dummy file headers for testing
+	dummyFile := &multipart.FileHeader{
+		Filename: "test.txt",
+		Size:     4,
+	}
+
+	files := map[string][]*multipart.FileHeader{
+		"f": {dummyFile},
+	}
+
+	type S struct {
+		F  *multipart.FileHeader    `schema:"f,required"`
+		F2 []*multipart.FileHeader  `schema:"f2,required"`
+		F3 *[]*multipart.FileHeader `schema:"f3,required"`
+		F4 string                   `schema:"f4,required"`
+	}
+
+	s := S{}
+	rv := reflect.ValueOf(&s).Elem()
+
+	f := rv.FieldByName("F")
+	f2 := rv.FieldByName("F2")
+	f3 := rv.FieldByName("F3")
+	f4 := rv.FieldByName("F4")
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		handleMultipartField(f, files["f"])
+		handleMultipartField(f2, files["f"])
+		handleMultipartField(f3, files["f"])
+		handleMultipartField(f4, files["f"])
 	}
 }
 

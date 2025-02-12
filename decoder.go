@@ -101,7 +101,6 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	errors := MultiError{}
 	for path, values := range src {
 		if parts, err := d.cache.parsePath(path, t); err == nil {
-			fmt.Println(parts)
 			if filesSlice, ok := multipartFiles[path]; ok {
 				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
 					errors[path] = err
@@ -112,7 +111,6 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 				}
 			}
 		} else if !d.ignoreUnknownKeys {
-			fmt.Print(err)
 			errors[path] = UnknownKeyError{Key: path}
 		}
 	}
@@ -312,13 +310,20 @@ var (
 // *multipart.FileHeader, *[]multipart.FileHeader, []*multipart.FileHeader
 func handleMultipartField(field reflect.Value, files []*multipart.FileHeader) bool {
 	fieldType := field.Type()
+	if !isMultipartField(fieldType) {
+		return false
+	}
+
+	// Skip if files are empty and field is multipart
+	if len(files) == 0 {
+		return true
+	}
 
 	// Check for *multipart.FileHeader
 	if fieldType == multipartFileHeaderPointerType {
 		field.Set(reflect.ValueOf(files[0]))
 		return true
 	}
-	fmt.Println(fieldType)
 
 	// Check for []*multipart.FileHeader
 	if fieldType == sliceMultipartFileHeaderPointerType {
