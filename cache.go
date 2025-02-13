@@ -63,13 +63,14 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		}
 		// Valid field. Append index.
 		path = append(path, field.name)
-		if field.isSliceOfStructs && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
+		if field.isSliceOfStructs && !isMultipartField(field.typ) && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
 			//
 			// Now that struct can implements TextUnmarshaler interface,
 			// we don't need to force the struct's fields to appear in the path.
 			// So checking i+2 is not necessary anymore.
+			// We can skip this part if the type is multipart.FileHeader. It is another special case too.
 			i++
 			if i+1 > len(keys) {
 				return nil, errInvalidPath
