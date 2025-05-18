@@ -310,12 +310,8 @@ func (o tagOptions) Contains(option string) bool {
 func (o tagOptions) getDefaultOptionValue() string {
 	for _, s := range o {
 		if strings.HasPrefix(s, "default:") {
-			if parts := strings.SplitN(s, ":", 2); len(parts) == 2 {
-				return parts[1]
-			}
-			return ""
+			return strings.SplitN(s, ":", 2)[1]
 		}
 	}
-
 	return ""
 }
