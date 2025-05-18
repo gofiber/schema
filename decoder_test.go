@@ -2457,6 +2457,7 @@ func TestDefaultsAreNotSupportedForStructsAndStructSlices(t *testing.T) {
 }
 
 func TestDefaultValueWithColon(t *testing.T) {
+	t.Parallel()
 	type D struct {
 		URL string `schema:"url,default:http://localhost:8080"`
 	}
