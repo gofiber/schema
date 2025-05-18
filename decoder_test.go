@@ -2456,6 +2456,22 @@ func TestDefaultsAreNotSupportedForStructsAndStructSlices(t *testing.T) {
 	}
 }
 
+func TestDefaultValueWithColon(t *testing.T) {
+	type D struct {
+		URL string `schema:"url,default:http://localhost:8080"`
+	}
+
+	var d D
+	decoder := NewDecoder()
+	if err := decoder.Decode(&d, map[string][]string{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if d.URL != "http://localhost:8080" {
+		t.Errorf("expected default url to be http://localhost:8080, got %s", d.URL)
+	}
+}
+
 func TestDecoder_MaxSize(t *testing.T) {
 	t.Parallel()
 
