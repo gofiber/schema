@@ -3071,6 +3071,31 @@ func TestHandleMultipartField(t *testing.T) {
 	}
 }
 
+func TestDecodePanicIsCaughtAndReturnedAsError(t *testing.T) {
+	type R struct {
+		N1 []*struct {
+			Value string
+		}
+	}
+	// Simulate a path that uses an invalid (e.g. negative) slice index,
+	// which can trigger a panic (e.g. reflect: slice index out of range).
+	data := map[string][]string{
+		"n1.-1.value": {"Foo"},
+	}
+
+	s := new(R)
+	decoder := NewDecoder()
+	err := decoder.Decode(s, data)
+	if err == nil {
+		t.Fatal("Expected an error when a panic occurs")
+	}
+
+	expected := "schema: panic while decoding: reflect: slice index out of range"
+	if err.Error() != expected {
+		t.Fatalf("Expected panic error message %q, got: %v", expected, err)
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{

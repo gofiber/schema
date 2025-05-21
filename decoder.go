@@ -80,7 +80,7 @@ func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) 
 // Keys are "paths" in dotted notation to the struct fields and nested structs.
 //
 // See the package documentation for a full explanation of the mechanics.
-func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) error {
+func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) (err error) {
 	var multipartFiles map[string][]*multipart.FileHeader
 
 	if len(files) > 0 {
@@ -96,28 +96,41 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
 		return errors.New("schema: interface must be a pointer to struct")
 	}
+
+	// Catch panics from the decoder and return them as an error.
+	// This is needed because the decoder calls reflect and reflect panics
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else {
+				err = fmt.Errorf("schema: panic while decoding: %v", r)
+			}
+		}
+	}()
+
 	v = v.Elem()
 	t := v.Type()
-	errors := MultiError{}
+	multiErrors := MultiError{}
 	for path, values := range src {
 		if parts, err := d.cache.parsePath(path, t); err == nil {
 			if filesSlice, ok := multipartFiles[path]; ok {
 				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
-					errors[path] = err
+					multiErrors[path] = err
 				}
 			} else {
 				if err = d.decode(v, path, parts, values, nil); err != nil {
-					errors[path] = err
+					multiErrors[path] = err
 				}
 			}
 		} else if !d.ignoreUnknownKeys {
-			errors[path] = UnknownKeyError{Key: path}
+			multiErrors[path] = UnknownKeyError{Key: path}
 		}
 	}
-	errors.merge(d.setDefaults(t, v))
-	errors.merge(d.checkRequired(t, src))
-	if len(errors) > 0 {
-		return errors
+	multiErrors.merge(d.setDefaults(t, v))
+	multiErrors.merge(d.checkRequired(t, src))
+	if len(multiErrors) > 0 {
+		return multiErrors
 	}
 	return nil
 }
