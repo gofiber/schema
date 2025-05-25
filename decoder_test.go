@@ -2473,33 +2473,6 @@ func TestDefaultValueWithColon(t *testing.T) {
 	}
 }
 
-func TestBoolDefaultAppliedOnlyWhenMissing(t *testing.T) {
-	t.Parallel()
-
-	type GetURLQuery struct {
-		Redirect bool `query:"redirect,default:true"`
-	}
-
-	dec := NewDecoder()
-	dec.SetAliasTag("query")
-
-	var v GetURLQuery
-	if err := dec.Decode(&v, map[string][]string{"redirect": {"false"}}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if v.Redirect {
-		t.Errorf("expected Redirect to be false when value is provided")
-	}
-
-	var v2 GetURLQuery
-	if err := dec.Decode(&v2, map[string][]string{}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !v2.Redirect {
-		t.Errorf("expected Redirect to be true when value missing")
-	}
-}
-
 func TestDecoder_MaxSize(t *testing.T) {
 	t.Parallel()
 
@@ -2590,6 +2563,60 @@ func TestDecoder_MaxSize(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDefaultsAppliedOnlyWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	type Data struct {
+		B bool    `schema:"b,default:true"`
+		I int     `schema:"i,default:5"`
+		F float64 `schema:"f,default:1.5"`
+		S []int   `schema:"s,default:1|2"`
+	}
+
+	dec := NewDecoder()
+
+	// Values are explicitly set – no defaults should be applied
+	withVals := Data{}
+	if err := dec.Decode(&withVals, map[string][]string{
+		"b": {"false"},
+		"i": {"0"},
+		"f": {"0"},
+		"s": {},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if withVals.B {
+		t.Errorf("B should be false when the value is set")
+	}
+	if withVals.I != 0 {
+		t.Errorf("I should be 0 when the value is set, got %d", withVals.I)
+	}
+	if withVals.F != 0 {
+		t.Errorf("F should be 0 when the value is set, got %f", withVals.F)
+	}
+	if len(withVals.S) != 0 {
+		t.Errorf("S should be empty when the value is set, got %v", withVals.S)
+	}
+
+	// No values provided – defaults should be applied
+	withoutVals := Data{}
+	if err := dec.Decode(&withoutVals, map[string][]string{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withoutVals.B {
+		t.Errorf("B should default to true when missing")
+	}
+	if withoutVals.I != 5 {
+		t.Errorf("Default I should be 5, got %d", withoutVals.I)
+	}
+	if withoutVals.F != 1.5 {
+		t.Errorf("Default F should be 1.5, got %f", withoutVals.F)
+	}
+	if !reflect.DeepEqual(withoutVals.S, []int{1, 2}) {
+		t.Errorf("Default S should be [1 2], got %v", withoutVals.S)
 	}
 }
 
