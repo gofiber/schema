@@ -2473,6 +2473,33 @@ func TestDefaultValueWithColon(t *testing.T) {
 	}
 }
 
+func TestBoolDefaultAppliedOnlyWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	type GetURLQuery struct {
+		Redirect bool `query:"redirect,default:true"`
+	}
+
+	dec := NewDecoder()
+	dec.SetAliasTag("query")
+
+	var v GetURLQuery
+	if err := dec.Decode(&v, map[string][]string{"redirect": {"false"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if v.Redirect {
+		t.Errorf("expected Redirect to be false when value is provided")
+	}
+
+	var v2 GetURLQuery
+	if err := dec.Decode(&v2, map[string][]string{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !v2.Redirect {
+		t.Errorf("expected Redirect to be true when value missing")
+	}
+}
+
 func TestDecoder_MaxSize(t *testing.T) {
 	t.Parallel()
 
