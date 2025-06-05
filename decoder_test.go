@@ -3150,6 +3150,29 @@ func TestDecodePanicIsCaughtAndReturnedAsError(t *testing.T) {
 	}
 }
 
+func TestDecodeIndexExceedsParserLimit(t *testing.T) {
+	type R struct {
+		N1 []*struct {
+			Value string
+		}
+	}
+	data := map[string][]string{
+		"n1.1001.value": {"Foo"},
+	}
+
+	s := new(R)
+	decoder := NewDecoder()
+	err := decoder.Decode(s, data)
+	if err == nil {
+		t.Fatal("Expected an error when index exceeds parser limit")
+	}
+
+	expected := MultiError{"n1.1001.value": UnknownKeyError{Key: "n1.1001.value"}}
+	if !reflect.DeepEqual(err, expected) {
+		t.Fatalf("Expected %v, got: %v", expected, err)
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{
