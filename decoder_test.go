@@ -3167,7 +3167,7 @@ func TestDecodeIndexExceedsParserLimit(t *testing.T) {
 		t.Fatal("Expected an error when index exceeds parser limit")
 	}
 
-	expected := MultiError{"n1.1001.value": UnknownKeyError{Key: "n1.1001.value"}}
+	expected := MultiError{"n1.1001.value": errIndexTooLarge}
 	if !reflect.DeepEqual(err, expected) {
 		t.Fatalf("Expected %v, got: %v", expected, err)
 	}
