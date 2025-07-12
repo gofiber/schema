@@ -104,3 +104,49 @@ func BenchmarkConvertPointer(b *testing.B) {
 		convertPointer(reflect.Int, "42")
 	}
 }
+
+type customZero struct{ A int }
+
+func (c customZero) IsZero() bool { return c.A == 0 }
+
+func TestIsZeroCases(t *testing.T) {
+	var sl []int
+	if !isZero(reflect.ValueOf(sl)) {
+		t.Errorf("nil slice should be zero")
+	}
+	sl = []int{}
+	if !isZero(reflect.ValueOf(sl)) {
+		t.Errorf("empty slice should be zero")
+	}
+	sl = []int{1}
+	if isZero(reflect.ValueOf(sl)) {
+		t.Errorf("non-empty slice considered zero")
+	}
+
+	arr := [2]int{}
+	if !isZero(reflect.ValueOf(arr)) {
+		t.Errorf("zero array should be zero")
+	}
+	arr = [2]int{0, 1}
+	if isZero(reflect.ValueOf(arr)) {
+		t.Errorf("non-zero array considered zero")
+	}
+
+	type S struct {
+		A int
+		B string
+	}
+	if !isZero(reflect.ValueOf(S{})) {
+		t.Errorf("zero struct should be zero")
+	}
+	if isZero(reflect.ValueOf(S{A: 1})) {
+		t.Errorf("non-zero struct considered zero")
+	}
+
+	if !isZero(reflect.ValueOf(customZero{})) {
+		t.Errorf("IsZero method not used for zero value")
+	}
+	if isZero(reflect.ValueOf(customZero{A: 1})) {
+		t.Errorf("IsZero method not used for non-zero value")
+	}
+}
