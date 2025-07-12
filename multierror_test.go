@@ -55,7 +55,7 @@ func TestMultiErrorMerge(t *testing.T) {
 
 func BenchmarkMultiErrorError(b *testing.B) {
 	m := MultiError{"a": errors.New("a"), "b": errors.New("b"), "c": errors.New("c")}
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = m.Error()
 	}
 }

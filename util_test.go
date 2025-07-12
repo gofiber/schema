@@ -86,7 +86,7 @@ func TestConvertPointer(t *testing.T) {
 }
 
 func BenchmarkParseTag(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		parseTag("field,omitempty,default:value")
 	}
 }
@@ -94,13 +94,13 @@ func BenchmarkParseTag(b *testing.B) {
 func BenchmarkIsZero(b *testing.B) {
 	type S struct{ A int }
 	v := reflect.ValueOf(S{})
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		isZero(v)
 	}
 }
 
 func BenchmarkConvertPointer(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		convertPointer(reflect.Int, "42")
 	}
 }

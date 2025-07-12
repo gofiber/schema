@@ -55,13 +55,13 @@ func TestBuiltinConverters(t *testing.T) {
 }
 
 func BenchmarkConvertBool(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		convertBool("true")
 	}
 }
 
 func BenchmarkConvertInt(b *testing.B) {
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		convertInt("42")
 	}
 }

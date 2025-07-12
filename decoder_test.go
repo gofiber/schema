@@ -437,9 +437,7 @@ func BenchmarkAll(b *testing.B) {
 	}
 
 	decoder := NewDecoder()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(S1{}, v)
 	}
 }
@@ -2956,10 +2954,8 @@ func BenchmarkDecoderMultipartFiles(b *testing.B) {
 	}
 
 	decoder := NewDecoder()
-	b.ResetTimer()
-
 	var err error
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err = decoder.Decode(&s, data, fileHeaders)
 	}
 
@@ -3042,7 +3038,7 @@ func BenchmarkIsMultipartFile(b *testing.B) {
 
 	for i, bc := range cases {
 		b.Run(fmt.Sprintf("IsMultipartFile-%d", i), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				isMultipartField(bc.typ)
 			}
 		})
@@ -3199,9 +3195,7 @@ func BenchmarkHandleMultipartField(b *testing.B) {
 	f3 := rv.FieldByName("F3")
 	f4 := rv.FieldByName("F4")
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		handleMultipartField(f, files["f"])
 		handleMultipartField(f2, files["f"])
 		handleMultipartField(f3, files["f"])
@@ -3224,9 +3218,7 @@ func BenchmarkLargeStructDecode(b *testing.B) {
 
 	decoder := NewDecoder()
 	s := &LargeStructForBenchmark{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(s, data)
 	}
 }
@@ -3274,9 +3266,7 @@ func BenchmarkSimpleStructDecode(b *testing.B) {
 		"e.f": {"3.14"},
 	}
 	decoder := NewDecoder()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(&s, data)
 	}
 }
@@ -3298,13 +3288,11 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 		"d.e": {"3.14"},
 	}
 	decoder := NewDecoder()
-	b.ResetTimer()
-
 	v := reflect.ValueOf(s)
 	// v = v.Elem()
 	t := v.Type()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.checkRequired(t, data)
 	}
 }
@@ -3326,9 +3314,7 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 	})
 
 	var ds DurationStruct
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(&ds, input)
 	}
 }
