@@ -27,8 +27,26 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Download gotestsum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=1.12.3
+          OS=$(uname -s)
+          case "$OS" in
+            Linux*) OS=linux;;
+            Darwin*) OS=darwin;;
+            MINGW*|MSYS*) OS=windows;;
+          esac
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) ARCH=amd64;;
+            aarch64|arm64) ARCH=arm64;;
+          esac
+          curl -sSL "https://github.com/gotestyourself/gotestsum/releases/download/v${VER}/gotestsum_${VER}_${OS}_${ARCH}.tar.gz" | tar -xz
       - name: Test
-        run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=1 -coverprofile=coverage.txt -covermode=atomic -shuffle=on
+        shell: bash
+        run: ./gotestsum -f testname -- ./... -race -count=1 -coverprofile=coverage.txt -covermode=atomic -shuffle=on
 
       - name: Upload coverage reports to Codecov
         if: ${{ matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.23.x' }}
@@ -50,5 +68,24 @@ jobs:
         with:
           go-version: stable
 
+      - name: Download gotestsum
+        shell: bash
+        run: |
+          set -euo pipefail
+          VER=1.12.3
+          OS=$(uname -s)
+          case "$OS" in
+            Linux*) OS=linux;;
+            Darwin*) OS=darwin;;
+            MINGW*|MSYS*) OS=windows;;
+          esac
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64|amd64) ARCH=amd64;;
+            aarch64|arm64) ARCH=arm64;;
+          esac
+          curl -sSL "https://github.com/gotestyourself/gotestsum/releases/download/v${VER}/gotestsum_${VER}_${OS}_${ARCH}.tar.gz" | tar -xz
+
       - name: Test
-        run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=15 -shuffle=on
+        shell: bash
+        run: ./gotestsum -f testname -- ./... -race -count=15 -shuffle=on
