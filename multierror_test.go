@@ -52,3 +52,10 @@ func TestMultiErrorMerge(t *testing.T) {
 		t.Errorf("missing merged error")
 	}
 }
+
+func BenchmarkMultiErrorError(b *testing.B) {
+	m := MultiError{"a": errors.New("a"), "b": errors.New("b"), "c": errors.New("c")}
+	for i := 0; i < b.N; i++ {
+		_ = m.Error()
+	}
+}

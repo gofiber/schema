@@ -150,3 +150,33 @@ func TestIsZeroCases(t *testing.T) {
 		t.Errorf("IsZero method not used for non-zero value")
 	}
 }
+
+func TestIsZeroFuncAndMap(t *testing.T) {
+	tests := map[string]func(){
+		"nil":     nil,
+		"non-nil": func() {},
+	}
+	for name, fn := range tests {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("expected panic for %s func", name)
+				}
+			}()
+			isZero(reflect.ValueOf(fn))
+		})
+	}
+
+	var m map[string]int
+	if !isZero(reflect.ValueOf(m)) {
+		t.Errorf("nil map should be zero")
+	}
+	m = map[string]int{}
+	if !isZero(reflect.ValueOf(m)) {
+		t.Errorf("empty map should be zero")
+	}
+	m["a"] = 1
+	if isZero(reflect.ValueOf(m)) {
+		t.Errorf("non-empty map considered zero")
+	}
+}
