@@ -3318,3 +3318,218 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 		_ = decoder.Decode(&ds, input)
 	}
 }
+
+func TestConversionErrorError(t *testing.T) {
+	e := ConversionError{Key: "f", Index: -1}
+	if got := e.Error(); got != "schema: error converting value for \"f\"" {
+		t.Errorf("unexpected message %q", got)
+	}
+	e = ConversionError{Key: "f", Index: 2, Err: errors.New("boom")}
+	msg := e.Error()
+	if !strings.Contains(msg, "index 2 of \"f\"") || !strings.Contains(msg, "boom") {
+		t.Errorf("unexpected message %q", msg)
+	}
+}
+
+type sliceValue []byte
+
+func (sliceValue) UnmarshalText([]byte) error { return nil }
+
+type valueUM string
+
+func (valueUM) UnmarshalText([]byte) error { return nil }
+
+type ptrUM string
+
+func (*ptrUM) UnmarshalText([]byte) error { return nil }
+
+type elemUM struct{}
+
+func (*elemUM) UnmarshalText([]byte) error { return nil }
+
+type failUM string
+
+func (*failUM) UnmarshalText([]byte) error { return errors.New("fail") }
+
+func TestIsTextUnmarshaler(t *testing.T) {
+	cases := []struct {
+		name  string
+		val   interface{}
+		check func(t *testing.T, u unmarshaler)
+	}{
+		{"value", valueUM(""), func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || u.IsPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"ptr", ptrUM(""), func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || !u.IsPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"sliceValue", sliceValue{}, func(t *testing.T, u unmarshaler) {
+			if !u.IsValid {
+				t.Fatalf("not valid")
+			}
+		}},
+		{"sliceElemPtr", []*elemUM{}, func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || !u.IsSliceElement || !u.IsSliceElementPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"invalid", 42, func(t *testing.T, u unmarshaler) {
+			if u.IsValid {
+				t.Fatalf("expected invalid")
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.check(t, isTextUnmarshaler(reflect.ValueOf(c.val)))
+		})
+	}
+}
+
+func TestHandleMultipartFieldAdditional(t *testing.T) {
+	fh1 := &multipart.FileHeader{Filename: "f1"}
+	fh2 := &multipart.FileHeader{Filename: "f2"}
+
+	var a *multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&a).Elem(), []*multipart.FileHeader{fh1}) || a != fh1 {
+		t.Errorf("single header not set")
+	}
+
+	var b []*multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&b).Elem(), []*multipart.FileHeader{fh1, fh2}) || len(b) != 2 || b[1] != fh2 {
+		t.Errorf("slice headers not set")
+	}
+
+	var c *[]*multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&c).Elem(), []*multipart.FileHeader{fh1}) || c == nil || len(*c) != 1 || (*c)[0] != fh1 {
+		t.Errorf("pointer slice not set")
+	}
+
+	var d *multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&d).Elem(), nil) || d != nil {
+		t.Errorf("empty files not handled")
+	}
+
+	x := 0
+	if handleMultipartField(reflect.ValueOf(&x).Elem(), []*multipart.FileHeader{fh1}) {
+		t.Errorf("non multipart field handled")
+	}
+}
+
+type unsupported struct {
+	C complex64 `schema:"c"`
+}
+
+type textErr struct{}
+
+func (*textErr) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type withSlice struct {
+	A []struct {
+		B int `schema:"b"`
+	} `schema:"a"`
+}
+
+type withText struct {
+	T textErr `schema:"t"`
+}
+
+type valueErrUM string
+
+func (valueErrUM) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type sliceUM struct{}
+
+func (*sliceUM) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type panicType int
+
+func TestDecodeErrors(t *testing.T) {
+	t.Run("invalid pointer", func(t *testing.T) {
+		var s unsupported
+		if err := NewDecoder().Decode(s, nil); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("panic converter", func(t *testing.T) {
+		dec := NewDecoder()
+		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic("boom") })
+		var target struct {
+			P panicType `schema:"p"`
+		}
+		if err := dec.Decode(&target, map[string][]string{"p": {"x"}}); err == nil {
+			t.Fatalf("expected panic error")
+		}
+	})
+
+	t.Run("panic error converter", func(t *testing.T) {
+		dec := NewDecoder()
+		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic(errors.New("x")) })
+		var target struct {
+			P panicType `schema:"p"`
+		}
+		if err := dec.Decode(&target, map[string][]string{"p": {"x"}}); err == nil {
+			t.Fatalf("expected panic error")
+		}
+	})
+
+	t.Run("unsupported type", func(t *testing.T) {
+		var u unsupported
+		if err := NewDecoder().Decode(&u, map[string][]string{"c": {"1"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("text unmarshaler error", func(t *testing.T) {
+		var w withText
+		err := NewDecoder().Decode(&w, map[string][]string{"t": {"x"}})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if _, ok := err.(MultiError)["t"].(ConversionError); !ok {
+			t.Fatalf("wrong error type: %v", err)
+		}
+	})
+
+	t.Run("index larger", func(t *testing.T) {
+		dec := NewDecoder()
+		dec.MaxSize(0)
+		var s withSlice
+		err := dec.Decode(&s, map[string][]string{"a.1.b": {"5"}})
+		if err == nil || !strings.Contains(err.(MultiError)["a.1.b"].Error(), "maxSize") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("slice converter missing", func(t *testing.T) {
+		var s struct {
+			C []complex64 `schema:"c"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"c": {"1"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("slice textunmarshal error", func(t *testing.T) {
+		var s struct {
+			S []sliceUM `schema:"s"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"s": {"a"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("value unmarshal error", func(t *testing.T) {
+		var s struct {
+			V valueErrUM `schema:"v"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"v": {"a"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+}
