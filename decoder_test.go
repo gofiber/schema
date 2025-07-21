@@ -3347,10 +3347,6 @@ type elemUM struct{}
 
 func (*elemUM) UnmarshalText([]byte) error { return nil }
 
-type failUM string
-
-func (*failUM) UnmarshalText([]byte) error { return errors.New("fail") }
-
 func TestIsTextUnmarshaler(t *testing.T) {
 	cases := []struct {
 		name  string
