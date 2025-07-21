@@ -3320,6 +3320,7 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 }
 
 func TestConversionErrorError(t *testing.T) {
+	t.Parallel()
 	e := ConversionError{Key: "f", Index: -1}
 	if got := e.Error(); got != "schema: error converting value for \"f\"" {
 		t.Errorf("unexpected message %q", got)
@@ -3348,6 +3349,7 @@ type elemUM struct{}
 func (*elemUM) UnmarshalText([]byte) error { return nil }
 
 func TestIsTextUnmarshaler(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name  string
 		val   interface{}
@@ -3381,12 +3383,14 @@ func TestIsTextUnmarshaler(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
 			c.check(t, isTextUnmarshaler(reflect.ValueOf(c.val)))
 		})
 	}
 }
 
 func TestHandleMultipartFieldAdditional(t *testing.T) {
+	t.Parallel()
 	fh1 := &multipart.FileHeader{Filename: "f1"}
 	fh2 := &multipart.FileHeader{Filename: "f2"}
 
@@ -3445,7 +3449,9 @@ func (*sliceUM) UnmarshalText([]byte) error { return errors.New("bad") }
 type panicType int
 
 func TestDecodeErrors(t *testing.T) {
+	t.Parallel()
 	t.Run("invalid pointer", func(t *testing.T) {
+		t.Parallel()
 		var s unsupported
 		if err := NewDecoder().Decode(s, nil); err == nil {
 			t.Fatalf("expected error")
@@ -3453,6 +3459,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("panic converter", func(t *testing.T) {
+		t.Parallel()
 		dec := NewDecoder()
 		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic("boom") })
 		var target struct {
@@ -3464,6 +3471,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("panic error converter", func(t *testing.T) {
+		t.Parallel()
 		dec := NewDecoder()
 		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic(errors.New("x")) })
 		var target struct {
@@ -3475,6 +3483,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("unsupported type", func(t *testing.T) {
+		t.Parallel()
 		var u unsupported
 		if err := NewDecoder().Decode(&u, map[string][]string{"c": {"1"}}); err == nil {
 			t.Fatalf("expected error")
@@ -3482,6 +3491,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("text unmarshaler error", func(t *testing.T) {
+		t.Parallel()
 		var w withText
 		err := NewDecoder().Decode(&w, map[string][]string{"t": {"x"}})
 		if err == nil {
@@ -3493,6 +3503,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("index larger", func(t *testing.T) {
+		t.Parallel()
 		dec := NewDecoder()
 		dec.MaxSize(0)
 		var s withSlice
@@ -3503,6 +3514,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("slice converter missing", func(t *testing.T) {
+		t.Parallel()
 		var s struct {
 			C []complex64 `schema:"c"`
 		}
@@ -3512,6 +3524,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("slice textunmarshal error", func(t *testing.T) {
+		t.Parallel()
 		var s struct {
 			S []sliceUM `schema:"s"`
 		}
@@ -3521,6 +3534,7 @@ func TestDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("value unmarshal error", func(t *testing.T) {
+		t.Parallel()
 		var s struct {
 			V valueErrUM `schema:"v"`
 		}
