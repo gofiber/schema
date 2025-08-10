@@ -3544,8 +3544,6 @@ func TestDecodeErrors(t *testing.T) {
 	})
 }
 
-// -----------------------------------------------------------------------------
-
 func TestDecodeMultipartFiles(t *testing.T) {
 	type payload struct {
 		Single   *multipart.FileHeader    `schema:"single"`
@@ -3578,8 +3576,6 @@ func TestDecodeMultipartFiles(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-
 func TestDecodeSliceTextUnmarshalerError(t *testing.T) {
 	type target struct {
 		B []rudeBool `schema:"b"`
@@ -3590,8 +3586,6 @@ func TestDecodeSliceTextUnmarshalerError(t *testing.T) {
 		t.Fatalf("expected error")
 	}
 }
-
-// -----------------------------------------------------------------------------
 
 func TestDecodeCommaSeparatedZeroEmpty(t *testing.T) {
 	type target struct {
@@ -3608,8 +3602,6 @@ func TestDecodeCommaSeparatedZeroEmpty(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-
 func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	type target struct {
 		N []*int `schema:"n"`
@@ -3622,8 +3614,6 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 		t.Fatalf("unexpected values: %v %v", s.N[0], s.N[1])
 	}
 }
-
-// -----------------------------------------------------------------------------
 
 func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
 	type target struct {
