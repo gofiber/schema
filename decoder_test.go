@@ -3543,3 +3543,95 @@ func TestDecodeErrors(t *testing.T) {
 		}
 	})
 }
+
+// -----------------------------------------------------------------------------
+
+func TestDecodeMultipartFiles(t *testing.T) {
+	type payload struct {
+		Single   *multipart.FileHeader    `schema:"single"`
+		Multiple []*multipart.FileHeader  `schema:"multi"`
+		PtrSlice *[]*multipart.FileHeader `schema:"ptr"`
+	}
+
+	fh1 := &multipart.FileHeader{Filename: "a"}
+	fh2 := &multipart.FileHeader{Filename: "b"}
+
+	src := map[string][]string{}
+	files := map[string][]*multipart.FileHeader{
+		"single": {fh1},
+		"multi":  {fh1, fh2},
+		"ptr":    {fh2},
+	}
+
+	var p payload
+	if err := NewDecoder().Decode(&p, src, files); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Single != fh1 {
+		t.Fatalf("single not set")
+	}
+	if len(p.Multiple) != 2 || p.Multiple[0] != fh1 || p.Multiple[1] != fh2 {
+		t.Fatalf("multi not set")
+	}
+	if p.PtrSlice == nil || len(*p.PtrSlice) != 1 || (*p.PtrSlice)[0] != fh2 {
+		t.Fatalf("ptr slice not set")
+	}
+}
+
+// -----------------------------------------------------------------------------
+
+func TestDecodeSliceTextUnmarshalerError(t *testing.T) {
+	type target struct {
+		B []rudeBool `schema:"b"`
+	}
+
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"maybe"}}); err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+// -----------------------------------------------------------------------------
+
+func TestDecodeCommaSeparatedZeroEmpty(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+	dec := NewDecoder()
+	dec.ZeroEmpty(true)
+	var s target
+	if err := dec.Decode(&s, map[string][]string{"n": {"1,,2"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{1, 0, 2}) {
+		t.Fatalf("unexpected slice: %v", s.N)
+	}
+}
+
+// -----------------------------------------------------------------------------
+
+func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
+	type target struct {
+		N []*int `schema:"n"`
+	}
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"n": {"1,2"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(s.N) != 2 || *s.N[0] != 1 || *s.N[1] != 2 {
+		t.Fatalf("unexpected values: %v %v", s.N[0], s.N[1])
+	}
+}
+
+// -----------------------------------------------------------------------------
+
+func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
+	type target struct {
+		A []IntAlias `schema:"a"`
+	}
+
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"a": {"1,a"}}); err == nil {
+		t.Fatalf("expected error")
+	}
+}
