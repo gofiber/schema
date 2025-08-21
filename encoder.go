@@ -61,8 +61,8 @@ func isZero(v reflect.Value) bool {
 			IsZero() bool
 		}
 		if v.Type().Implements(reflect.TypeOf((*zero)(nil)).Elem()) {
-			iz := v.MethodByName("IsZero").Call([]reflect.Value{})[0]
-			return iz.Interface().(bool)
+			iz, _ := reflect.TypeAssert[bool](v.MethodByName("IsZero").Call([]reflect.Value{})[0])
+			return iz
 		}
 		z := true
 		for i := 0; i < v.NumField(); i++ {

@@ -471,7 +471,8 @@ func TestRegisterEncoderStructIsZero(t *testing.T) {
 
 		encoder := NewEncoder()
 		encoder.RegisterEncoder(time.Time{}, func(value reflect.Value) string {
-			return value.Interface().(time.Time).Format(time.RFC3339Nano)
+			tv, _ := reflect.TypeAssert[time.Time](value)
+			return tv.Format(time.RFC3339Nano)
 		})
 
 		err := encoder.Encode(ss[s], vals)
@@ -521,7 +522,7 @@ func TestRegisterEncoderWithPtrType(t *testing.T) {
 			return ""
 		}
 
-		custom := value.Interface().(*CustomTime)
+		custom, _ := reflect.TypeAssert[*CustomTime](value)
 		return custom.time.String()
 	})
 
@@ -546,7 +547,7 @@ func TestTimeDurationEncoding(t *testing.T) {
 
 	enc := NewEncoder()
 	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
-		d := v.Interface().(time.Duration)
+		d, _ := reflect.TypeAssert[time.Duration](v)
 		return d.String() // "3m0s"
 	})
 
@@ -577,7 +578,8 @@ func TestTimeDurationOmitEmpty(t *testing.T) {
 
 	enc := NewEncoder()
 	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
-		return v.Interface().(time.Duration).String()
+		d, _ := reflect.TypeAssert[time.Duration](v)
+		return d.String()
 	})
 
 	err := enc.Encode(&testData, vals)
@@ -731,7 +733,7 @@ func BenchmarkLargeStructEncode(b *testing.B) {
 
 	// Optionally register a custom encoder for time.Time
 	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
-		tVal := v.Interface().(time.Time)
+		tVal, _ := reflect.TypeAssert[time.Time](v)
 		return tVal.Format(time.RFC3339)
 	})
 
@@ -757,7 +759,7 @@ func BenchmarkLargeStructEncodeParallel(b *testing.B) {
 	}
 	enc := NewEncoder()
 	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
-		tVal := v.Interface().(time.Time)
+		tVal, _ := reflect.TypeAssert[time.Time](v)
 		return tVal.Format(time.RFC3339)
 	})
 
@@ -781,7 +783,8 @@ func BenchmarkTimeDurationEncoding(b *testing.B) {
 
 	enc := NewEncoder()
 	enc.RegisterEncoder(time.Duration(0), func(v reflect.Value) string {
-		return v.Interface().(time.Duration).String()
+		d, _ := reflect.TypeAssert[time.Duration](v)
+		return d.String()
 	})
 
 	vals := map[string][]string{}
