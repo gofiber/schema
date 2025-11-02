@@ -88,7 +88,6 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 			}
 			parts = append(parts, pathPart{
 				path:  path,
-				field: field,
 				index: int(index64),
 			})
 			path = make([]string, 0)
@@ -114,7 +113,6 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	// Add the remaining.
 	parts = append(parts, pathPart{
 		path:  path,
-		field: field,
 		index: -1,
 	})
 	return parts, nil
@@ -269,7 +267,6 @@ func (f *fieldInfo) paths(prefix string) []string {
 }
 
 type pathPart struct {
-	field *fieldInfo
 	path  []string // path to the field: walks structs using field names.
 	index int      // struct index in slices of structs.
 }
