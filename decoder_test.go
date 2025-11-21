@@ -1919,9 +1919,11 @@ func TestComprehensiveDecodingErrors(t *testing.T) {
 		if key, expected := "Y.s.v", (UnknownKeyError{Key: "Y.s.v"}); e[key] != expected {
 			t.Errorf("%s: expected %#v, got %#v", key, expected, e[key])
 		}
+		// J is promoted from the embedded I2 struct.
 		if expected := 123; dst.J.P == nil || *dst.J.P != expected {
 			t.Errorf("I2.J.P: expected %#v, got %#v", expected, dst.J.P)
 		}
+		// P is promoted from the embedded S1 inside X.
 		if expected := ""; dst.X.P == nil || *dst.X.P != expected {
 			t.Errorf("X.S1.P: expected %#v, got %#v", expected, dst.X.P)
 		}
