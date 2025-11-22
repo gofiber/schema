@@ -672,9 +672,7 @@ func BenchmarkSimpleStructEncode(b *testing.B) {
 	enc := NewEncoder()
 
 	vals := map[string][]string{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = enc.Encode(&s, vals)
 	}
 }
@@ -738,9 +736,7 @@ func BenchmarkLargeStructEncode(b *testing.B) {
 	})
 
 	vals := map[string][]string{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = enc.Encode(&s, vals)
 	}
 }
@@ -789,9 +785,7 @@ func BenchmarkTimeDurationEncoding(b *testing.B) {
 	})
 
 	vals := map[string][]string{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = enc.Encode(&testData, vals)
 	}
 }

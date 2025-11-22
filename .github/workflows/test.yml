@@ -15,15 +15,15 @@ jobs:
   unit:
     strategy:
       matrix:
-        go-version: [1.22.x, 1.23.x, 1.24.x]
+        go-version: [1.24.x]
         platform: [ubuntu-latest, windows-latest, macos-latest, macos-13]
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go-version }}
 
@@ -31,24 +31,27 @@ jobs:
         run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=1 -coverprofile=coverage.txt -covermode=atomic -shuffle=on
 
       - name: Upload coverage reports to Codecov
-        if: ${{ matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.23.x' }}
-        uses: codecov/codecov-action@v5.4.3
+        if: ${{ matrix.platform == 'ubuntu-latest' && matrix.go-version == '1.24.x' }}
+        uses: codecov/codecov-action@v5.5.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          file: ./coverage.txt
           flags: unittests
           slug: gofiber/schema
+          verbose: true
 
   repeated:
     runs-on: ubuntu-latest
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: stable
 
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@v1.12.3
+
       - name: Test
-        run: go run gotest.tools/gotestsum@latest -f testname -- ./... -race -count=15 -shuffle=on
+        run: gotestsum -f testname -- ./... -race -count=15 -shuffle=on

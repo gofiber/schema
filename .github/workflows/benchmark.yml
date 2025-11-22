@@ -23,22 +23,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0 # to be able to retrieve the last commit in main
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # NOTE: Keep this in sync with the version from go.mod
-          go-version: "1.22.x"
+          go-version: "1.24.x"
 
       - name: Run Benchmark
         run: set -o pipefail; go test ./... -benchmem -run=^$ -bench . | tee output.txt
 
       # NOTE: Benchmarks could change with different CPU types
       - name: Get GitHub Runner System Information
-        uses: kenchan0130/actions-system-info@v1.3.0
+        uses: kenchan0130/actions-system-info@v1.4.0
         id: system-info
 
       - name: Get Main branch SHA
@@ -56,7 +56,7 @@ jobs:
 
       # This will only run if we have Benchmark Results from main branch
       - name: Compare PR Benchmark Results with main branch
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: steps.cache.outputs.cache-hit == 'true'
         with:
           tool: 'go'
@@ -72,7 +72,7 @@ jobs:
           alert-threshold: "150%"
 
       - name: Store Benchmark Results for main branch
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: ${{ github.ref_name == 'main' }}
         with:
           tool: 'go'
@@ -86,7 +86,7 @@ jobs:
           alert-threshold: "150%"
 
       - name: Publish Benchmark Results to GitHub Pages
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: ${{ github.ref_name == 'main' }}
         with:
           tool: 'go'

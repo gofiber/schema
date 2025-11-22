@@ -437,9 +437,7 @@ func BenchmarkAll(b *testing.B) {
 	}
 
 	decoder := NewDecoder()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(S1{}, v)
 	}
 }
@@ -1716,11 +1714,12 @@ func TestAnonymousStructField(t *testing.T) {
 		if a.B != "abc" {
 			t.Errorf("B: expected %v, got %v", "abc", a.B)
 		}
-		if a.AS1.A != 1 {
-			t.Errorf("AS1.A: expected %v, got %v", 1, a.AS1.A)
+		embedded := a.AS1
+		if embedded.A != 1 {
+			t.Errorf("AS1.A: expected %v, got %v", 1, embedded.A)
 		}
-		if a.AS1.E != 2 {
-			t.Errorf("AS1.E: expected %v, got %v", 2, a.AS1.E)
+		if embedded.E != 2 {
+			t.Errorf("AS1.E: expected %v, got %v", 2, embedded.E)
 		}
 	}
 	a := AS2{}
@@ -1754,8 +1753,8 @@ func TestAnonymousStructField(t *testing.T) {
 		if a.D != "abc" {
 			t.Errorf("D: expected %v, got %v", "abc", a.D)
 		}
-		if a.AS3.C != 1 {
-			t.Errorf("AS3.C: expected %v, got %v", 1, a.AS3.C)
+		if embedded := a.AS3; embedded.C != 1 {
+			t.Errorf("AS3.C: expected %v, got %v", 1, embedded.C)
 		}
 	}
 }
@@ -1920,11 +1919,13 @@ func TestComprehensiveDecodingErrors(t *testing.T) {
 		if key, expected := "Y.s.v", (UnknownKeyError{Key: "Y.s.v"}); e[key] != expected {
 			t.Errorf("%s: expected %#v, got %#v", key, expected, e[key])
 		}
-		if expected := 123; dst.I2.J.P == nil || *dst.I2.J.P != expected {
-			t.Errorf("I2.J.P: expected %#v, got %#v", expected, dst.I2.J.P)
+		// J is promoted from the embedded I2 struct.
+		if expected := 123; dst.J.P == nil || *dst.J.P != expected {
+			t.Errorf("I2.J.P: expected %#v, got %#v", expected, dst.J.P)
 		}
-		if expected := ""; dst.X.S1.P == nil || *dst.X.S1.P != expected {
-			t.Errorf("X.S1.P: expected %#v, got %#v", expected, dst.X.S1.P)
+		// P is promoted from the embedded S1 inside X.
+		if expected := ""; dst.X.P == nil || *dst.X.P != expected {
+			t.Errorf("X.S1.P: expected %#v, got %#v", expected, dst.X.P)
 		}
 		if expected := "abc"; dst.X.T.V != expected {
 			t.Errorf("X.T.V: expected %#v, got %#v", expected, dst.X.T.V)
@@ -2566,6 +2567,60 @@ func TestDecoder_MaxSize(t *testing.T) {
 	}
 }
 
+func TestDefaultsAppliedOnlyWhenMissing(t *testing.T) {
+	t.Parallel()
+
+	type Data struct {
+		B bool    `schema:"b,default:true"`
+		I int     `schema:"i,default:5"`
+		F float64 `schema:"f,default:1.5"`
+		S []int   `schema:"s,default:1|2"`
+	}
+
+	dec := NewDecoder()
+
+	// Values are explicitly set – no defaults should be applied
+	withVals := Data{}
+	if err := dec.Decode(&withVals, map[string][]string{
+		"b": {"false"},
+		"i": {"0"},
+		"f": {"0"},
+		"s": {},
+	}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if withVals.B {
+		t.Errorf("B should be false when the value is set")
+	}
+	if withVals.I != 0 {
+		t.Errorf("I should be 0 when the value is set, got %d", withVals.I)
+	}
+	if withVals.F != 0 {
+		t.Errorf("F should be 0 when the value is set, got %f", withVals.F)
+	}
+	if len(withVals.S) != 0 {
+		t.Errorf("S should be empty when the value is set, got %v", withVals.S)
+	}
+
+	// No values provided – defaults should be applied
+	withoutVals := Data{}
+	if err := dec.Decode(&withoutVals, map[string][]string{}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !withoutVals.B {
+		t.Errorf("B should default to true when missing")
+	}
+	if withoutVals.I != 5 {
+		t.Errorf("Default I should be 5, got %d", withoutVals.I)
+	}
+	if withoutVals.F != 1.5 {
+		t.Errorf("Default F should be 1.5, got %f", withoutVals.F)
+	}
+	if !reflect.DeepEqual(withoutVals.S, []int{1, 2}) {
+		t.Errorf("Default S should be [1 2], got %v", withoutVals.S)
+	}
+}
+
 func TestDecoder_SetMaxSize(t *testing.T) {
 	t.Run("default maxsize should be equal to given constant", func(t *testing.T) {
 		t.Parallel()
@@ -2902,10 +2957,8 @@ func BenchmarkDecoderMultipartFiles(b *testing.B) {
 	}
 
 	decoder := NewDecoder()
-	b.ResetTimer()
-
 	var err error
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		err = decoder.Decode(&s, data, fileHeaders)
 	}
 
@@ -2988,7 +3041,7 @@ func BenchmarkIsMultipartFile(b *testing.B) {
 
 	for i, bc := range cases {
 		b.Run(fmt.Sprintf("IsMultipartFile-%d", i), func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				isMultipartField(bc.typ)
 			}
 		})
@@ -3096,6 +3149,29 @@ func TestDecodePanicIsCaughtAndReturnedAsError(t *testing.T) {
 	}
 }
 
+func TestDecodeIndexExceedsParserLimit(t *testing.T) {
+	type R struct {
+		N1 []*struct {
+			Value string
+		}
+	}
+	data := map[string][]string{
+		"n1.1001.value": {"Foo"},
+	}
+
+	s := new(R)
+	decoder := NewDecoder()
+	err := decoder.Decode(s, data)
+	if err == nil {
+		t.Fatal("Expected an error when index exceeds parser limit")
+	}
+
+	expected := MultiError{"n1.1001.value": errIndexTooLarge}
+	if !reflect.DeepEqual(err, expected) {
+		t.Fatalf("Expected %v, got: %v", expected, err)
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{
@@ -3122,9 +3198,7 @@ func BenchmarkHandleMultipartField(b *testing.B) {
 	f3 := rv.FieldByName("F3")
 	f4 := rv.FieldByName("F4")
 
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		handleMultipartField(f, files["f"])
 		handleMultipartField(f2, files["f"])
 		handleMultipartField(f3, files["f"])
@@ -3147,9 +3221,7 @@ func BenchmarkLargeStructDecode(b *testing.B) {
 
 	decoder := NewDecoder()
 	s := &LargeStructForBenchmark{}
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(s, data)
 	}
 }
@@ -3197,9 +3269,7 @@ func BenchmarkSimpleStructDecode(b *testing.B) {
 		"e.f": {"3.14"},
 	}
 	decoder := NewDecoder()
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(&s, data)
 	}
 }
@@ -3221,13 +3291,11 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 		"d.e": {"3.14"},
 	}
 	decoder := NewDecoder()
-	b.ResetTimer()
-
 	v := reflect.ValueOf(s)
 	// v = v.Elem()
 	t := v.Type()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.checkRequired(t, data)
 	}
 }
@@ -3249,9 +3317,314 @@ func BenchmarkTimeDurationDecoding(b *testing.B) {
 	})
 
 	var ds DurationStruct
-	b.ResetTimer()
-
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = decoder.Decode(&ds, input)
+	}
+}
+
+func TestConversionErrorError(t *testing.T) {
+	t.Parallel()
+	e := ConversionError{Key: "f", Index: -1}
+	if got := e.Error(); got != "schema: error converting value for \"f\"" {
+		t.Errorf("unexpected message %q", got)
+	}
+	e = ConversionError{Key: "f", Index: 2, Err: errors.New("boom")}
+	msg := e.Error()
+	if !strings.Contains(msg, "index 2 of \"f\"") || !strings.Contains(msg, "boom") {
+		t.Errorf("unexpected message %q", msg)
+	}
+}
+
+type sliceValue []byte
+
+func (sliceValue) UnmarshalText([]byte) error { return nil }
+
+type valueUM string
+
+func (valueUM) UnmarshalText([]byte) error { return nil }
+
+type ptrUM string
+
+func (*ptrUM) UnmarshalText([]byte) error { return nil }
+
+type elemUM struct{}
+
+func (*elemUM) UnmarshalText([]byte) error { return nil }
+
+func TestIsTextUnmarshaler(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		val   interface{}
+		check func(t *testing.T, u unmarshaler)
+	}{
+		{"value", valueUM(""), func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || u.IsPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"ptr", ptrUM(""), func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || !u.IsPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"sliceValue", sliceValue{}, func(t *testing.T, u unmarshaler) {
+			if !u.IsValid {
+				t.Fatalf("not valid")
+			}
+		}},
+		{"sliceElemPtr", []*elemUM{}, func(t *testing.T, u unmarshaler) {
+			if !u.IsValid || !u.IsSliceElement || !u.IsSliceElementPtr {
+				t.Fatalf("wrong flags: %+v", u)
+			}
+		}},
+		{"invalid", 42, func(t *testing.T, u unmarshaler) {
+			if u.IsValid {
+				t.Fatalf("expected invalid")
+			}
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			c.check(t, isTextUnmarshaler(reflect.ValueOf(c.val)))
+		})
+	}
+}
+
+func TestHandleMultipartFieldAdditional(t *testing.T) {
+	t.Parallel()
+	fh1 := &multipart.FileHeader{Filename: "f1"}
+	fh2 := &multipart.FileHeader{Filename: "f2"}
+
+	var a *multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&a).Elem(), []*multipart.FileHeader{fh1}) || a != fh1 {
+		t.Errorf("single header not set")
+	}
+
+	var b []*multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&b).Elem(), []*multipart.FileHeader{fh1, fh2}) || len(b) != 2 || b[1] != fh2 {
+		t.Errorf("slice headers not set")
+	}
+
+	var c *[]*multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&c).Elem(), []*multipart.FileHeader{fh1}) || c == nil || len(*c) != 1 || (*c)[0] != fh1 {
+		t.Errorf("pointer slice not set")
+	}
+
+	var d *multipart.FileHeader
+	if !handleMultipartField(reflect.ValueOf(&d).Elem(), nil) || d != nil {
+		t.Errorf("empty files not handled")
+	}
+
+	x := 0
+	if handleMultipartField(reflect.ValueOf(&x).Elem(), []*multipart.FileHeader{fh1}) {
+		t.Errorf("non multipart field handled")
+	}
+}
+
+type unsupported struct {
+	C complex64 `schema:"c"`
+}
+
+type textErr struct{}
+
+func (*textErr) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type withSlice struct {
+	A []struct {
+		B int `schema:"b"`
+	} `schema:"a"`
+}
+
+type withText struct {
+	T textErr `schema:"t"`
+}
+
+type valueErrUM string
+
+func (valueErrUM) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type sliceUM struct{}
+
+func (*sliceUM) UnmarshalText([]byte) error { return errors.New("bad") }
+
+type panicType int
+
+func TestDecodeErrors(t *testing.T) {
+	t.Parallel()
+	t.Run("invalid pointer", func(t *testing.T) {
+		t.Parallel()
+		var s unsupported
+		if err := NewDecoder().Decode(s, nil); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("panic converter", func(t *testing.T) {
+		t.Parallel()
+		dec := NewDecoder()
+		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic("boom") })
+		var target struct {
+			P panicType `schema:"p"`
+		}
+		if err := dec.Decode(&target, map[string][]string{"p": {"x"}}); err == nil {
+			t.Fatalf("expected panic error")
+		}
+	})
+
+	t.Run("panic error converter", func(t *testing.T) {
+		t.Parallel()
+		dec := NewDecoder()
+		dec.RegisterConverter(panicType(0), func(string) reflect.Value { panic(errors.New("x")) })
+		var target struct {
+			P panicType `schema:"p"`
+		}
+		if err := dec.Decode(&target, map[string][]string{"p": {"x"}}); err == nil {
+			t.Fatalf("expected panic error")
+		}
+	})
+
+	t.Run("unsupported type", func(t *testing.T) {
+		t.Parallel()
+		var u unsupported
+		if err := NewDecoder().Decode(&u, map[string][]string{"c": {"1"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("text unmarshaler error", func(t *testing.T) {
+		t.Parallel()
+		var w withText
+		err := NewDecoder().Decode(&w, map[string][]string{"t": {"x"}})
+		if err == nil {
+			t.Fatalf("expected error")
+		}
+		if _, ok := err.(MultiError)["t"].(ConversionError); !ok {
+			t.Fatalf("wrong error type: %v", err)
+		}
+	})
+
+	t.Run("index larger", func(t *testing.T) {
+		t.Parallel()
+		dec := NewDecoder()
+		dec.MaxSize(0)
+		var s withSlice
+		err := dec.Decode(&s, map[string][]string{"a.1.b": {"5"}})
+		if err == nil || !strings.Contains(err.(MultiError)["a.1.b"].Error(), "maxSize") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("slice converter missing", func(t *testing.T) {
+		t.Parallel()
+		var s struct {
+			C []complex64 `schema:"c"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"c": {"1"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("slice textunmarshal error", func(t *testing.T) {
+		t.Parallel()
+		var s struct {
+			S []sliceUM `schema:"s"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"s": {"a"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+
+	t.Run("value unmarshal error", func(t *testing.T) {
+		t.Parallel()
+		var s struct {
+			V valueErrUM `schema:"v"`
+		}
+		if err := NewDecoder().Decode(&s, map[string][]string{"v": {"a"}}); err == nil {
+			t.Fatalf("expected error")
+		}
+	})
+}
+
+func TestDecodeMultipartFiles(t *testing.T) {
+	type payload struct {
+		Single   *multipart.FileHeader    `schema:"single"`
+		Multiple []*multipart.FileHeader  `schema:"multi"`
+		PtrSlice *[]*multipart.FileHeader `schema:"ptr"`
+	}
+
+	fh1 := &multipart.FileHeader{Filename: "a"}
+	fh2 := &multipart.FileHeader{Filename: "b"}
+
+	src := map[string][]string{}
+	files := map[string][]*multipart.FileHeader{
+		"single": {fh1},
+		"multi":  {fh1, fh2},
+		"ptr":    {fh2},
+	}
+
+	var p payload
+	if err := NewDecoder().Decode(&p, src, files); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if p.Single != fh1 {
+		t.Fatalf("single not set")
+	}
+	if len(p.Multiple) != 2 || p.Multiple[0] != fh1 || p.Multiple[1] != fh2 {
+		t.Fatalf("multi not set")
+	}
+	if p.PtrSlice == nil || len(*p.PtrSlice) != 1 || (*p.PtrSlice)[0] != fh2 {
+		t.Fatalf("ptr slice not set")
+	}
+}
+
+func TestDecodeSliceTextUnmarshalerError(t *testing.T) {
+	type target struct {
+		B []rudeBool `schema:"b"`
+	}
+
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"maybe"}}); err == nil {
+		t.Fatalf("expected error")
+	}
+}
+
+func TestDecodeCommaSeparatedZeroEmpty(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+	dec := NewDecoder()
+	dec.ZeroEmpty(true)
+	var s target
+	if err := dec.Decode(&s, map[string][]string{"n": {"1,,2"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{1, 0, 2}) {
+		t.Fatalf("unexpected slice: %v", s.N)
+	}
+}
+
+func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
+	type target struct {
+		N []*int `schema:"n"`
+	}
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"n": {"1,2"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(s.N) != 2 || *s.N[0] != 1 || *s.N[1] != 2 {
+		t.Fatalf("unexpected values: %v %v", s.N[0], s.N[1])
+	}
+}
+
+func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
+	type target struct {
+		A []IntAlias `schema:"a"`
+	}
+
+	var s target
+	if err := NewDecoder().Decode(&s, map[string][]string{"a": {"1,a"}}); err == nil {
+		t.Fatalf("expected error")
 	}
 }
