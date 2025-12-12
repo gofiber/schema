@@ -1714,11 +1714,12 @@ func TestAnonymousStructField(t *testing.T) {
 		if a.B != "abc" {
 			t.Errorf("B: expected %v, got %v", "abc", a.B)
 		}
-		if a.AS1.A != 1 {
-			t.Errorf("AS1.A: expected %v, got %v", 1, a.AS1.A)
+		embedded := a.AS1
+		if embedded.A != 1 {
+			t.Errorf("AS1.A: expected %v, got %v", 1, embedded.A)
 		}
-		if a.AS1.E != 2 {
-			t.Errorf("AS1.E: expected %v, got %v", 2, a.AS1.E)
+		if embedded.E != 2 {
+			t.Errorf("AS1.E: expected %v, got %v", 2, embedded.E)
 		}
 	}
 	a := AS2{}
@@ -1752,8 +1753,8 @@ func TestAnonymousStructField(t *testing.T) {
 		if a.D != "abc" {
 			t.Errorf("D: expected %v, got %v", "abc", a.D)
 		}
-		if a.AS3.C != 1 {
-			t.Errorf("AS3.C: expected %v, got %v", 1, a.AS3.C)
+		if embedded := a.AS3; embedded.C != 1 {
+			t.Errorf("AS3.C: expected %v, got %v", 1, embedded.C)
 		}
 	}
 }
@@ -1918,11 +1919,13 @@ func TestComprehensiveDecodingErrors(t *testing.T) {
 		if key, expected := "Y.s.v", (UnknownKeyError{Key: "Y.s.v"}); e[key] != expected {
 			t.Errorf("%s: expected %#v, got %#v", key, expected, e[key])
 		}
-		if expected := 123; dst.I2.J.P == nil || *dst.I2.J.P != expected {
-			t.Errorf("I2.J.P: expected %#v, got %#v", expected, dst.I2.J.P)
+		// J is promoted from the embedded I2 struct.
+		if expected := 123; dst.J.P == nil || *dst.J.P != expected {
+			t.Errorf("I2.J.P: expected %#v, got %#v", expected, dst.J.P)
 		}
-		if expected := ""; dst.X.S1.P == nil || *dst.X.S1.P != expected {
-			t.Errorf("X.S1.P: expected %#v, got %#v", expected, dst.X.S1.P)
+		// P is promoted from the embedded S1 inside X.
+		if expected := ""; dst.X.P == nil || *dst.X.P != expected {
+			t.Errorf("X.S1.P: expected %#v, got %#v", expected, dst.X.P)
 		}
 		if expected := "abc"; dst.X.T.V != expected {
 			t.Errorf("X.T.V: expected %#v, got %#v", expected, dst.X.T.V)

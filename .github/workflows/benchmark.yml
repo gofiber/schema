@@ -23,12 +23,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Fetch Repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0 # to be able to retrieve the last commit in main
 
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # NOTE: Keep this in sync with the version from go.mod
           go-version: "1.25.x"
@@ -49,14 +49,14 @@ jobs:
 
       - name: Get Benchmark Results from main branch
         id: cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ./cache
           key: ${{ steps.get-main-branch-sha.outputs.sha }}-${{ runner.os }}-${{ steps.system-info.outputs.cpu-model }}-benchmark
 
       # This will only run if we have Benchmark Results from main branch
       - name: Compare PR Benchmark Results with main branch
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: steps.cache.outputs.cache-hit == 'true'
         with:
           tool: 'go'
@@ -72,7 +72,7 @@ jobs:
           alert-threshold: "150%"
 
       - name: Store Benchmark Results for main branch
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: ${{ github.ref_name == 'main' }}
         with:
           tool: 'go'
@@ -86,7 +86,7 @@ jobs:
           alert-threshold: "150%"
 
       - name: Publish Benchmark Results to GitHub Pages
-        uses: benchmark-action/github-action-benchmark@v1.20.4
+        uses: benchmark-action/github-action-benchmark@v1.20.7
         if: ${{ github.ref_name == 'main' }}
         with:
           tool: 'go'
@@ -104,7 +104,7 @@ jobs:
           auto-push: false
 
       - name: Update Benchmark Results cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         if: ${{ github.ref_name == 'main' }}
         with:
           path: ./cache
