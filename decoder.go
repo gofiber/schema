@@ -493,7 +493,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				if m.IsSliceElementPtr {
 					u = reflect.New(reflect.PointerTo(elemT).Elem())
 				}
-				if err := u.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(value)); err != nil {
+				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
+				if err := um.UnmarshalText([]byte(value)); err != nil {
 					return ConversionError{
 						Key:   path,
 						Type:  t,
@@ -575,7 +576,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		} else if m.IsValid {
 			if m.IsPtr {
 				u := reflect.New(v.Type())
-				if err := u.Interface().(encoding.TextUnmarshaler).UnmarshalText([]byte(val)); err != nil {
+				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
+				if err := um.UnmarshalText([]byte(val)); err != nil {
 					return ConversionError{
 						Key:   path,
 						Type:  t,
@@ -620,13 +622,13 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 func isTextUnmarshaler(v reflect.Value) unmarshaler {
 	// Create a new unmarshaller instance
 	m := unmarshaler{}
-	if m.Unmarshaler, m.IsValid = v.Interface().(encoding.TextUnmarshaler); m.IsValid {
+	if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
 		return m
 	}
 	// As the UnmarshalText function should be applied to the pointer of the
 	// type, we check that type to see if it implements the necessary
 	// method.
-	if m.Unmarshaler, m.IsValid = reflect.New(v.Type()).Interface().(encoding.TextUnmarshaler); m.IsValid {
+	if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.New(v.Type())); m.IsValid {
 		m.IsPtr = true
 		return m
 	}
@@ -638,7 +640,7 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 	}
 	if t.Kind() == reflect.Slice {
 		// Check if the slice implements encoding.TextUnmarshaller
-		if m.Unmarshaler, m.IsValid = v.Interface().(encoding.TextUnmarshaler); m.IsValid {
+		if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
 			return m
 		}
 		// If t is a pointer slice, check if its elements implement
@@ -648,13 +650,13 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 			t = reflect.PointerTo(t.Elem())
 			v = reflect.Zero(t)
 			m.IsSliceElementPtr = true
-			m.Unmarshaler, m.IsValid = v.Interface().(encoding.TextUnmarshaler)
+			m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v)
 			return m
 		}
 	}
 
 	v = reflect.New(t)
-	m.Unmarshaler, m.IsValid = v.Interface().(encoding.TextUnmarshaler)
+	m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v)
 	return m
 }
 
