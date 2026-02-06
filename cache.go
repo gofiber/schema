@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	utils "github.com/gofiber/utils/v2"
 )
 
 const maxParserIndex = 1000
@@ -24,7 +26,7 @@ func newCache() *cache {
 	c := cache{
 		m:       make(map[reflect.Type]*structInfo),
 		regconv: make(map[reflect.Type]Converter),
-		tag:     "schema",
+		tag:     utils.CopyString("schema"),
 	}
 	return &c
 }
@@ -53,17 +55,23 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	var field *fieldInfo
 	var index64 int64
 	var err error
-	parts := make([]pathPart, 0)
-	path := make([]string, 0)
-	keys := strings.Split(p, ".")
-	for i := 0; i < len(keys); i++ {
+	var parts []pathPart
+	var path []string
+	for keyStart := 0; ; {
 		if t.Kind() != reflect.Struct {
 			return nil, errInvalidPath
 		}
 		if struc = c.get(t); struc == nil {
 			return nil, errInvalidPath
 		}
-		if field = struc.get(keys[i]); field == nil {
+		keyEnd := keyStart
+		for keyEnd < len(p) && p[keyEnd] != '.' {
+			keyEnd++
+		}
+		if keyStart == keyEnd {
+			return nil, errInvalidPath
+		}
+		if field = struc.get(p[keyStart:keyEnd]); field == nil {
 			return nil, errInvalidPath
 		}
 		// Valid field. Append index.
@@ -76,11 +84,18 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 			// we don't need to force the struct's fields to appear in the path.
 			// So checking i+2 is not necessary anymore.
 			// We can skip this part if the type is multipart.FileHeader. It is another special case too.
-			i++
-			if i+1 > len(keys) {
+			keyStart = keyEnd + 1
+			if keyStart >= len(p) {
 				return nil, errInvalidPath
 			}
-			if index64, err = strconv.ParseInt(keys[i], 10, 0); err != nil {
+			keyEnd = keyStart
+			for keyEnd < len(p) && p[keyEnd] != '.' {
+				keyEnd++
+			}
+			if keyStart == keyEnd {
+				return nil, errInvalidPath
+			}
+			if index64, err = strconv.ParseInt(p[keyStart:keyEnd], 10, 0); err != nil {
 				return nil, errInvalidPath
 			}
 			if index64 > maxParserIndex {
@@ -91,7 +106,7 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 				field: field,
 				index: int(index64),
 			})
-			path = make([]string, 0)
+			path = nil
 
 			// Get the next struct type, dropping ptrs.
 			if field.typ.Kind() == reflect.Ptr {
@@ -109,6 +124,14 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 			t = field.typ.Elem()
 		} else {
 			t = field.typ
+		}
+
+		if keyEnd == len(p) {
+			break
+		}
+		keyStart = keyEnd + 1
+		if keyStart >= len(p) {
+			return nil, errInvalidPath
 		}
 	}
 	// Add the remaining.
@@ -139,7 +162,11 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	info := &structInfo{}
 	var anonymousInfos []*structInfo
 	for i := 0; i < t.NumField(); i++ {
-		if f := c.createField(t.Field(i), parentAlias); f != nil {
+		structField := t.Field(i)
+		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr {
+			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
+		}
+		if f := c.createField(structField, parentAlias); f != nil {
 			info.fields = append(info.fields, f)
 			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous {
 				anonymousInfos = append(anonymousInfos, c.create(ft, f.canonicalAlias))
@@ -154,6 +181,12 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			if !containsAlias(others, f.alias) {
 				info.fields = append(info.fields, f)
 			}
+		}
+	}
+	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
+	for _, field := range info.fields {
+		if _, exists := info.fieldsByName[field.alias]; !exists {
+			info.fieldsByName[field.alias] = field
 		}
 	}
 	return info
@@ -218,10 +251,15 @@ func (c *cache) converter(t reflect.Type) Converter {
 // ----------------------------------------------------------------------------
 
 type structInfo struct {
-	fields []*fieldInfo
+	fields             []*fieldInfo
+	fieldsByName       map[string]*fieldInfo
+	anonymousPtrFields []int
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
+	if field, ok := i.fieldsByName[alias]; ok {
+		return field
+	}
 	for _, field := range i.fields {
 		if strings.EqualFold(field.alias, alias) {
 			return field
@@ -317,8 +355,8 @@ func (o tagOptions) Contains(option string) bool {
 
 func (o tagOptions) getDefaultOptionValue() string {
 	for _, s := range o {
-		if strings.HasPrefix(s, "default:") {
-			return strings.SplitN(s, ":", 2)[1]
+		if value, ok := strings.CutPrefix(s, "default:"); ok {
+			return value
 		}
 	}
 	return ""

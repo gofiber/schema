@@ -87,26 +87,28 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	errors := MultiError{}
 
 	for i := 0; i < v.NumField(); i++ {
+		fieldValue := v.Field(i)
+		fieldType := fieldValue.Type()
 		name, opts := fieldAlias(t.Field(i), e.cache.tag)
 		if name == "-" {
 			continue
 		}
 
 		// Encode struct pointer types if the field is a valid pointer and a struct.
-		if isValidStructPointer(v.Field(i)) && !e.hasCustomEncoder(v.Field(i).Type()) {
-			err := e.encode(v.Field(i).Elem(), dst)
+		if isValidStructPointer(fieldValue) && !e.hasCustomEncoder(fieldType) {
+			err := e.encode(fieldValue.Elem(), dst)
 			if err != nil {
-				errors[v.Field(i).Elem().Type().String()] = err
+				errors[fieldValue.Elem().Type().String()] = err
 			}
 			continue
 		}
 
-		encFunc := typeEncoder(v.Field(i).Type(), e.regenc)
+		encFunc := typeEncoder(fieldType, e.regenc)
 
 		// Encode non-slice types and custom implementations immediately.
 		if encFunc != nil {
-			value := encFunc(v.Field(i))
-			if opts.Contains("omitempty") && isZero(v.Field(i)) {
+			value := encFunc(fieldValue)
+			if opts.Contains("omitempty") && isZero(fieldValue) {
 				continue
 			}
 
@@ -114,31 +116,31 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			continue
 		}
 
-		if v.Field(i).Type().Kind() == reflect.Struct {
-			err := e.encode(v.Field(i), dst)
+		if fieldType.Kind() == reflect.Struct {
+			err := e.encode(fieldValue, dst)
 			if err != nil {
-				errors[v.Field(i).Type().String()] = err
+				errors[fieldType.String()] = err
 			}
 			continue
 		}
 
-		if v.Field(i).Type().Kind() == reflect.Slice {
-			encFunc = typeEncoder(v.Field(i).Type().Elem(), e.regenc)
+		if fieldType.Kind() == reflect.Slice {
+			encFunc = typeEncoder(fieldType.Elem(), e.regenc)
 		}
 
 		if encFunc == nil {
-			errors[v.Field(i).Type().String()] = fmt.Errorf("schema: encoder not found for %v", v.Field(i))
+			errors[fieldType.String()] = fmt.Errorf("schema: encoder not found for %v", fieldValue)
 			continue
 		}
 
 		// Encode a slice.
-		if v.Field(i).Len() == 0 && opts.Contains("omitempty") {
+		if fieldValue.Len() == 0 && opts.Contains("omitempty") {
 			continue
 		}
 
 		dst[name] = []string{}
-		for j := 0; j < v.Field(i).Len(); j++ {
-			dst[name] = append(dst[name], encFunc(v.Field(i).Index(j)))
+		for j := 0; j < fieldValue.Len(); j++ {
+			dst[name] = append(dst[name], encFunc(fieldValue.Index(j)))
 		}
 	}
 
