@@ -1260,6 +1260,64 @@ func TestInvalidPathInCacheParsePath(t *testing.T) {
 	}
 }
 
+func TestCacheParsePathInvalidPathCases(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		Value string `schema:"value"`
+	}
+	type payload struct {
+		N1   []item `schema:"n1"`
+		Name string `schema:"name"`
+	}
+
+	c := newCache()
+	payloadType := reflect.TypeOf(payload{})
+
+	tests := []struct {
+		name string
+		path string
+		typ  reflect.Type
+	}{
+		{
+			name: "non struct type",
+			path: "name",
+			typ:  reflect.TypeOf(0),
+		},
+		{
+			name: "unknown field",
+			path: "missing",
+			typ:  payloadType,
+		},
+		{
+			name: "empty index segment",
+			path: "n1..value",
+			typ:  payloadType,
+		},
+		{
+			name: "invalid index segment",
+			path: "n1.x.value",
+			typ:  payloadType,
+		},
+		{
+			name: "trailing dot after index",
+			path: "n1.0.",
+			typ:  payloadType,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			_, err := c.parsePath(tt.path, tt.typ)
+			if !errors.Is(err, errInvalidPath) {
+				t.Fatalf("expected errInvalidPath for %q, got: %v", tt.path, err)
+			}
+		})
+	}
+}
+
 // issue 32
 func TestDecodeToTypedField(t *testing.T) {
 	type Aa bool

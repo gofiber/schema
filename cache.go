@@ -261,11 +261,12 @@ type structInfo struct {
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
-	if field, ok := i.fieldsByName[utils.ToLower(alias)]; ok {
+	aliasKey := utils.ToLower(alias)
+	if field, ok := i.fieldsByName[aliasKey]; ok {
 		return field
 	}
 	for _, field := range i.fields {
-		if utils.EqualFold(field.alias, alias) {
+		if utils.ToLower(field.alias) == aliasKey {
 			return field
 		}
 	}
