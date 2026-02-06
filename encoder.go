@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+
+	utils "github.com/gofiber/utils/v2"
 )
 
 type encoderFunc func(reflect.Value) string
@@ -191,11 +193,11 @@ func encodeBool(v reflect.Value) string {
 }
 
 func encodeInt(v reflect.Value) string {
-	return strconv.FormatInt(int64(v.Int()), 10)
+	return utils.FormatInt(v.Int())
 }
 
 func encodeUint(v reflect.Value) string {
-	return strconv.FormatUint(uint64(v.Uint()), 10)
+	return utils.FormatUint(v.Uint())
 }
 
 func encodeFloat(v reflect.Value, bits int) string {

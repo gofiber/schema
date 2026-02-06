@@ -7,7 +7,6 @@ package schema
 import (
 	"errors"
 	"reflect"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -26,7 +25,7 @@ func newCache() *cache {
 	c := cache{
 		m:       make(map[reflect.Type]*structInfo),
 		regconv: make(map[reflect.Type]Converter),
-		tag:     utils.CopyString("schema"),
+		tag:     "schema",
 	}
 	return &c
 }
@@ -95,7 +94,7 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 			if keyStart == keyEnd {
 				return nil, errInvalidPath
 			}
-			if index64, err = strconv.ParseInt(p[keyStart:keyEnd], 10, 0); err != nil {
+			if index64, err = utils.ParseInt(p[keyStart:keyEnd]); err != nil {
 				return nil, errInvalidPath
 			}
 			if index64 > maxParserIndex {
@@ -261,7 +260,7 @@ func (i *structInfo) get(alias string) *fieldInfo {
 		return field
 	}
 	for _, field := range i.fields {
-		if strings.EqualFold(field.alias, alias) {
+		if utils.EqualFold(field.alias, alias) {
 			return field
 		}
 	}

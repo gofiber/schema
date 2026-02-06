@@ -59,14 +59,14 @@ func convertBool(value string) reflect.Value {
 }
 
 func convertFloat32(value string) reflect.Value {
-	if v, err := strconv.ParseFloat(value, 32); err == nil {
-		return reflect.ValueOf(float32(v))
+	if v, err := utils.ParseFloat32(value); err == nil {
+		return reflect.ValueOf(v)
 	}
 	return invalidValue
 }
 
 func convertFloat64(value string) reflect.Value {
-	if v, err := strconv.ParseFloat(value, 64); err == nil {
+	if v, err := utils.ParseFloat64(value); err == nil {
 		return reflect.ValueOf(v)
 	}
 	return invalidValue
