@@ -53,7 +53,6 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	var struc *structInfo
 	var field *fieldInfo
 	var index64 int64
-	var err error
 	var parts []pathPart
 	var path []string
 	for keyStart := 0; ; {
@@ -63,14 +62,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		if struc = c.get(t); struc == nil {
 			return nil, errInvalidPath
 		}
-		keyEnd := keyStart
-		for keyEnd < len(p) && p[keyEnd] != '.' {
-			keyEnd++
-		}
-		if keyStart == keyEnd {
+		keyEnd, segment, err := nextPathSegment(p, keyStart)
+		if err != nil {
 			return nil, errInvalidPath
 		}
-		if field = struc.get(p[keyStart:keyEnd]); field == nil {
+		if field = struc.get(segment); field == nil {
 			return nil, errInvalidPath
 		}
 		// Valid field. Append index.
@@ -87,14 +83,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 			if keyStart >= len(p) {
 				return nil, errInvalidPath
 			}
-			keyEnd = keyStart
-			for keyEnd < len(p) && p[keyEnd] != '.' {
-				keyEnd++
-			}
-			if keyStart == keyEnd {
+			keyEnd, segment, err = nextPathSegment(p, keyStart)
+			if err != nil {
 				return nil, errInvalidPath
 			}
-			if index64, err = utils.ParseInt(p[keyStart:keyEnd]); err != nil {
+			if index64, err = utils.ParseInt(segment); err != nil {
 				return nil, errInvalidPath
 			}
 			if index64 > maxParserIndex {
@@ -142,6 +135,17 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	return parts, nil
 }
 
+func nextPathSegment(path string, start int) (int, string, error) {
+	end := start
+	for end < len(path) && path[end] != '.' {
+		end++
+	}
+	if start == end {
+		return 0, "", errInvalidPath
+	}
+	return end, path[start:end], nil
+}
+
 // get returns a cached structInfo, creating it if necessary.
 func (c *cache) get(t reflect.Type) *structInfo {
 	c.l.RLock()
@@ -184,8 +188,9 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
 	for _, field := range info.fields {
-		if _, exists := info.fieldsByName[field.alias]; !exists {
-			info.fieldsByName[field.alias] = field
+		aliasKey := utils.ToLower(field.alias)
+		if _, exists := info.fieldsByName[aliasKey]; !exists {
+			info.fieldsByName[aliasKey] = field
 		}
 	}
 	return info
@@ -256,7 +261,7 @@ type structInfo struct {
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
-	if field, ok := i.fieldsByName[alias]; ok {
+	if field, ok := i.fieldsByName[utils.ToLower(alias)]; ok {
 		return field
 	}
 	for _, field := range i.fields {
