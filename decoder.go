@@ -410,14 +410,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			v = v.Elem()
 		}
 
-		// alloc embedded structs
+		// Allocate embedded anonymous pointers required for promoted fields.
 		if v.Type().Kind() == reflect.Struct {
-			for i := 0; i < v.NumField(); i++ {
-				field := v.Field(i)
-				if field.Type().Kind() == reflect.Ptr && field.IsNil() && v.Type().Field(i).Anonymous {
-					field.Set(reflect.New(field.Type().Elem()))
-				}
-			}
+			d.ensureAnonymousPtrs(v)
 		}
 
 		v = v.FieldByName(name)
@@ -617,6 +612,16 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		}
 	}
 	return nil
+}
+
+func (d *Decoder) ensureAnonymousPtrs(v reflect.Value) {
+	info := d.cache.get(v.Type())
+	for _, idx := range info.anonymousPtrFields {
+		field := v.Field(idx)
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+	}
 }
 
 func isTextUnmarshaler(v reflect.Value) unmarshaler {
