@@ -8,6 +8,7 @@ jobs:
   notify:
     uses: gofiber/.github/.github/workflows/after-release.yml@main
     with:
-      repos: '["gofiber/fiber"]'
+      repos: |
+        - gofiber/fiber
     secrets:
       dispatch-token: ${{ secrets.DISPATCH_TOKEN }}
