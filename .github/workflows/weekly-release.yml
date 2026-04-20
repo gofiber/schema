@@ -32,3 +32,6 @@ jobs:
       repo-type: single
       dry-run: ${{ inputs.dry-run || false }}
       draft-tags: ${{ inputs.draft-tags || '' }}
+      post-release-events: after-release
+    secrets:
+      dispatch-token: ${{ secrets.DISPATCH_TOKEN }}
