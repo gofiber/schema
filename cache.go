@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	utils "github.com/gofiber/utils/v2"
+	utilstrings "github.com/gofiber/utils/v2/strings"
 )
 
 const maxParserIndex = 1000
@@ -188,7 +189,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
 	for _, field := range info.fields {
-		aliasKey := utils.ToLower(field.alias)
+		aliasKey := utilstrings.ToLower(field.alias)
 		if _, exists := info.fieldsByName[aliasKey]; !exists {
 			info.fieldsByName[aliasKey] = field
 		}
@@ -261,12 +262,12 @@ type structInfo struct {
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
-	aliasKey := utils.ToLower(alias)
+	aliasKey := utilstrings.ToLower(alias)
 	if field, ok := i.fieldsByName[aliasKey]; ok {
 		return field
 	}
 	for _, field := range i.fields {
-		if utils.ToLower(field.alias) == aliasKey {
+		if utilstrings.ToLower(field.alias) == aliasKey {
 			return field
 		}
 	}
