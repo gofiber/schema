@@ -209,7 +209,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				// this check is to handle if the wrong value is provided
 				conv := getBuiltinConverter(f.typ.Kind())
 				if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
-					vCurrent.Set(conv(f.defaultValue))
+					vCurrent.Set(convertedVal)
 				}
 			}
 		}

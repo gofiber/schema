@@ -288,8 +288,6 @@ type fieldInfo struct {
 	// unmarshalerInfo contains information regarding the
 	// encoding.TextUnmarshaler implementation of the field type.
 	unmarshalerInfo unmarshaler
-	// encoderFunc is the cached encoder function for this field's type.
-	encoderFunc encoderFunc
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.
