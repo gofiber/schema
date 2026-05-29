@@ -786,6 +786,35 @@ func TestSetAliasTag(t *testing.T) {
 	}
 }
 
+func TestSetAliasTagAfterCacheWarm(t *testing.T) {
+	type aliased struct {
+		ID string `schema:"schema_id" json:"json_id"`
+	}
+
+	dec := NewDecoder()
+
+	var schemaTagged aliased
+	err := dec.Decode(&schemaTagged, map[string][]string{
+		"schema_id": {"schema"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode schema tag: %v", err)
+	}
+
+	dec.SetAliasTag("json")
+
+	var jsonTagged aliased
+	err = dec.Decode(&jsonTagged, map[string][]string{
+		"json_id": {"json"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode json tag after alias change: %v", err)
+	}
+	if jsonTagged.ID != "json" {
+		t.Fatalf("Bad value after alias change: got %q, want %q", jsonTagged.ID, "json")
+	}
+}
+
 func TestZeroEmpty(t *testing.T) {
 	data := map[string][]string{
 		"F01": {""},
@@ -1356,6 +1385,36 @@ func TestRegisterConverter(t *testing.T) {
 	}
 	if s1.Bb != Bb(2) {
 		t.Errorf("s1.Bb: expected %v, got %v", 2, s1.Bb)
+	}
+}
+
+func TestRegisterConverterAfterCacheWarm(t *testing.T) {
+	type custom int
+	type payload struct {
+		Value custom `schema:"value"`
+	}
+
+	decoder := NewDecoder()
+
+	var warmed payload
+	err := decoder.Decode(&warmed, map[string][]string{})
+	if err != nil {
+		t.Fatalf("Failed to warm decoder cache: %v", err)
+	}
+
+	decoder.RegisterConverter(custom(0), func(s string) reflect.Value {
+		return reflect.ValueOf(custom(42))
+	})
+
+	var result payload
+	err = decoder.Decode(&result, map[string][]string{
+		"value": {"ignored"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode with registered converter after cache warm: %v", err)
+	}
+	if result.Value != custom(42) {
+		t.Fatalf("Bad value: got %v, want %v", result.Value, custom(42))
 	}
 }
 

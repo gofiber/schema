@@ -24,24 +24,34 @@ var (
 // newCache returns a new cache.
 func newCache() *cache {
 	c := cache{
-		m:       make(map[reflect.Type]*structInfo),
-		regconv: make(map[reflect.Type]Converter),
-		tag:     "schema",
+		m:         make(map[reflect.Type]*structInfo),
+		pathCache: make(map[pathCacheKey][]pathPart),
+		regconv:   make(map[reflect.Type]Converter),
+		tag:       "schema",
 	}
 	return &c
 }
 
 // cache caches meta-data about a struct.
 type cache struct {
-	l       sync.RWMutex
-	m       map[reflect.Type]*structInfo
-	regconv map[reflect.Type]Converter
-	tag     string
+	l         sync.RWMutex
+	m         map[reflect.Type]*structInfo
+	pathCache map[pathCacheKey][]pathPart
+	regconv   map[reflect.Type]Converter
+	tag       string
+}
+
+type pathCacheKey struct {
+	path string
+	typ  reflect.Type
 }
 
 // registerConverter registers a converter function for a custom type.
 func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
+	c.l.Lock()
 	c.regconv[reflect.TypeOf(value)] = converterFunc
+	c.reset()
+	c.l.Unlock()
 }
 
 // parsePath parses a path in dotted notation verifying that it is a valid
@@ -51,6 +61,14 @@ func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
 // reflect.Value.FieldByString(). Multiple parts are required for slices of
 // structs.
 func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
+	cacheKey := pathCacheKey{path: p, typ: t}
+	c.l.RLock()
+	cached, ok := c.pathCache[cacheKey]
+	c.l.RUnlock()
+	if ok {
+		return cached, nil
+	}
+
 	var struc *structInfo
 	var field *fieldInfo
 	var index64 int64
@@ -133,6 +151,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		field: field,
 		index: -1,
 	})
+
+	c.l.Lock()
+	c.pathCache[cacheKey] = parts
+	c.l.Unlock()
+
 	return parts, nil
 }
 
@@ -159,6 +182,11 @@ func (c *cache) get(t reflect.Type) *structInfo {
 		c.l.Unlock()
 	}
 	return info
+}
+
+func (c *cache) reset() {
+	c.m = make(map[reflect.Type]*structInfo)
+	c.pathCache = make(map[pathCacheKey][]pathPart)
 }
 
 // create creates a structInfo with meta-data about a struct.
