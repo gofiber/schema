@@ -11,11 +11,19 @@ import (
 	"mime/multipart"
 	"reflect"
 	"strings"
+	"sync"
 )
 
 const (
 	defaultMaxSize = 16000
 )
+
+var decodeValueBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]reflect.Value, 0, 8)
+		return &buf
+	},
+}
 
 // NewDecoder returns a new Decoder.
 func NewDecoder() *Decoder {
@@ -416,7 +424,13 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	conv := d.cache.converter(t)
 	m := isTextUnmarshaler(v)
 	if conv == nil && t.Kind() == reflect.Slice && m.IsSliceElement {
-		var items []reflect.Value
+		itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
+		items := (*itemsBuf)[:0]
+		defer func() {
+			clear(items)
+			*itemsBuf = items[:0]
+			decodeValueBufferPool.Put(itemsBuf)
+		}()
 		elemT := t.Elem()
 		isPtrElem := elemT.Kind() == reflect.Ptr
 		if isPtrElem {

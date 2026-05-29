@@ -3735,6 +3735,29 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	}
 }
 
+func TestDecodeSliceReplacesPreviousValues(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"1,2,3"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{1, 2, 3}) {
+		t.Fatalf("unexpected initial slice: %v", s.N)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"4"}}); err != nil {
+		t.Fatalf("unexpected error on second decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{4}) {
+		t.Fatalf("unexpected slice after second decode: %v", s.N)
+	}
+}
+
 func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
 	type target struct {
 		A []IntAlias `schema:"a"`
