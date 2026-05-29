@@ -227,6 +227,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			info.fieldsByName[aliasKey] = field
 		}
 	}
+	info.requiredFields = c.buildRequiredFields(info)
 	return info
 }
 
@@ -292,6 +293,7 @@ type structInfo struct {
 	fields             []*fieldInfo
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
+	requiredFields     map[string][]fieldWithPrefix
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
@@ -305,6 +307,33 @@ func (i *structInfo) get(alias string) *fieldInfo {
 		}
 	}
 	return nil
+}
+
+func (c *cache) buildRequiredFields(info *structInfo) map[string][]fieldWithPrefix {
+	var requiredFields map[string][]fieldWithPrefix
+	for _, field := range info.fields {
+		if field.typ.Kind() == reflect.Struct {
+			nested := c.get(field.typ)
+			for _, prefix := range field.paths("") {
+				nestedPrefix := prefix + "."
+				for key, fields := range nested.requiredFields {
+					requiredKey := field.canonicalAlias + "." + key
+					for _, nestedField := range fields {
+						requiredFields = appendRequiredField(requiredFields, requiredKey, fieldWithPrefix{
+							fieldInfo: nestedField.fieldInfo,
+							prefix:    nestedPrefix + nestedField.prefix,
+						})
+					}
+				}
+			}
+		}
+		if field.isRequired {
+			requiredFields = appendRequiredField(requiredFields, field.canonicalAlias, fieldWithPrefix{
+				fieldInfo: field,
+			})
+		}
+	}
+	return requiredFields
 }
 
 func containsAlias(infos []*structInfo, alias string) bool {

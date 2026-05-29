@@ -114,28 +114,28 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 
 	v = v.Elem()
 	t := v.Type()
-	multiErrors := MultiError{}
+	var multiErrors MultiError
 	for path, values := range src {
 		if parts, err := d.cache.parsePath(path, t); err == nil {
 			if filesSlice, ok := multipartFiles[path]; ok {
 				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
-					multiErrors[path] = err
+					multiErrors = appendError(multiErrors, path, err)
 				}
 			} else {
 				if err = d.decode(v, path, parts, values, nil); err != nil {
-					multiErrors[path] = err
+					multiErrors = appendError(multiErrors, path, err)
 				}
 			}
 		} else {
 			if errors.Is(err, errIndexTooLarge) {
-				multiErrors[path] = err
+				multiErrors = appendError(multiErrors, path, err)
 			} else if !d.ignoreUnknownKeys {
-				multiErrors[path] = UnknownKeyError{Key: path}
+				multiErrors = appendError(multiErrors, path, UnknownKeyError{Key: path})
 			}
 		}
 	}
-	multiErrors.merge(d.setDefaults(t, v, src, ""))
-	multiErrors.merge(d.checkRequired(t, src))
+	multiErrors = mergeErrors(multiErrors, d.setDefaults(t, v, src, ""))
+	multiErrors = mergeErrors(multiErrors, d.checkRequired(t, src))
 	if len(multiErrors) > 0 {
 		return multiErrors
 	}
@@ -152,7 +152,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
 
-	errs := MultiError{}
+	var errs MultiError
 
 	if v.Type().Kind() == reflect.Struct {
 		for i := 0; i < v.NumField(); i++ {
@@ -173,16 +173,16 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		}
 
 		if f.defaultValue != "" && f.isRequired {
-			errs.merge(MultiError{"default-" + f.name: errors.New("required fields cannot have a default value")})
+			errs = appendError(errs, "default-"+f.name, errors.New("required fields cannot have a default value"))
 		} else if f.defaultValue != "" && vCurrent.IsZero() && !f.isRequired && !fieldProvided(src, prefix, f) {
 			if f.typ.Kind() == reflect.Struct {
-				errs.merge(MultiError{"default-" + f.name: errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")})
+				errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 			} else if f.typ.Kind() == reflect.Slice {
 				vals := strings.Split(f.defaultValue, "|")
 
 				// check if slice has one of the supported types for defaults
 				if _, ok := builtinConverters[f.typ.Elem().Kind()]; !ok {
-					errs.merge(MultiError{"default-" + f.name: errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")})
+					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 					continue
 				}
 
@@ -191,7 +191,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 					// this check is to handle if the wrong value is provided
 					convertedVal := builtinConverters[f.typ.Elem().Kind()](val)
 					if !convertedVal.IsValid() {
-						errs.merge(MultiError{"default-" + f.name: fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name)})
+						errs = appendError(errs, "default-"+f.name, fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name))
 						break
 					}
 					defaultSlice = reflect.Append(defaultSlice, convertedVal)
@@ -201,7 +201,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				t1 := f.typ.Elem()
 
 				if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
-					errs.merge(MultiError{"default-" + f.name: errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")})
+					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 				}
 
 				// this check is to handle if the wrong value is provided
@@ -225,10 +225,11 @@ func isPointerToStruct(v reflect.Value) bool {
 }
 
 func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
-	for _, p := range f.paths(prefix) {
-		if _, ok := src[p]; ok {
-			return true
-		}
+	if hasFieldPath(src, prefix, f.alias) {
+		return true
+	}
+	if f.alias != f.canonicalAlias && hasFieldPath(src, prefix, f.canonicalAlias) {
+		return true
 	}
 	return false
 }
@@ -239,50 +240,17 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 //
 // src is the source map for decoding, we use it here to see if those required fields are included in src
 func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiError {
-	m, errs := d.findRequiredFields(t, "", "")
-	for key, fields := range m {
+	struc := d.cache.get(t)
+	if struc == nil {
+		return MultiError{t.Name() + "*": errors.New("cache fail")}
+	}
+	var errs MultiError
+	for key, fields := range struc.requiredFields {
 		if isEmptyFields(fields, src) {
-			errs[key] = EmptyFieldError{Key: key}
+			errs = appendError(errs, key, EmptyFieldError{Key: key})
 		}
 	}
 	return errs
-}
-
-// findRequiredFields recursively searches the struct type t for required fields.
-//
-// canonicalPrefix and searchPrefix are used to resolve full paths in dotted notation
-// for nested struct fields. canonicalPrefix is a complete path which never omits
-// any embedded struct fields. searchPrefix is a user-friendly path which may omit
-// some embedded struct fields to point promoted fields.
-func (d *Decoder) findRequiredFields(t reflect.Type, canonicalPrefix, searchPrefix string) (map[string][]fieldWithPrefix, MultiError) {
-	struc := d.cache.get(t)
-	if struc == nil {
-		// unexpect, cache.get never return nil
-		return nil, MultiError{canonicalPrefix + "*": errors.New("cache fail")}
-	}
-
-	m := map[string][]fieldWithPrefix{}
-	errs := MultiError{}
-	for _, f := range struc.fields {
-		if f.typ.Kind() == reflect.Struct {
-			fcprefix := canonicalPrefix + f.canonicalAlias + "."
-			for _, fspath := range f.paths(searchPrefix) {
-				fm, ferrs := d.findRequiredFields(f.typ, fcprefix, fspath+".")
-				for key, fields := range fm {
-					m[key] = append(m[key], fields...)
-				}
-				errs.merge(ferrs)
-			}
-		}
-		if f.isRequired {
-			key := canonicalPrefix + f.canonicalAlias
-			m[key] = append(m[key], fieldWithPrefix{
-				fieldInfo: f,
-				prefix:    searchPrefix,
-			})
-		}
-	}
-	return m, errs
 }
 
 type fieldWithPrefix struct {
@@ -293,26 +261,11 @@ type fieldWithPrefix struct {
 // isEmptyFields returns true if all of specified fields are empty.
 func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
 	for _, f := range fields {
-		for _, path := range f.paths(f.prefix) {
-			v, ok := src[path]
-			if ok && !isEmpty(f.typ, v) {
-				return false
-			}
-			for key := range src {
-				nested := strings.IndexByte(key, '.') != -1
-
-				// for non required nested structs
-				c1 := strings.HasSuffix(f.prefix, ".") && key == path
-
-				// for required nested structs
-				c2 := f.prefix == "" && nested && strings.HasPrefix(key, path)
-
-				// for non nested fields
-				c3 := f.prefix == "" && !nested && key == path
-				if !isEmpty(f.typ, src[key]) && (c1 || c2 || c3) {
-					return false
-				}
-			}
+		if hasValueForPath(src, f.typ, f.prefix, f.alias) {
+			return false
+		}
+		if f.alias != f.canonicalAlias && hasValueForPath(src, f.typ, f.prefix, f.canonicalAlias) {
+			return false
 		}
 	}
 	return true
@@ -759,4 +712,75 @@ func (e MultiError) merge(errors MultiError) {
 			e[key] = err
 		}
 	}
+}
+
+func appendRequiredField(m map[string][]fieldWithPrefix, key string, field fieldWithPrefix) map[string][]fieldWithPrefix {
+	if m == nil {
+		m = make(map[string][]fieldWithPrefix)
+	}
+	m[key] = append(m[key], field)
+	return m
+}
+
+func appendError(m MultiError, key string, err error) MultiError {
+	if err == nil {
+		return m
+	}
+	if m == nil {
+		m = make(MultiError)
+	}
+	if m[key] == nil {
+		m[key] = err
+	}
+	return m
+}
+
+func mergeErrors(dst, src MultiError) MultiError {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make(MultiError, len(src))
+	}
+	for key, err := range src {
+		if dst[key] == nil {
+			dst[key] = err
+		}
+	}
+	return dst
+}
+
+func hasFieldPath(src map[string][]string, prefix, suffix string) bool {
+	if prefix == "" {
+		_, ok := src[suffix]
+		return ok
+	}
+	_, ok := src[prefix+suffix]
+	return ok
+}
+
+func hasValueForPath(src map[string][]string, typ reflect.Type, prefix, suffix string) bool {
+	path := suffix
+	if prefix != "" {
+		path = prefix + suffix
+	}
+	if value, ok := src[path]; ok && !isEmpty(typ, value) {
+		return true
+	}
+	for key, value := range src {
+		nested := strings.IndexByte(key, '.') != -1
+
+		// for non required nested structs
+		c1 := strings.HasSuffix(prefix, ".") && key == path
+
+		// for required nested structs
+		c2 := prefix == "" && nested && strings.HasPrefix(key, path)
+
+		// for non nested fields
+		c3 := prefix == "" && !nested && key == path
+		if !isEmpty(typ, value) && (c1 || c2 || c3) {
+			return true
+		}
+	}
+	return false
 }
