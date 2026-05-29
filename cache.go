@@ -153,7 +153,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	})
 
 	c.l.Lock()
-	c.pathCache[cacheKey] = parts
+	if cached, ok := c.pathCache[cacheKey]; ok {
+		parts = cached
+	} else {
+		c.pathCache[cacheKey] = parts
+	}
 	c.l.Unlock()
 
 	return parts, nil
