@@ -154,10 +154,10 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 
 	c.l.Lock()
 	if cached, ok := c.pathCache[cacheKey]; ok {
-		parts = cached
-	} else {
-		c.pathCache[cacheKey] = parts
+		c.l.Unlock()
+		return cached, nil
 	}
+	c.pathCache[cacheKey] = parts
 	c.l.Unlock()
 
 	return parts, nil
@@ -188,6 +188,7 @@ func (c *cache) get(t reflect.Type) *structInfo {
 	return info
 }
 
+// reset clears cached metadata and must be called with c.l held.
 func (c *cache) reset() {
 	c.m = make(map[reflect.Type]*structInfo)
 	c.pathCache = make(map[pathCacheKey][]pathPart)
