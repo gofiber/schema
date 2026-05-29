@@ -31,7 +31,27 @@ var (
 	uint64Type   = reflect.Uint64
 )
 
-// Default converters for basic types.
+// builtinConvertersArray is an array indexed by reflect.Kind for O(1) lookup.
+var builtinConvertersArray [reflect.UnsafePointer + 1]Converter
+
+func init() {
+	builtinConvertersArray[reflect.Bool] = convertBool
+	builtinConvertersArray[reflect.Float32] = convertFloat32
+	builtinConvertersArray[reflect.Float64] = convertFloat64
+	builtinConvertersArray[reflect.Int] = convertInt
+	builtinConvertersArray[reflect.Int8] = convertInt8
+	builtinConvertersArray[reflect.Int16] = convertInt16
+	builtinConvertersArray[reflect.Int32] = convertInt32
+	builtinConvertersArray[reflect.Int64] = convertInt64
+	builtinConvertersArray[reflect.String] = convertString
+	builtinConvertersArray[reflect.Uint] = convertUint
+	builtinConvertersArray[reflect.Uint8] = convertUint8
+	builtinConvertersArray[reflect.Uint16] = convertUint16
+	builtinConvertersArray[reflect.Uint32] = convertUint32
+	builtinConvertersArray[reflect.Uint64] = convertUint64
+}
+
+// builtinConverters is kept for backward compatibility with tests.
 var builtinConverters = map[reflect.Kind]Converter{
 	boolType:    convertBool,
 	float32Type: convertFloat32,
@@ -47,6 +67,14 @@ var builtinConverters = map[reflect.Kind]Converter{
 	uint16Type:  convertUint16,
 	uint32Type:  convertUint32,
 	uint64Type:  convertUint64,
+}
+
+// getBuiltinConverter returns the converter for a kind using O(1) array lookup.
+func getBuiltinConverter(k reflect.Kind) Converter {
+	if k <= reflect.UnsafePointer {
+		return builtinConvertersArray[k]
+	}
+	return nil
 }
 
 func convertBool(value string) reflect.Value {
@@ -147,78 +175,55 @@ func convertUint64(value string) reflect.Value {
 }
 
 func convertPointer(k reflect.Kind, value string) reflect.Value {
-	switch k {
-	case boolType:
-		if v := convertBool(value); v.IsValid() {
+	conv := getBuiltinConverter(k)
+	if conv == nil {
+		return invalidValue
+	}
+	if v := conv(value); v.IsValid() {
+		switch k {
+		case boolType:
 			converted := v.Bool()
 			return reflect.ValueOf(&converted)
-		}
-	case float32Type:
-		if v := convertFloat32(value); v.IsValid() {
+		case float32Type:
 			converted := float32(v.Float())
 			return reflect.ValueOf(&converted)
-		}
-	case float64Type:
-		if v := convertFloat64(value); v.IsValid() {
-			converted := float64(v.Float())
+		case float64Type:
+			converted := v.Float()
 			return reflect.ValueOf(&converted)
-		}
-	case intType:
-		if v := convertInt(value); v.IsValid() {
+		case intType:
 			converted := int(v.Int())
 			return reflect.ValueOf(&converted)
-		}
-	case int8Type:
-		if v := convertInt8(value); v.IsValid() {
+		case int8Type:
 			converted := int8(v.Int())
 			return reflect.ValueOf(&converted)
-		}
-	case int16Type:
-		if v := convertInt16(value); v.IsValid() {
+		case int16Type:
 			converted := int16(v.Int())
 			return reflect.ValueOf(&converted)
-		}
-	case int32Type:
-		if v := convertInt32(value); v.IsValid() {
+		case int32Type:
 			converted := int32(v.Int())
 			return reflect.ValueOf(&converted)
-		}
-	case int64Type:
-		if v := convertInt64(value); v.IsValid() {
-			converted := int64(v.Int())
+		case int64Type:
+			converted := v.Int()
 			return reflect.ValueOf(&converted)
-		}
-	case stringType:
-		if v := convertString(value); v.IsValid() {
+		case stringType:
 			converted := v.String()
 			return reflect.ValueOf(&converted)
-		}
-	case uintType:
-		if v := convertUint(value); v.IsValid() {
+		case uintType:
 			converted := uint(v.Uint())
 			return reflect.ValueOf(&converted)
-		}
-	case uint8Type:
-		if v := convertUint8(value); v.IsValid() {
+		case uint8Type:
 			converted := uint8(v.Uint())
 			return reflect.ValueOf(&converted)
-		}
-	case uint16Type:
-		if v := convertUint16(value); v.IsValid() {
+		case uint16Type:
 			converted := uint16(v.Uint())
 			return reflect.ValueOf(&converted)
-		}
-	case uint32Type:
-		if v := convertUint32(value); v.IsValid() {
+		case uint32Type:
 			converted := uint32(v.Uint())
 			return reflect.ValueOf(&converted)
-		}
-	case uint64Type:
-		if v := convertUint64(value); v.IsValid() {
-			converted := uint64(v.Uint())
+		case uint64Type:
+			converted := v.Uint()
 			return reflect.ValueOf(&converted)
 		}
 	}
-
 	return invalidValue
 }

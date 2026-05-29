@@ -178,7 +178,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				vals := strings.Split(f.defaultValue, "|")
 
 				// check if slice has one of the supported types for defaults
-				if _, ok := builtinConverters[f.typ.Elem().Kind()]; !ok {
+				if getBuiltinConverter(f.typ.Elem().Kind()) == nil {
 					errs.merge(MultiError{"default-" + f.name: errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")})
 					continue
 				}
@@ -186,7 +186,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				defaultSlice := reflect.MakeSlice(f.typ, 0, cap(vals))
 				for _, val := range vals {
 					// this check is to handle if the wrong value is provided
-					convertedVal := builtinConverters[f.typ.Elem().Kind()](val)
+					convertedVal := getBuiltinConverter(f.typ.Elem().Kind())(val)
 					if !convertedVal.IsValid() {
 						errs.merge(MultiError{"default-" + f.name: fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name)})
 						break
@@ -207,8 +207,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				}
 			} else {
 				// this check is to handle if the wrong value is provided
-				if convertedVal := builtinConverters[f.typ.Kind()](f.defaultValue); convertedVal.IsValid() {
-					vCurrent.Set(builtinConverters[f.typ.Kind()](f.defaultValue))
+				conv := getBuiltinConverter(f.typ.Kind())
+				if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
+					vCurrent.Set(conv(f.defaultValue))
 				}
 			}
 		}
@@ -237,6 +238,9 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 // src is the source map for decoding, we use it here to see if those required fields are included in src
 func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiError {
 	m, errs := d.findRequiredFields(t, "", "")
+	if len(m) == 0 {
+		return errs
+	}
 	for key, fields := range m {
 		if isEmptyFields(fields, src) {
 			errs[key] = EmptyFieldError{Key: key}
@@ -295,19 +299,29 @@ func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
 			if ok && !isEmpty(f.typ, v) {
 				return false
 			}
-			for key := range src {
-				nested := strings.IndexByte(key, '.') != -1
-
+			// Check for nested keys that match this field.
+			pathDot := path + "."
+			for key, val := range src {
+				if len(val) == 0 {
+					continue
+				}
 				// for non required nested structs
-				c1 := strings.HasSuffix(f.prefix, ".") && key == path
-
+				if strings.HasSuffix(f.prefix, ".") && key == path {
+					if !isEmpty(f.typ, val) {
+						return false
+					}
+				}
 				// for required nested structs
-				c2 := f.prefix == "" && nested && strings.HasPrefix(key, path)
-
+				if f.prefix == "" && strings.HasPrefix(key, pathDot) {
+					if !isEmpty(f.typ, val) {
+						return false
+					}
+				}
 				// for non nested fields
-				c3 := f.prefix == "" && !nested && key == path
-				if !isEmpty(f.typ, src[key]) && (c1 || c2 || c3) {
-					return false
+				if f.prefix == "" && key == path {
+					if !isEmpty(f.typ, val) {
+						return false
+					}
 				}
 			}
 		}
@@ -470,7 +484,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		// Try to get a converter for the element type.
 		conv := d.cache.converter(elemT)
 		if conv == nil {
-			conv = builtinConverters[elemT.Kind()]
+			conv = getBuiltinConverter(elemT.Kind())
 			if conv == nil {
 				// As we are not dealing with slice of structs here, we don't need to check if the type
 				// implements TextUnmarshaler interface
@@ -597,7 +611,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			if d.zeroEmpty {
 				v.Set(reflect.Zero(t))
 			}
-		} else if conv := builtinConverters[t.Kind()]; conv != nil {
+		} else if conv := getBuiltinConverter(t.Kind()); conv != nil {
 			if value := conv(val); value.IsValid() {
 				v.Set(value.Convert(t))
 			} else {

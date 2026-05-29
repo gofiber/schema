@@ -53,28 +53,27 @@ func isZero(v reflect.Value) bool {
 	case reflect.Map, reflect.Slice:
 		return v.IsNil() || v.Len() == 0
 	case reflect.Array:
-		z := true
 		for i := 0; i < v.Len(); i++ {
-			z = z && isZero(v.Index(i))
+			if !isZero(v.Index(i)) {
+				return false
+			}
 		}
-		return z
+		return true
 	case reflect.Struct:
-		type zero interface {
-			IsZero() bool
+		if v.CanInterface() {
+			if iz, ok := v.Interface().(interface{ IsZero() bool }); ok {
+				return iz.IsZero()
+			}
 		}
-		if v.Type().Implements(reflect.TypeOf((*zero)(nil)).Elem()) {
-			iz, _ := reflect.TypeAssert[bool](v.MethodByName("IsZero").Call([]reflect.Value{})[0])
-			return iz
-		}
-		z := true
 		for i := 0; i < v.NumField(); i++ {
-			z = z && isZero(v.Field(i))
+			if !isZero(v.Field(i)) {
+				return false
+			}
 		}
-		return z
+		return true
 	}
 	// Compare other types directly:
-	z := reflect.Zero(v.Type())
-	return v.Interface() == z.Interface()
+	return v.IsZero()
 }
 
 func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
@@ -109,11 +108,10 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 
 		// Encode non-slice types and custom implementations immediately.
 		if encFunc != nil {
-			value := encFunc(fieldValue)
 			if opts.Contains("omitempty") && isZero(fieldValue) {
 				continue
 			}
-
+			value := encFunc(fieldValue)
 			dst[name] = append(dst[name], value)
 			continue
 		}

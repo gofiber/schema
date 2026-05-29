@@ -152,19 +152,15 @@ func TestIsZeroCases(t *testing.T) {
 }
 
 func TestIsZeroFuncAndMap(t *testing.T) {
-	tests := map[string]func(){
-		"nil":     nil,
-		"non-nil": func() {},
+	// nil func should be zero
+	var nilFn func()
+	if !isZero(reflect.ValueOf(nilFn)) {
+		t.Errorf("nil func should be zero")
 	}
-	for name, fn := range tests {
-		t.Run(name, func(t *testing.T) {
-			defer func() {
-				if r := recover(); r == nil {
-					t.Errorf("expected panic for %s func", name)
-				}
-			}()
-			isZero(reflect.ValueOf(fn))
-		})
+	// non-nil func should not be zero
+	nonNilFn := func() {}
+	if isZero(reflect.ValueOf(nonNilFn)) {
+		t.Errorf("non-nil func should not be zero")
 	}
 
 	var m map[string]int
