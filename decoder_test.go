@@ -2445,6 +2445,52 @@ func TestRequiredFieldsCannotHaveDefaults(t *testing.T) {
 	}
 }
 
+func TestNestedDefaultErrorsDoNotPanic(t *testing.T) {
+	t.Run("struct field", func(t *testing.T) {
+		type Inner struct {
+			Value string `schema:"value,required,default:test"`
+		}
+		type Outer struct {
+			Inner Inner `schema:"inner"`
+		}
+
+		var dst Outer
+		err := NewDecoder().Decode(&dst, map[string][]string{})
+
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+		if _, ok := err.(MultiError); !ok {
+			t.Fatalf("expected MultiError, got %T: %v", err, err)
+		}
+		if !strings.Contains(err.Error(), "required fields cannot have a default value") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("pointer field", func(t *testing.T) {
+		type Inner struct {
+			Value string `schema:"value,required,default:test"`
+		}
+		type Outer struct {
+			Inner *Inner `schema:"inner"`
+		}
+
+		dst := Outer{Inner: &Inner{}}
+		err := NewDecoder().Decode(&dst, map[string][]string{})
+
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+		if _, ok := err.(MultiError); !ok {
+			t.Fatalf("expected MultiError, got %T: %v", err, err)
+		}
+		if !strings.Contains(err.Error(), "required fields cannot have a default value") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestInvalidDefaultElementInSliceRaiseError(t *testing.T) {
 	type D struct {
 		A []int  `schema:"a,default:0|notInt"`

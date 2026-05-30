@@ -175,9 +175,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		vCurrent := v.FieldByName(f.name)
 
 		if vCurrent.Type().Kind() == reflect.Struct && f.defaultValue == "" {
-			errs.merge(d.setDefaults(vCurrent.Type(), vCurrent, src, prefix+f.canonicalAlias+"."))
+			errs = mergeErrors(errs, d.setDefaults(vCurrent.Type(), vCurrent, src, prefix+f.canonicalAlias+"."))
 		} else if isPointerToStruct(vCurrent) && f.defaultValue == "" {
-			errs.merge(d.setDefaults(vCurrent.Elem().Type(), vCurrent.Elem(), src, prefix+f.canonicalAlias+"."))
+			errs = mergeErrors(errs, d.setDefaults(vCurrent.Elem().Type(), vCurrent.Elem(), src, prefix+f.canonicalAlias+"."))
 		}
 
 		if f.defaultValue != "" && f.isRequired {
