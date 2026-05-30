@@ -3743,10 +3743,10 @@ func TestDecodeSliceReplacesPreviousValues(t *testing.T) {
 	dec := NewDecoder()
 	var s target
 
-	if err := dec.Decode(&s, map[string][]string{"n": {"1,2,3"}}); err != nil {
+	if err := dec.Decode(&s, map[string][]string{"n": {"1,2,3,4,5,6,7,8,9"}}); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !reflect.DeepEqual(s.N, []int{1, 2, 3}) {
+	if !reflect.DeepEqual(s.N, []int{1, 2, 3, 4, 5, 6, 7, 8, 9}) {
 		t.Fatalf("unexpected initial slice: %v", s.N)
 	}
 
@@ -3766,5 +3766,59 @@ func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
 	var s target
 	if err := NewDecoder().Decode(&s, map[string][]string{"a": {"1,a"}}); err == nil {
 		t.Fatalf("expected error")
+	}
+}
+
+func TestDecodeSliceErrorLeavesPooledBufferReusable(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	err := dec.Decode(&s, map[string][]string{"n": {"1,nope"}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	multi, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("unexpected error type: %T", err)
+	}
+	if _, ok := multi["n"].(ConversionError); !ok {
+		t.Fatalf("unexpected field error: %v", multi["n"])
+	}
+	if strings.Contains(err.Error(), "panic") {
+		t.Fatalf("unexpected panic-style error: %v", err)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"2,3"}}); err != nil {
+		t.Fatalf("unexpected error after failed decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{2, 3}) {
+		t.Fatalf("unexpected slice after retry: %v", s.N)
+	}
+}
+
+func TestDecodeTextUnmarshalerSliceReplacesPreviousValues(t *testing.T) {
+	type target struct {
+		B []rudeBool `schema:"b"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	if err := dec.Decode(&s, map[string][]string{"b": {"Yup", "Nope", "Yup", "Nope", "Yup", "Nope", "Yup", "Nope", "Yup"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{true, false, true, false, true, false, true, false, true}) {
+		t.Fatalf("unexpected initial slice: %v", s.B)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"b": {"Nope"}}); err != nil {
+		t.Fatalf("unexpected error on second decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
+		t.Fatalf("unexpected slice after second decode: %v", s.B)
 	}
 }
