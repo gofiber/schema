@@ -2446,6 +2446,33 @@ func TestRequiredFieldsCannotHaveDefaults(t *testing.T) {
 }
 
 func TestNestedDefaultErrorsDoNotPanic(t *testing.T) {
+	assertNestedDefaultErrors := func(t *testing.T, err error) {
+		t.Helper()
+
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+
+		multiErr, ok := err.(MultiError)
+		if !ok {
+			t.Fatalf("expected MultiError, got %T: %v", err, err)
+		}
+
+		var foundDefaultError bool
+		for _, itemErr := range multiErr {
+			if itemErr == nil {
+				continue
+			}
+			if itemErr.Error() == "required fields cannot have a default value" {
+				foundDefaultError = true
+			}
+		}
+
+		if !foundDefaultError {
+			t.Fatalf("unexpected errors: %#v", multiErr)
+		}
+	}
+
 	t.Run("struct field", func(t *testing.T) {
 		type Inner struct {
 			Value string `schema:"value,required,default:test"`
@@ -2456,16 +2483,7 @@ func TestNestedDefaultErrorsDoNotPanic(t *testing.T) {
 
 		var dst Outer
 		err := NewDecoder().Decode(&dst, map[string][]string{})
-
-		if err == nil {
-			t.Fatal("expected decode error")
-		}
-		if _, ok := err.(MultiError); !ok {
-			t.Fatalf("expected MultiError, got %T: %v", err, err)
-		}
-		if !strings.Contains(err.Error(), "required fields cannot have a default value") {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		assertNestedDefaultErrors(t, err)
 	})
 
 	t.Run("pointer field", func(t *testing.T) {
@@ -2478,16 +2496,7 @@ func TestNestedDefaultErrorsDoNotPanic(t *testing.T) {
 
 		dst := Outer{Inner: &Inner{}}
 		err := NewDecoder().Decode(&dst, map[string][]string{})
-
-		if err == nil {
-			t.Fatal("expected decode error")
-		}
-		if _, ok := err.(MultiError); !ok {
-			t.Fatalf("expected MultiError, got %T: %v", err, err)
-		}
-		if !strings.Contains(err.Error(), "required fields cannot have a default value") {
-			t.Fatalf("unexpected error: %v", err)
-		}
+		assertNestedDefaultErrors(t, err)
 	})
 }
 
