@@ -178,7 +178,8 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				vals := strings.Split(f.defaultValue, "|")
 
 				// check if slice has one of the supported types for defaults
-				if getBuiltinConverter(f.typ.Elem().Kind()) == nil {
+				conv := getBuiltinConverter(f.typ.Elem().Kind())
+				if conv == nil {
 					errs.merge(MultiError{"default-" + f.name: errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")})
 					continue
 				}
@@ -186,7 +187,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				defaultSlice := reflect.MakeSlice(f.typ, 0, cap(vals))
 				for _, val := range vals {
 					// this check is to handle if the wrong value is provided
-					convertedVal := getBuiltinConverter(f.typ.Elem().Kind())(val)
+					convertedVal := conv(val)
 					if !convertedVal.IsValid() {
 						errs.merge(MultiError{"default-" + f.name: fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name)})
 						break
@@ -305,20 +306,8 @@ func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
 				if len(val) == 0 {
 					continue
 				}
-				// for non required nested structs
-				if strings.HasSuffix(f.prefix, ".") && key == path {
-					if !isEmpty(f.typ, val) {
-						return false
-					}
-				}
-				// for required nested structs
-				if f.prefix == "" && strings.HasPrefix(key, pathDot) {
-					if !isEmpty(f.typ, val) {
-						return false
-					}
-				}
-				// for non nested fields
-				if f.prefix == "" && key == path {
+				// for nested structs
+				if strings.HasPrefix(key, pathDot) {
 					if !isEmpty(f.typ, val) {
 						return false
 					}

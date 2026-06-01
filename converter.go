@@ -31,27 +31,7 @@ var (
 	uint64Type   = reflect.Uint64
 )
 
-// builtinConvertersArray is an array indexed by reflect.Kind for O(1) lookup.
-var builtinConvertersArray [reflect.UnsafePointer + 1]Converter
-
-func init() {
-	builtinConvertersArray[reflect.Bool] = convertBool
-	builtinConvertersArray[reflect.Float32] = convertFloat32
-	builtinConvertersArray[reflect.Float64] = convertFloat64
-	builtinConvertersArray[reflect.Int] = convertInt
-	builtinConvertersArray[reflect.Int8] = convertInt8
-	builtinConvertersArray[reflect.Int16] = convertInt16
-	builtinConvertersArray[reflect.Int32] = convertInt32
-	builtinConvertersArray[reflect.Int64] = convertInt64
-	builtinConvertersArray[reflect.String] = convertString
-	builtinConvertersArray[reflect.Uint] = convertUint
-	builtinConvertersArray[reflect.Uint8] = convertUint8
-	builtinConvertersArray[reflect.Uint16] = convertUint16
-	builtinConvertersArray[reflect.Uint32] = convertUint32
-	builtinConvertersArray[reflect.Uint64] = convertUint64
-}
-
-// builtinConverters is kept for backward compatibility with tests.
+// builtinConverters is the single source of truth for type converters.
 var builtinConverters = map[reflect.Kind]Converter{
 	boolType:    convertBool,
 	float32Type: convertFloat32,
@@ -67,6 +47,15 @@ var builtinConverters = map[reflect.Kind]Converter{
 	uint16Type:  convertUint16,
 	uint32Type:  convertUint32,
 	uint64Type:  convertUint64,
+}
+
+// builtinConvertersArray is an array indexed by reflect.Kind for O(1) lookup.
+var builtinConvertersArray [reflect.UnsafePointer + 1]Converter
+
+func init() {
+	for k, conv := range builtinConverters {
+		builtinConvertersArray[k] = conv
+	}
 }
 
 // getBuiltinConverter returns the converter for a kind using O(1) array lookup.
