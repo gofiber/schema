@@ -222,9 +222,8 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
 	for _, field := range info.fields {
-		aliasKey := utilstrings.ToLower(field.alias)
-		if _, exists := info.fieldsByName[aliasKey]; !exists {
-			info.fieldsByName[aliasKey] = field
+		if _, exists := info.fieldsByName[field.aliasLower]; !exists {
+			info.fieldsByName[field.aliasLower] = field
 		}
 	}
 	info.requiredFields = c.buildRequiredFields(info)
@@ -263,7 +262,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		}
 	}
 	if isStruct = ft.Kind() == reflect.Struct; !isStruct {
-		if c.converter(ft) == nil && builtinConverters[ft.Kind()] == nil {
+		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil {
 			// Type is not supported.
 			return nil
 		}
@@ -273,6 +272,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		typ:              field.Type,
 		name:             field.Name,
 		alias:            alias,
+		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
 		unmarshalerInfo:  m,
 		isSliceOfStructs: isSlice && isStruct,
@@ -300,11 +300,6 @@ func (i *structInfo) get(alias string) *fieldInfo {
 	aliasKey := utilstrings.ToLower(alias)
 	if field, ok := i.fieldsByName[aliasKey]; ok {
 		return field
-	}
-	for _, field := range i.fields {
-		if utilstrings.ToLower(field.alias) == aliasKey {
-			return field
-		}
 	}
 	return nil
 }
@@ -337,8 +332,9 @@ func (c *cache) buildRequiredFields(info *structInfo) map[string][]fieldWithPref
 }
 
 func containsAlias(infos []*structInfo, alias string) bool {
+	aliasKey := utilstrings.ToLower(alias)
 	for _, info := range infos {
-		if info.get(alias) != nil {
+		if _, ok := info.fieldsByName[aliasKey]; ok {
 			return true
 		}
 	}
@@ -350,6 +346,8 @@ type fieldInfo struct {
 	// name is the field name in the struct.
 	name  string
 	alias string
+	// aliasLower is the pre-computed lowercase alias for fast lookups.
+	aliasLower string
 	// canonicalAlias is almost the same as the alias, but is prefixed with
 	// an embedded struct field alias in dotted notation if this field is
 	// promoted from the struct.
@@ -407,8 +405,10 @@ type tagOptions []string
 // parseTag splits a struct field's url tag into its name and comma-separated
 // options.
 func parseTag(tag string) (string, tagOptions) {
-	s := strings.Split(tag, ",")
-	return s[0], s[1:]
+	if idx := strings.IndexByte(tag, ','); idx != -1 {
+		return tag[:idx], strings.Split(tag[idx+1:], ",")
+	}
+	return tag, nil
 }
 
 // Contains checks whether the tagOptions contains the specified option.

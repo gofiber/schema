@@ -160,7 +160,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
 
-	var errs MultiError
+	errs := MultiError{}
 
 	if v.Type().Kind() == reflect.Struct {
 		for i := 0; i < v.NumField(); i++ {
@@ -189,7 +189,8 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				vals := strings.Split(f.defaultValue, "|")
 
 				// check if slice has one of the supported types for defaults
-				if _, ok := builtinConverters[f.typ.Elem().Kind()]; !ok {
+				conv := getBuiltinConverter(f.typ.Elem().Kind())
+				if conv == nil {
 					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 					continue
 				}
@@ -197,7 +198,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				defaultSlice := reflect.MakeSlice(f.typ, 0, cap(vals))
 				for _, val := range vals {
 					// this check is to handle if the wrong value is provided
-					convertedVal := builtinConverters[f.typ.Elem().Kind()](val)
+					convertedVal := conv(val)
 					if !convertedVal.IsValid() {
 						errs = appendError(errs, "default-"+f.name, fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name))
 						break
@@ -218,8 +219,11 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				}
 			} else {
 				// this check is to handle if the wrong value is provided
-				if convertedVal := builtinConverters[f.typ.Kind()](f.defaultValue); convertedVal.IsValid() {
-					vCurrent.Set(builtinConverters[f.typ.Kind()](f.defaultValue))
+				conv := getBuiltinConverter(f.typ.Kind())
+				if conv == nil {
+					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
+				} else if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
+					vCurrent.Set(convertedVal)
 				}
 			}
 		}
@@ -233,11 +237,10 @@ func isPointerToStruct(v reflect.Value) bool {
 }
 
 func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
-	if hasFieldPath(src, prefix, f.alias) {
-		return true
-	}
-	if f.alias != f.canonicalAlias && hasFieldPath(src, prefix, f.canonicalAlias) {
-		return true
+	for _, p := range f.paths(prefix) {
+		if _, ok := src[p]; ok {
+			return true
+		}
 	}
 	return false
 }
@@ -248,17 +251,53 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 //
 // src is the source map for decoding, we use it here to see if those required fields are included in src
 func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiError {
-	struc := d.cache.get(t)
-	if struc == nil {
-		return MultiError{t.Name() + "*": errors.New("cache fail")}
+	m, errs := d.findRequiredFields(t, "", "")
+	if len(m) == 0 {
+		return errs
 	}
-	var errs MultiError
-	for key, fields := range struc.requiredFields {
+	for key, fields := range m {
 		if isEmptyFields(fields, src) {
 			errs = appendError(errs, key, EmptyFieldError{Key: key})
 		}
 	}
 	return errs
+}
+
+// findRequiredFields recursively searches the struct type t for required fields.
+//
+// canonicalPrefix and searchPrefix are used to resolve full paths in dotted notation
+// for nested struct fields. canonicalPrefix is a complete path which never omits
+// any embedded struct fields. searchPrefix is a user-friendly path which may omit
+// some embedded struct fields to point promoted fields.
+func (d *Decoder) findRequiredFields(t reflect.Type, canonicalPrefix, searchPrefix string) (map[string][]fieldWithPrefix, MultiError) {
+	struc := d.cache.get(t)
+	if struc == nil {
+		// unexpect, cache.get never return nil
+		return nil, MultiError{canonicalPrefix + "*": errors.New("cache fail")}
+	}
+
+	m := map[string][]fieldWithPrefix{}
+	errs := MultiError{}
+	for _, f := range struc.fields {
+		if f.typ.Kind() == reflect.Struct {
+			fcprefix := canonicalPrefix + f.canonicalAlias + "."
+			for _, fspath := range f.paths(searchPrefix) {
+				fm, ferrs := d.findRequiredFields(f.typ, fcprefix, fspath+".")
+				for key, fields := range fm {
+					m[key] = append(m[key], fields...)
+				}
+				errs.merge(ferrs)
+			}
+		}
+		if f.isRequired {
+			key := canonicalPrefix + f.canonicalAlias
+			m[key] = append(m[key], fieldWithPrefix{
+				fieldInfo: f,
+				prefix:    searchPrefix,
+			})
+		}
+	}
+	return m, errs
 }
 
 type fieldWithPrefix struct {
@@ -269,11 +308,24 @@ type fieldWithPrefix struct {
 // isEmptyFields returns true if all of specified fields are empty.
 func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
 	for _, f := range fields {
-		if hasValueForPath(src, f.typ, f.prefix, f.alias) {
-			return false
-		}
-		if f.alias != f.canonicalAlias && hasValueForPath(src, f.typ, f.prefix, f.canonicalAlias) {
-			return false
+		for _, path := range f.paths(f.prefix) {
+			v, ok := src[path]
+			if ok && !isEmpty(f.typ, v) {
+				return false
+			}
+			// Check for nested keys that match this field.
+			pathDot := path + "."
+			for key, val := range src {
+				if len(val) == 0 {
+					continue
+				}
+				// for nested structs
+				if strings.HasPrefix(key, pathDot) {
+					if !isEmpty(f.typ, val) {
+						return false
+					}
+				}
+			}
 		}
 	}
 	return true
@@ -440,7 +492,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		// Try to get a converter for the element type.
 		conv := d.cache.converter(elemT)
 		if conv == nil {
-			conv = builtinConverters[elemT.Kind()]
+			conv = getBuiltinConverter(elemT.Kind())
 			if conv == nil {
 				// As we are not dealing with slice of structs here, we don't need to check if the type
 				// implements TextUnmarshaler interface
@@ -567,7 +619,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			if d.zeroEmpty {
 				v.Set(reflect.Zero(t))
 			}
-		} else if conv := builtinConverters[t.Kind()]; conv != nil {
+		} else if conv := getBuiltinConverter(t.Kind()); conv != nil {
 			if value := conv(val); value.IsValid() {
 				v.Set(value.Convert(t))
 			} else {
