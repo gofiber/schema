@@ -815,38 +815,3 @@ func mergeErrors(dst, src MultiError) MultiError {
 	}
 	return dst
 }
-
-func hasFieldPath(src map[string][]string, prefix, suffix string) bool {
-	if prefix == "" {
-		_, ok := src[suffix]
-		return ok
-	}
-	_, ok := src[prefix+suffix]
-	return ok
-}
-
-func hasValueForPath(src map[string][]string, typ reflect.Type, prefix, suffix string) bool {
-	path := suffix
-	if prefix != "" {
-		path = prefix + suffix
-	}
-	if value, ok := src[path]; ok && !isEmpty(typ, value) {
-		return true
-	}
-	for key, value := range src {
-		nested := strings.IndexByte(key, '.') != -1
-
-		// for non required nested structs
-		c1 := strings.HasSuffix(prefix, ".") && key == path
-
-		// for required nested structs
-		c2 := prefix == "" && nested && strings.HasPrefix(key, path)
-
-		// for non nested fields
-		c3 := prefix == "" && !nested && key == path
-		if !isEmpty(typ, value) && (c1 || c2 || c3) {
-			return true
-		}
-	}
-	return false
-}
