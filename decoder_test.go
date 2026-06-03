@@ -786,6 +786,35 @@ func TestSetAliasTag(t *testing.T) {
 	}
 }
 
+func TestSetAliasTagAfterCacheWarm(t *testing.T) {
+	type aliased struct {
+		ID string `schema:"schema_id" json:"json_id"`
+	}
+
+	dec := NewDecoder()
+
+	var schemaTagged aliased
+	err := dec.Decode(&schemaTagged, map[string][]string{
+		"schema_id": {"schema"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode schema tag: %v", err)
+	}
+
+	dec.SetAliasTag("json")
+
+	var jsonTagged aliased
+	err = dec.Decode(&jsonTagged, map[string][]string{
+		"json_id": {"json"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode json tag after alias change: %v", err)
+	}
+	if jsonTagged.ID != "json" {
+		t.Fatalf("Bad value after alias change: got %q, want %q", jsonTagged.ID, "json")
+	}
+}
+
 func TestZeroEmpty(t *testing.T) {
 	data := map[string][]string{
 		"F01": {""},
@@ -1356,6 +1385,36 @@ func TestRegisterConverter(t *testing.T) {
 	}
 	if s1.Bb != Bb(2) {
 		t.Errorf("s1.Bb: expected %v, got %v", 2, s1.Bb)
+	}
+}
+
+func TestRegisterConverterAfterCacheWarm(t *testing.T) {
+	type custom int
+	type payload struct {
+		Value custom `schema:"value"`
+	}
+
+	decoder := NewDecoder()
+
+	var warmed payload
+	err := decoder.Decode(&warmed, map[string][]string{})
+	if err != nil {
+		t.Fatalf("Failed to warm decoder cache: %v", err)
+	}
+
+	decoder.RegisterConverter(custom(0), func(s string) reflect.Value {
+		return reflect.ValueOf(custom(42))
+	})
+
+	var result payload
+	err = decoder.Decode(&result, map[string][]string{
+		"value": {"ignored"},
+	})
+	if err != nil {
+		t.Fatalf("Failed to decode with registered converter after cache warm: %v", err)
+	}
+	if result.Value != custom(42) {
+		t.Fatalf("Bad value: got %v, want %v", result.Value, custom(42))
 	}
 }
 
@@ -2383,6 +2442,88 @@ func TestRequiredFieldsCannotHaveDefaults(t *testing.T) {
 
 	if err == nil || !strings.Contains(err.Error(), expected) {
 		t.Errorf("decoding should fail with error msg %s got %q", expected, err)
+	}
+}
+
+func TestNestedDefaultErrorsDoNotPanic(t *testing.T) {
+	assertNestedDefaultErrors := func(t *testing.T, err error) {
+		t.Helper()
+
+		if err == nil {
+			t.Fatal("expected decode error")
+		}
+
+		multiErr, ok := err.(MultiError)
+		if !ok {
+			t.Fatalf("expected MultiError, got %T: %v", err, err)
+		}
+
+		var foundDefaultError bool
+		for _, itemErr := range multiErr {
+			if itemErr == nil {
+				continue
+			}
+			if itemErr.Error() == "required fields cannot have a default value" {
+				foundDefaultError = true
+			}
+		}
+
+		if !foundDefaultError {
+			t.Fatalf("unexpected errors: %#v", multiErr)
+		}
+	}
+
+	t.Run("struct field", func(t *testing.T) {
+		type Inner struct {
+			Value string `schema:"value,required,default:test"`
+		}
+		type Outer struct {
+			Inner Inner `schema:"inner"`
+		}
+
+		var dst Outer
+		err := NewDecoder().Decode(&dst, map[string][]string{})
+		assertNestedDefaultErrors(t, err)
+	})
+
+	t.Run("pointer field", func(t *testing.T) {
+		type Inner struct {
+			Value string `schema:"value,required,default:test"`
+		}
+		type Outer struct {
+			Inner *Inner `schema:"inner"`
+		}
+
+		dst := Outer{Inner: &Inner{}}
+		err := NewDecoder().Decode(&dst, map[string][]string{})
+		assertNestedDefaultErrors(t, err)
+	})
+}
+
+func TestUnsupportedDefaultTypeDoesNotPanic(t *testing.T) {
+	type D struct {
+		Value [1]string `schema:"value,default:test"`
+	}
+
+	var dst D
+	err := NewDecoder().Decode(&dst, map[string][]string{})
+	if err == nil {
+		t.Fatal("expected decode error")
+	}
+
+	multiErr, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("expected MultiError, got %T: %v", err, err)
+	}
+
+	itemErr := multiErr["default-Value"]
+	if itemErr == nil {
+		t.Fatalf("expected default-Value error, got %#v", multiErr)
+	}
+
+	const want = "default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"
+	if itemErr.Error() != want {
+		t.Fatalf("expected %q, got %q", want, itemErr.Error())
 	}
 }
 
@@ -3676,6 +3817,29 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	}
 }
 
+func TestDecodeSliceReplacesPreviousValues(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"1,2,3,4,5,6,7,8,9"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{1, 2, 3, 4, 5, 6, 7, 8, 9}) {
+		t.Fatalf("unexpected initial slice: %v", s.N)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"4"}}); err != nil {
+		t.Fatalf("unexpected error on second decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{4}) {
+		t.Fatalf("unexpected slice after second decode: %v", s.N)
+	}
+}
+
 func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
 	type target struct {
 		A []IntAlias `schema:"a"`
@@ -3684,5 +3848,59 @@ func TestDecodeCommaSeparatedAliasSliceError(t *testing.T) {
 	var s target
 	if err := NewDecoder().Decode(&s, map[string][]string{"a": {"1,a"}}); err == nil {
 		t.Fatalf("expected error")
+	}
+}
+
+func TestDecodeSliceErrorLeavesPooledBufferReusable(t *testing.T) {
+	type target struct {
+		N []int `schema:"n"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	err := dec.Decode(&s, map[string][]string{"n": {"1,nope"}})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	multi, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("unexpected error type: %T", err)
+	}
+	if _, ok := multi["n"].(ConversionError); !ok {
+		t.Fatalf("unexpected field error: %v", multi["n"])
+	}
+	if strings.Contains(err.Error(), "panic") {
+		t.Fatalf("unexpected panic-style error: %v", err)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"n": {"2,3"}}); err != nil {
+		t.Fatalf("unexpected error after failed decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.N, []int{2, 3}) {
+		t.Fatalf("unexpected slice after retry: %v", s.N)
+	}
+}
+
+func TestDecodeTextUnmarshalerSliceReplacesPreviousValues(t *testing.T) {
+	type target struct {
+		B []rudeBool `schema:"b"`
+	}
+
+	dec := NewDecoder()
+	var s target
+
+	if err := dec.Decode(&s, map[string][]string{"b": {"Yup", "Nope", "Yup", "Nope", "Yup", "Nope", "Yup", "Nope", "Yup"}}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{true, false, true, false, true, false, true, false, true}) {
+		t.Fatalf("unexpected initial slice: %v", s.B)
+	}
+
+	if err := dec.Decode(&s, map[string][]string{"b": {"Nope"}}); err != nil {
+		t.Fatalf("unexpected error on second decode: %v", err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
+		t.Fatalf("unexpected slice after second decode: %v", s.B)
 	}
 }
