@@ -156,7 +156,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]string, prefix string) MultiError {
 	struc := d.cache.get(t)
 	if struc == nil {
-		// unexpect, cache.get never return nil
+		// unexpected, cache.get never return nil
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
 
@@ -272,7 +272,7 @@ func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiEr
 func (d *Decoder) findRequiredFields(t reflect.Type, canonicalPrefix, searchPrefix string) (map[string][]fieldWithPrefix, MultiError) {
 	struc := d.cache.get(t)
 	if struc == nil {
-		// unexpect, cache.get never return nil
+		// unexpected, cache.get never return nil
 		return nil, MultiError{canonicalPrefix + "*": errors.New("cache fail")}
 	}
 
