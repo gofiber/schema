@@ -2,6 +2,8 @@
 
 Package gofiber/schema converts structs to and from form values.
 
+Per-commit benchmark charts: <https://gofiber.github.io/schema/benchmarks/>
+
 ## Example
 
 Here's a quick example: we parse POST form values and then decode them into a struct:
