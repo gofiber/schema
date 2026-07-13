@@ -157,6 +157,8 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		c.l.Unlock()
 		return cached, nil
 	}
+	// Detach the key: callers may pass strings aliasing reused request buffers.
+	cacheKey.path = strings.Clone(p)
 	c.pathCache[cacheKey] = parts
 	c.l.Unlock()
 
