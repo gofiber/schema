@@ -12,6 +12,7 @@ import (
 
 	utils "github.com/gofiber/utils/v2"
 	utilstrings "github.com/gofiber/utils/v2/strings"
+	"github.com/gofiber/utils/v2/swar"
 )
 
 const maxParserIndex = 1000
@@ -165,8 +166,22 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	return parts, nil
 }
 
+// dotBroadcast is the SWAR needle for '.'; hoisted so the word loop in
+// nextPathSegment pays no per-call broadcast cost.
+var dotBroadcast = swar.Broadcast('.')
+
 func nextPathSegment(path string, start int) (int, string, error) {
 	end := start
+	for end+swar.WordLen <= len(path) {
+		if m := swar.ZeroLanes(swar.Load8(path, end) ^ dotBroadcast); m != 0 {
+			end += swar.FirstLane(m)
+			if start == end {
+				return 0, "", errInvalidPath
+			}
+			return end, path[start:end], nil
+		}
+		end += swar.WordLen
+	}
 	for end < len(path) && path[end] != '.' {
 		end++
 	}
@@ -401,21 +416,33 @@ func fieldAlias(field reflect.StructField, tagName string) (alias string, option
 }
 
 // tagOptions is the string following a comma in a struct field's tag, or
-// the empty string. It does not include the leading comma.
-type tagOptions []string
+// the empty string. It does not include the leading comma. Keeping the raw
+// comma-separated string avoids the []string allocation of strings.Split on
+// hot paths (the encoder parses tags on every Encode call).
+type tagOptions string
 
 // parseTag splits a struct field's url tag into its name and comma-separated
 // options.
 func parseTag(tag string) (string, tagOptions) {
 	if idx := strings.IndexByte(tag, ','); idx != -1 {
-		return tag[:idx], strings.Split(tag[idx+1:], ",")
+		return tag[:idx], tagOptions(tag[idx+1:])
 	}
-	return tag, nil
+	return tag, ""
+}
+
+// next returns the first comma-separated option and the remaining options.
+func (o tagOptions) next() (string, tagOptions) {
+	if idx := strings.IndexByte(string(o), ','); idx != -1 {
+		return string(o[:idx]), o[idx+1:]
+	}
+	return string(o), ""
 }
 
 // Contains checks whether the tagOptions contains the specified option.
 func (o tagOptions) Contains(option string) bool {
-	for _, s := range o {
+	for o != "" {
+		var s string
+		s, o = o.next()
 		if s == option {
 			return true
 		}
@@ -424,7 +451,9 @@ func (o tagOptions) Contains(option string) bool {
 }
 
 func (o tagOptions) getDefaultOptionValue() string {
-	for _, s := range o {
+	for o != "" {
+		var s string
+		s, o = o.next()
 		if value, ok := strings.CutPrefix(s, "default:"); ok {
 			return value
 		}

@@ -160,7 +160,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
 
-	errs := MultiError{}
+	var errs MultiError
 
 	if v.Type().Kind() == reflect.Struct {
 		for i := 0; i < v.NumField(); i++ {
@@ -186,8 +186,6 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 			if f.typ.Kind() == reflect.Struct {
 				errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 			} else if f.typ.Kind() == reflect.Slice {
-				vals := strings.Split(f.defaultValue, "|")
-
 				// check if slice has one of the supported types for defaults
 				conv := getBuiltinConverter(f.typ.Elem().Kind())
 				if conv == nil {
@@ -195,8 +193,8 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 					continue
 				}
 
-				defaultSlice := reflect.MakeSlice(f.typ, 0, cap(vals))
-				for _, val := range vals {
+				defaultSlice := reflect.MakeSlice(f.typ, 0, strings.Count(f.defaultValue, "|")+1)
+				for val := range strings.SplitSeq(f.defaultValue, "|") {
 					// this check is to handle if the wrong value is provided
 					convertedVal := conv(val)
 					if !convertedVal.IsValid() {
@@ -247,57 +245,19 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 
 // checkRequired checks whether required fields are empty
 //
-// check type t recursively if t has struct fields.
+// The set of required fields (including those of nested structs) is
+// precomputed once per struct type in structInfo.requiredFields, so this
+// only performs the per-request emptiness checks against src.
 //
 // src is the source map for decoding, we use it here to see if those required fields are included in src
 func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiError {
-	m, errs := d.findRequiredFields(t, "", "")
-	if len(m) == 0 {
-		return errs
-	}
-	for key, fields := range m {
+	var errs MultiError
+	for key, fields := range d.cache.get(t).requiredFields {
 		if isEmptyFields(fields, src) {
 			errs = appendError(errs, key, EmptyFieldError{Key: key})
 		}
 	}
 	return errs
-}
-
-// findRequiredFields recursively searches the struct type t for required fields.
-//
-// canonicalPrefix and searchPrefix are used to resolve full paths in dotted notation
-// for nested struct fields. canonicalPrefix is a complete path which never omits
-// any embedded struct fields. searchPrefix is a user-friendly path which may omit
-// some embedded struct fields to point promoted fields.
-func (d *Decoder) findRequiredFields(t reflect.Type, canonicalPrefix, searchPrefix string) (map[string][]fieldWithPrefix, MultiError) {
-	struc := d.cache.get(t)
-	if struc == nil {
-		// unexpected, cache.get never return nil
-		return nil, MultiError{canonicalPrefix + "*": errors.New("cache fail")}
-	}
-
-	m := map[string][]fieldWithPrefix{}
-	errs := MultiError{}
-	for _, f := range struc.fields {
-		if f.typ.Kind() == reflect.Struct {
-			fcprefix := canonicalPrefix + f.canonicalAlias + "."
-			for _, fspath := range f.paths(searchPrefix) {
-				fm, ferrs := d.findRequiredFields(f.typ, fcprefix, fspath+".")
-				for key, fields := range fm {
-					m[key] = append(m[key], fields...)
-				}
-				errs.merge(ferrs)
-			}
-		}
-		if f.isRequired {
-			key := canonicalPrefix + f.canonicalAlias
-			m[key] = append(m[key], fieldWithPrefix{
-				fieldInfo: f,
-				prefix:    searchPrefix,
-			})
-		}
-	}
-	return m, errs
 }
 
 type fieldWithPrefix struct {
@@ -537,9 +497,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 				items = append(items, item)
 			} else {
-				if strings.Contains(value, ",") {
-					values := strings.Split(value, ",")
-					for _, value := range values {
+				if strings.IndexByte(value, ',') != -1 {
+					for value := range strings.SplitSeq(value, ",") {
 						if value == "" {
 							if d.zeroEmpty {
 								items = append(items, reflect.Zero(elemT))

@@ -36,7 +36,7 @@ func TestFieldAlias(t *testing.T) {
 }
 
 func TestTagOptionsContains(t *testing.T) {
-	opts := tagOptions{"a", "b", "default:val"}
+	opts := tagOptions("a,b,default:val")
 	if !opts.Contains("a") || opts.Contains("c") {
 		t.Fatalf("contains failed")
 	}
