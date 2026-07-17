@@ -444,12 +444,30 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return fmt.Errorf("%v index %d is larger than the configured maxSize %d", v.Kind(), idx, d.maxSize)
 		}
 		if v.IsNil() || v.Len() < idx+1 {
-			value := reflect.MakeSlice(t, idx+1, idx+1)
-			if v.Len() < idx+1 {
-				// Resize it.
-				reflect.Copy(value, v)
+			if !v.IsNil() && v.Cap() >= idx+1 {
+				// Extend within existing capacity, zeroing the exposed
+				// slots: the backing array may hold stale caller data, and
+				// fresh elements must start from zero like MakeSlice ones.
+				oldLen := v.Len()
+				v.SetLen(idx + 1)
+				for i := oldLen; i <= idx; i++ {
+					v.Index(i).SetZero()
+				}
+			} else {
+				// Grow with headroom so consecutive indices don't trigger a
+				// reallocation and full copy each ("items.0" ... "items.N"
+				// would otherwise cost O(N^2) copying).
+				newCap := idx + 1
+				if double := 2 * v.Cap(); double > newCap {
+					newCap = double
+				}
+				value := reflect.MakeSlice(t, idx+1, newCap)
+				if v.Len() > 0 {
+					// Resize it.
+					reflect.Copy(value, v)
+				}
+				v.Set(value)
 			}
-			v.Set(value)
 		}
 		return d.decode(v.Index(idx), path, parts[1:], values, files)
 	}

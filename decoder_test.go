@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"mime/multipart"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2325,6 +2326,80 @@ func TestDoubleEmbeddedPointer(t *testing.T) {
 	}
 	if s.F != "raw a" {
 		t.Errorf("F: expected %q, got %q", "raw a", s.F)
+	}
+}
+
+// Reused destination slices must not leak stale element data into slots the
+// decoder grows into, and out-of-order indices must land correctly.
+func TestDecodeSliceIndexGrowth(t *testing.T) {
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	src := map[string][]string{}
+	for i := 0; i < 50; i++ {
+		src["items."+strconv.Itoa(i)+".price"] = []string{strconv.Itoa(i * 3)}
+	}
+	d := NewDecoder()
+
+	var c cart
+	if err := d.Decode(&c, src); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 50 {
+		t.Fatalf("len = %d, want 50", len(c.Items))
+	}
+	for i, it := range c.Items {
+		if it.Price != i*3 {
+			t.Fatalf("Items[%d].Price = %d, want %d", i, it.Price, i*3)
+		}
+	}
+
+	// A destination with spare capacity full of stale data must decode the
+	// same way: grown slots start from zero.
+	stale := cart{Items: make([]item, 0, 64)}
+	full := stale.Items[:64]
+	for i := range full {
+		full[i] = item{Name: "stale", Price: -1}
+	}
+	if err := d.Decode(&stale, src); err != nil {
+		t.Fatal(err)
+	}
+	if len(stale.Items) != 50 {
+		t.Fatalf("len = %d, want 50", len(stale.Items))
+	}
+	for i, it := range stale.Items {
+		if it.Name != "" || it.Price != i*3 {
+			t.Fatalf("Items[%d] = %+v, want zero Name and Price %d", i, it, i*3)
+		}
+	}
+}
+
+func BenchmarkSliceManyIndicesDecode(b *testing.B) {
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+	src := map[string][]string{}
+	for i := 0; i < 100; i++ {
+		idx := strconv.Itoa(i)
+		src["items."+idx+".name"] = []string{"x"}
+		src["items."+idx+".price"] = []string{idx}
+	}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var c cart
+		if err := d.Decode(&c, src); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
