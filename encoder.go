@@ -12,6 +12,10 @@ import (
 
 type encoderFunc func(reflect.Value) string
 
+// errNotStruct is returned by Encode for invalid sources; hoisted so the
+// check does not allocate on every call.
+var errNotStruct = errors.New("schema: interface must be a struct")
+
 // Encoder encodes values from a struct into url.Values.
 type Encoder struct {
 	cache  *cache
@@ -137,7 +141,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 		v = v.Elem()
 	}
 	if v.Kind() != reflect.Struct {
-		return errors.New("schema: interface must be a struct")
+		return errNotStruct
 	}
 
 	var errs MultiError

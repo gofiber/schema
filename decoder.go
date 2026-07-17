@@ -18,6 +18,10 @@ const (
 	defaultMaxSize = 16000
 )
 
+// errNotPointerToStruct is returned by Decode for invalid destinations;
+// hoisted so the check does not allocate on every call.
+var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
+
 var decodeValueBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]reflect.Value, 0, 8)
@@ -105,7 +109,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
-		return errors.New("schema: interface must be a pointer to struct")
+		return errNotPointerToStruct
 	}
 
 	// Catch panics from the decoder and return them as an error.
@@ -637,52 +641,69 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 // instead of boxing every element in a reflect.Value. The slice is built
 // detached and only assigned to v when every value parsed, matching the
 // all-or-nothing behavior of the generic path.
+//
+// A value that fails to parse as a whole is retried as a comma-separated
+// list. For non-string kinds a value containing a comma can never parse as a
+// whole (no builtin syntax admits commas), and string values always parse,
+// so the element count is knowable upfront: a cheap counting pass sizes the
+// slice exactly and the fill pass parses each item once.
 func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
 	elemT := t.Elem()
 	k := elemT.Kind()
-	sl := reflect.New(t).Elem()
-	sl.Set(reflect.MakeSlice(t, 0, len(values)))
-	appendSlot := func() reflect.Value {
-		n := sl.Len()
-		if n == sl.Cap() {
-			sl.Grow(1)
-		}
-		sl.SetLen(n + 1)
-		return sl.Index(n)
-	}
-	for key, value := range values {
-		if value == "" {
+	split := k != reflect.String
+
+	n := 0
+	for _, value := range values {
+		switch {
+		case value == "":
 			if d.zeroEmpty {
-				appendSlot()
+				n++
 			}
-			continue
-		}
-		if _, ok := setBuiltinKind(appendSlot(), k, value); !ok {
-			// The whole value did not parse; retry it as a comma-separated
-			// list. The failed slot is still zero, so shrinking undoes it.
-			sl.SetLen(sl.Len() - 1)
-			if strings.IndexByte(value, ',') == -1 {
-				return ConversionError{
-					Key:   path,
-					Type:  elemT,
-					Index: key,
+		case split && strings.IndexByte(value, ',') != -1:
+			for item := range strings.SplitSeq(value, ",") {
+				if item != "" || d.zeroEmpty {
+					n++
 				}
 			}
+		default:
+			n++
+		}
+	}
+
+	sl := reflect.MakeSlice(t, n, n)
+	i := 0
+	for key, value := range values {
+		switch {
+		case value == "":
+			if d.zeroEmpty {
+				i++ // slot stays zero
+			}
+		case split && strings.IndexByte(value, ',') != -1:
 			for item := range strings.SplitSeq(value, ",") {
 				if item == "" {
 					if d.zeroEmpty {
-						appendSlot()
+						i++ // slot stays zero
 					}
 					continue
 				}
-				if _, ok := setBuiltinKind(appendSlot(), k, item); !ok {
+				if _, ok := setBuiltinKind(sl.Index(i), k, item); !ok {
 					return ConversionError{
 						Key:   path,
 						Type:  elemT,
 						Index: key,
 					}
 				}
+				i++
 			}
+		default:
+			if _, ok := setBuiltinKind(sl.Index(i), k, value); !ok {
+				return ConversionError{
+					Key:   path,
+					Type:  elemT,
+					Index: key,
+				}
+			}
+			i++
 		}
 	}
 	v.Set(sl)

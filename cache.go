@@ -25,19 +25,17 @@ var (
 // newCache returns a new cache.
 func newCache() *cache {
 	c := cache{
-		m:         make(map[reflect.Type]*structInfo),
-		pathCache: make(map[pathCacheKey][]pathPart),
-		regconv:   make(map[reflect.Type]Converter),
-		tag:       "schema",
+		regconv: make(map[reflect.Type]Converter),
+		tag:     "schema",
 	}
 	return &c
 }
 
 // cache caches meta-data about a struct.
 type cache struct {
-	l         sync.RWMutex
-	m         map[reflect.Type]*structInfo
-	pathCache map[pathCacheKey][]pathPart
+	l         sync.RWMutex // serializes configuration writes (tag, regconv)
+	m         sync.Map     // map[reflect.Type]*structInfo
+	pathCache sync.Map     // map[pathCacheKey][]pathPart
 	regconv   map[reflect.Type]Converter
 	tag       string
 }
@@ -63,11 +61,8 @@ func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
 // structs.
 func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	cacheKey := pathCacheKey{path: p, typ: t}
-	c.l.RLock()
-	cached, ok := c.pathCache[cacheKey]
-	c.l.RUnlock()
-	if ok {
-		return cached, nil
+	if cached, ok := c.pathCache.Load(cacheKey); ok {
+		return cached.([]pathPart), nil
 	}
 
 	var struc *structInfo
@@ -159,15 +154,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		index: -1,
 	})
 
-	c.l.Lock()
-	if cached, ok := c.pathCache[cacheKey]; ok {
-		c.l.Unlock()
-		return cached, nil
-	}
 	// Detach the key: callers may pass strings aliasing reused request buffers.
 	cacheKey.path = strings.Clone(p)
-	c.pathCache[cacheKey] = parts
-	c.l.Unlock()
+	if cached, loaded := c.pathCache.LoadOrStore(cacheKey, parts); loaded {
+		return cached.([]pathPart), nil
+	}
 
 	return parts, nil
 }
@@ -199,22 +190,17 @@ func nextPathSegment(path string, start int) (int, string, error) {
 
 // get returns a cached structInfo, creating it if necessary.
 func (c *cache) get(t reflect.Type) *structInfo {
-	c.l.RLock()
-	info := c.m[t]
-	c.l.RUnlock()
-	if info == nil {
-		info = c.create(t, "")
-		c.l.Lock()
-		c.m[t] = info
-		c.l.Unlock()
+	if info, ok := c.m.Load(t); ok {
+		return info.(*structInfo)
 	}
-	return info
+	info, _ := c.m.LoadOrStore(t, c.create(t, ""))
+	return info.(*structInfo)
 }
 
 // reset clears cached metadata and must be called with c.l held.
 func (c *cache) reset() {
-	c.m = make(map[reflect.Type]*structInfo)
-	c.pathCache = make(map[pathCacheKey][]pathPart)
+	c.m.Clear()
+	c.pathCache.Clear()
 }
 
 // create creates a structInfo with meta-data about a struct.
@@ -337,6 +323,9 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 
 // converter returns the converter for a type.
 func (c *cache) converter(t reflect.Type) Converter {
+	if len(c.regconv) == 0 {
+		return nil
+	}
 	return c.regconv[t]
 }
 

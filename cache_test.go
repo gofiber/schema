@@ -73,9 +73,7 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 	typ := reflect.TypeOf(Outer{})
 	b.ReportAllocs()
 	for b.Loop() {
-		d.cache.l.Lock()
-		clear(d.cache.pathCache)
-		d.cache.l.Unlock()
+		d.cache.pathCache.Clear()
 		if _, err := d.cache.parsePath("items.0.value", typ); err != nil {
 			b.Fatal(err)
 		}
@@ -96,14 +94,15 @@ func TestParsePathDetachesCacheKey(t *testing.T) {
 	}
 	copy(buf, "policy") // simulate fasthttp buffer reuse mutating the key bytes
 
-	d.cache.l.RLock()
-	defer d.cache.l.RUnlock()
-	if len(d.cache.pathCache) != 1 {
-		t.Fatalf("expected 1 cached path, got %d", len(d.cache.pathCache))
-	}
-	for k := range d.cache.pathCache {
-		if k.path != "entity" {
+	count := 0
+	d.cache.pathCache.Range(func(key, _ any) bool {
+		count++
+		if k := key.(pathCacheKey); k.path != "entity" {
 			t.Fatalf("pathCache key mutated to %q; key must be cloned before caching", k.path)
 		}
+		return true
+	})
+	if count != 1 {
+		t.Fatalf("expected 1 cached path, got %d", count)
 	}
 }
