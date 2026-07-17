@@ -126,9 +126,10 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 
 	v = v.Elem()
 	t := v.Type()
+	rootInfo := d.cache.get(t)
 	var multiErrors MultiError
 	for path, values := range src {
-		if parts, err := d.cache.parsePath(path, t); err == nil {
+		if parts, err := d.cache.parsePathInfo(path, t, rootInfo); err == nil {
 			if filesSlice, ok := multipartFiles[path]; ok {
 				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
 					multiErrors = appendError(multiErrors, path, err)
@@ -422,7 +423,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	}
 
 	// Check multipart files
-	if mp := handleMultipartField(v, files); mp {
+	if parts[0].field.isMultipart && handleMultipartField(v, files) {
 		return nil
 	}
 

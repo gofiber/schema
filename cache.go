@@ -33,16 +33,10 @@ func newCache() *cache {
 
 // cache caches meta-data about a struct.
 type cache struct {
-	l         sync.RWMutex // serializes configuration writes (tag, regconv)
-	m         sync.Map     // map[reflect.Type]*structInfo
-	pathCache sync.Map     // map[pathCacheKey][]pathPart
-	regconv   map[reflect.Type]Converter
-	tag       string
-}
-
-type pathCacheKey struct {
-	path string
-	typ  reflect.Type
+	l       sync.RWMutex // serializes configuration writes (tag, regconv)
+	m       sync.Map     // map[reflect.Type]*structInfo
+	regconv map[reflect.Type]Converter
+	tag     string
 }
 
 // registerConverter registers a converter function for a custom type.
@@ -60,8 +54,18 @@ func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
 // reflect.Value.FieldByString(). Multiple parts are required for slices of
 // structs.
 func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
-	cacheKey := pathCacheKey{path: p, typ: t}
-	if cached, ok := c.pathCache.Load(cacheKey); ok {
+	if t.Kind() != reflect.Struct {
+		return nil, errInvalidPath
+	}
+	return c.parsePathInfo(p, t, c.get(t))
+}
+
+// parsePathInfo is parsePath with the root struct's info already resolved,
+// letting Decode look it up once per call instead of once per key. The
+// parsed-path cache lives on that structInfo, keyed by the plain path
+// string, which hashes much cheaper than a composite key.
+func (c *cache) parsePathInfo(p string, t reflect.Type, rootInfo *structInfo) ([]pathPart, error) {
+	if cached, ok := rootInfo.paths.Load(p); ok {
 		return cached.([]pathPart), nil
 	}
 
@@ -155,8 +159,7 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	})
 
 	// Detach the key: callers may pass strings aliasing reused request buffers.
-	cacheKey.path = strings.Clone(p)
-	if cached, loaded := c.pathCache.LoadOrStore(cacheKey, parts); loaded {
+	if cached, loaded := rootInfo.paths.LoadOrStore(strings.Clone(p), parts); loaded {
 		return cached.([]pathPart), nil
 	}
 
@@ -197,10 +200,10 @@ func (c *cache) get(t reflect.Type) *structInfo {
 	return info.(*structInfo)
 }
 
-// reset clears cached metadata and must be called with c.l held.
+// reset clears cached metadata and must be called with c.l held. Parsed
+// path caches live on the structInfos, so dropping them drops those too.
 func (c *cache) reset() {
 	c.m.Clear()
-	c.pathCache.Clear()
 }
 
 // create creates a structInfo with meta-data about a struct.
@@ -314,6 +317,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		unmarshalerInfo:  m,
 		derefUnmarshaler: isTextUnmarshaler(reflect.Zero(indirectType(field.Type))),
 		elemUnmarshaler:  isTextUnmarshaler(reflect.Zero(ft)),
+		isMultipart:      isMultipartField(field.Type),
 		isSliceOfStructs: isSlice && isStruct,
 		isAnonymous:      field.Anonymous,
 		isRequired:       options.Contains("required"),
@@ -336,6 +340,10 @@ type structInfo struct {
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
 	requiredFields     map[string][]fieldWithPrefix
+	// paths caches parsed paths rooted at this struct type
+	// (map[string][]pathPart); keys are cloned so they never alias reused
+	// request buffers.
+	paths sync.Map
 	// hasDefaults reports whether this struct or any struct reachable
 	// through its fields declares a default tag option, letting the decoder
 	// skip the setDefaults walk entirely for the common case.
@@ -413,6 +421,10 @@ type fieldInfo struct {
 	// slice index (e.g. "a.0") and the value at hand is an element rather
 	// than the slice field itself.
 	elemUnmarshaler unmarshaler
+	// isMultipart indicates whether the field type is one of the supported
+	// multipart file header shapes, precomputed so the decoder can skip the
+	// type comparisons on every other field.
+	isMultipart bool
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.
