@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	utils "github.com/gofiber/utils/v2"
 	utilstrings "github.com/gofiber/utils/v2/strings"
@@ -37,6 +38,11 @@ type cache struct {
 	m       sync.Map     // map[reflect.Type]*structInfo
 	regconv map[reflect.Type]Converter
 	tag     string
+	// gen is bumped (under l) before m is cleared on configuration changes;
+	// get snapshots it before building a structInfo and refuses to cache the
+	// result if it changed, so a build racing a reconfiguration cannot
+	// re-insert stale metadata after the clear.
+	gen atomic.Uint64
 }
 
 // registerConverter registers a converter function for a custom type.
@@ -57,28 +63,26 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	if t.Kind() != reflect.Struct {
 		return nil, errInvalidPath
 	}
-	return c.parsePathInfo(p, t, c.get(t))
+	return c.parsePathInfo(p, c.get(t))
 }
 
 // parsePathInfo is parsePath with the root struct's info already resolved,
 // letting Decode look it up once per call instead of once per key. The
 // parsed-path cache lives on that structInfo, keyed by the plain path
 // string, which hashes much cheaper than a composite key.
-func (c *cache) parsePathInfo(p string, t reflect.Type, rootInfo *structInfo) ([]pathPart, error) {
+func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error) {
 	if cached, ok := rootInfo.paths.Load(p); ok {
 		return cached.([]pathPart), nil
 	}
 
-	var struc *structInfo
+	struc := rootInfo
+	var t reflect.Type
 	var field *fieldInfo
 	var index64 int64
 	var parts []pathPart
 	var hops []pathHop
 	for keyStart := 0; ; {
-		if t.Kind() != reflect.Struct {
-			return nil, errInvalidPath
-		}
-		if struc = c.get(t); struc == nil {
+		if struc == nil {
 			return nil, errInvalidPath
 		}
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
@@ -88,15 +92,11 @@ func (c *cache) parsePathInfo(p string, t reflect.Type, rootInfo *structInfo) ([
 		if field = struc.get(segment); field == nil {
 			return nil, errInvalidPath
 		}
-		// Valid field. Append the hop, resolving the field index chain once
-		// here so the decoder can walk plain indices instead of repeating
-		// FieldByName lookups on every Decode call.
-		sf, ok := t.FieldByName(field.name)
-		if !ok {
-			return nil, errInvalidPath
-		}
-		hops = append(hops, pathHop{index: sf.Index, ensure: struc.anonymousPtrFields})
-		if field.isSliceOfStructs && !isMultipartField(field.typ) && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
+		// Valid field. Append the hop; the field's index chain was resolved
+		// when the structInfo was built, so the decoder walks plain indices
+		// instead of repeating FieldByName lookups on every Decode call.
+		hops = append(hops, pathHop{index: field.index, ensure: struc.anonymousPtrFields})
+		if field.isSliceOfStructs && !field.isMultipart && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
 			//
@@ -150,12 +150,18 @@ func (c *cache) parsePathInfo(p string, t reflect.Type, rootInfo *structInfo) ([
 		if keyStart >= len(p) {
 			return nil, errInvalidPath
 		}
+		if t.Kind() != reflect.Struct {
+			return nil, errInvalidPath
+		}
+		struc = c.get(t)
 	}
-	// Add the remaining.
+	// Add the remaining. A part without hops means the path terminated at a
+	// slice index ("a.0"), so the decoder receives a slice element there.
 	parts = append(parts, pathPart{
 		hops:  hops,
 		field: field,
 		index: -1,
+		elem:  len(hops) == 0,
 	})
 
 	// Detach the key: callers may pass strings aliasing reused request buffers.
@@ -196,13 +202,28 @@ func (c *cache) get(t reflect.Type) *structInfo {
 	if info, ok := c.m.Load(t); ok {
 		return info.(*structInfo)
 	}
-	info, _ := c.m.LoadOrStore(t, c.create(t, ""))
-	return info.(*structInfo)
+	gen := c.gen.Load()
+	info := c.create(t, "")
+	if c.gen.Load() != gen {
+		// Configuration changed while building; serve the result once but
+		// don't cache it — the next call rebuilds with the new config.
+		return info
+	}
+	cached, _ := c.m.LoadOrStore(t, info)
+	if c.gen.Load() != gen {
+		// A reconfiguration cleared the cache between the check and the
+		// store; drop the entry so stale metadata cannot stick (a discarded
+		// concurrent fresh build just rebuilds on the next call).
+		c.m.Delete(t)
+		return info
+	}
+	return cached.(*structInfo)
 }
 
 // reset clears cached metadata and must be called with c.l held. Parsed
 // path caches live on the structInfos, so dropping them drops those too.
 func (c *cache) reset() {
+	c.gen.Add(1)
 	c.m.Clear()
 }
 
@@ -210,15 +231,18 @@ func (c *cache) reset() {
 func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	info := &structInfo{}
 	var anonymousInfos []*structInfo
+	var anonymousIdx [][]int
 	for i := 0; i < t.NumField(); i++ {
 		structField := t.Field(i)
 		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr {
 			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
 		}
 		if f := c.createField(structField, parentAlias); f != nil {
+			f.index = structField.Index
 			info.fields = append(info.fields, f)
 			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous {
 				anonymousInfos = append(anonymousInfos, c.create(ft, f.canonicalAlias))
+				anonymousIdx = append(anonymousIdx, structField.Index)
 			}
 		}
 	}
@@ -228,7 +252,12 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		others = append(others, anonymousInfos[i+1:]...)
 		for _, f := range a.fields {
 			if !containsAlias(others, f.alias) {
-				info.fields = append(info.fields, f)
+				// Copy the promoted field so its index chain can be prefixed
+				// with the embedded field's index; the original stays valid
+				// for the embedded type's own structInfo.
+				pf := *f
+				pf.index = append(append(make([]int, 0, len(anonymousIdx[i])+len(f.index)), anonymousIdx[i]...), f.index...)
+				info.fields = append(info.fields, &pf)
 			}
 		}
 	}
@@ -239,35 +268,46 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	info.requiredFields = c.buildRequiredFields(info)
-	info.hasDefaults = c.hasDefaultsDeep(t, map[reflect.Type]bool{})
+	hasDefaults, hasAnonPtr := c.scanDefaultsTree(t, map[reflect.Type]bool{})
+	// The setDefaults walk also allocates nil anonymous embedded pointers,
+	// so it can only be skipped when neither defaults nor such pointers
+	// exist anywhere in the tree.
+	info.needsDefaultsWalk = hasDefaults || hasAnonPtr
 	return info
 }
 
-// hasDefaultsDeep reports whether t or any struct type reachable through its
-// (possibly pointer-wrapped) fields declares a default tag option. visited
-// guards against recursive types.
-func (c *cache) hasDefaultsDeep(t reflect.Type, visited map[reflect.Type]bool) bool {
+// scanDefaultsTree reports whether t or any struct type reachable through
+// its (possibly pointer-wrapped) fields declares a default tag option, and
+// whether any reachable struct has anonymous pointer fields. visited guards
+// against recursive types.
+func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) (hasDefaults, hasAnonPtr bool) {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct || visited[t] {
-		return false
+		return false, false
 	}
 	visited[t] = true
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
+		if field.Anonymous && field.Type.Kind() == reflect.Ptr {
+			hasAnonPtr = true
+		}
 		alias, options := fieldAlias(field, c.tag)
 		if alias == "-" {
 			continue
 		}
 		if options.getDefaultOptionValue() != "" {
-			return true
+			hasDefaults = true
 		}
-		if c.hasDefaultsDeep(field.Type, visited) {
-			return true
+		d, a := c.scanDefaultsTree(field.Type, visited)
+		hasDefaults = hasDefaults || d
+		hasAnonPtr = hasAnonPtr || a
+		if hasDefaults && hasAnonPtr {
+			return true, true
 		}
 	}
-	return false
+	return hasDefaults, hasAnonPtr
 }
 
 // createField creates a fieldInfo for the given field.
@@ -308,6 +348,18 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		}
 	}
 
+	// Reuse the unmarshaler facts when the successive type unwrappings land
+	// on the same type (the common non-pointer, non-slice case).
+	derefT := indirectType(field.Type)
+	derefU := m
+	if derefT != field.Type {
+		derefU = isTextUnmarshaler(reflect.Zero(derefT))
+	}
+	elemU := derefU
+	if ft != derefT {
+		elemU = isTextUnmarshaler(reflect.Zero(ft))
+	}
+
 	return &fieldInfo{
 		typ:              field.Type,
 		name:             field.Name,
@@ -315,8 +367,8 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
 		unmarshalerInfo:  m,
-		derefUnmarshaler: isTextUnmarshaler(reflect.Zero(indirectType(field.Type))),
-		elemUnmarshaler:  isTextUnmarshaler(reflect.Zero(ft)),
+		derefUnmarshaler: derefU,
+		elemUnmarshaler:  elemU,
 		isMultipart:      isMultipartField(field.Type),
 		isSliceOfStructs: isSlice && isStruct,
 		isAnonymous:      field.Anonymous,
@@ -344,10 +396,11 @@ type structInfo struct {
 	// (map[string][]pathPart); keys are cloned so they never alias reused
 	// request buffers.
 	paths sync.Map
-	// hasDefaults reports whether this struct or any struct reachable
-	// through its fields declares a default tag option, letting the decoder
-	// skip the setDefaults walk entirely for the common case.
-	hasDefaults bool
+	// needsDefaultsWalk reports whether the setDefaults walk can have any
+	// effect on this struct tree: it is set when a default tag option or an
+	// anonymous embedded pointer field (which the walk allocates) exists
+	// anywhere in the tree, letting the decoder skip the walk otherwise.
+	needsDefaultsWalk bool
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
@@ -368,18 +421,15 @@ func (c *cache) buildRequiredFields(info *structInfo) map[string][]fieldWithPref
 				for key, fields := range nested.requiredFields {
 					requiredKey := field.canonicalAlias + "." + key
 					for _, nestedField := range fields {
-						requiredFields = appendRequiredField(requiredFields, requiredKey, fieldWithPrefix{
-							fieldInfo: nestedField.fieldInfo,
-							prefix:    nestedPrefix + nestedField.prefix,
-						})
+						requiredFields = appendRequiredField(requiredFields, requiredKey,
+							newFieldWithPrefix(nestedField.fieldInfo, nestedPrefix+nestedField.prefix))
 					}
 				}
 			}
 		}
 		if field.isRequired {
-			requiredFields = appendRequiredField(requiredFields, field.canonicalAlias, fieldWithPrefix{
-				fieldInfo: field,
-			})
+			requiredFields = appendRequiredField(requiredFields, field.canonicalAlias,
+				newFieldWithPrefix(field, ""))
 		}
 	}
 	return requiredFields
@@ -397,6 +447,10 @@ func containsAlias(infos []*structInfo, alias string) bool {
 
 type fieldInfo struct {
 	typ reflect.Type
+	// index is the field index chain relative to the struct type whose
+	// structInfo holds this fieldInfo; promoted fields carry the full chain
+	// through the embedded structs (a copy is made per promotion level).
+	index []int
 	// name is the field name in the struct.
 	name  string
 	alias string
@@ -444,6 +498,10 @@ type pathPart struct {
 	field *fieldInfo
 	hops  []pathHop // path to the field: walks structs using field indices.
 	index int       // struct index in slices of structs.
+	// elem marks a terminal part whose path ended at a slice index ("a.0"):
+	// the decoder's value is then an element of the slice field rather than
+	// the field itself.
+	elem bool
 }
 
 // pathHop describes one named-field lookup along a path. index is the field
@@ -491,19 +549,12 @@ func parseTag(tag string) (string, tagOptions) {
 	return tag, ""
 }
 
-// next returns the first comma-separated option and the remaining options.
-func (o tagOptions) next() (string, tagOptions) {
-	if idx := strings.IndexByte(string(o), ','); idx != -1 {
-		return string(o[:idx]), o[idx+1:]
-	}
-	return string(o), ""
-}
-
 // Contains checks whether the tagOptions contains the specified option.
 func (o tagOptions) Contains(option string) bool {
-	for o != "" {
-		var s string
-		s, o = o.next()
+	if o == "" {
+		return false
+	}
+	for s := range strings.SplitSeq(string(o), ",") {
 		if s == option {
 			return true
 		}
@@ -512,9 +563,10 @@ func (o tagOptions) Contains(option string) bool {
 }
 
 func (o tagOptions) getDefaultOptionValue() string {
-	for o != "" {
-		var s string
-		s, o = o.next()
+	if o == "" {
+		return ""
+	}
+	for s := range strings.SplitSeq(string(o), ",") {
 		if value, ok := strings.CutPrefix(s, "default:"); ok {
 			return value
 		}

@@ -2329,6 +2329,126 @@ func TestDoubleEmbeddedPointer(t *testing.T) {
 	}
 }
 
+// Embedded anonymous pointers must be allocated by Decode even when the
+// struct declares no defaults and src contains no matching keys — callers
+// rely on promoted fields being reachable after Decode.
+func TestEmbeddedPointerAllocatedWithoutDefaults(t *testing.T) {
+	type Inner struct {
+		X string `schema:"x"`
+	}
+	type Outer struct {
+		*Inner
+		Y string `schema:"y"`
+	}
+
+	var o Outer
+	if err := NewDecoder().Decode(&o, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if o.Inner == nil {
+		t.Fatal("embedded pointer not allocated for empty src")
+	}
+
+	var o2 Outer
+	if err := NewDecoder().Decode(&o2, map[string][]string{"y": {"v"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o2.Inner == nil {
+		t.Fatal("embedded pointer not allocated when src only touches siblings")
+	}
+}
+
+type shadowTU struct{ S string }
+
+func (c *shadowTU) UnmarshalText(b []byte) error { c.S = string(b); return nil }
+
+type shadowEmb struct {
+	F shadowTU `schema:"f"`
+}
+
+type shadowOuter struct {
+	shadowEmb
+	F string `schema:"g"`
+}
+
+// A promoted field whose Go name is shadowed by an outer field with a
+// different alias must decode into the embedded field its alias identifies
+// (this used to panic via mismatched cached unmarshaler metadata).
+func TestShadowedPromotedFieldDecodes(t *testing.T) {
+	var s shadowOuter
+	if err := NewDecoder().Decode(&s, map[string][]string{"f": {"val"}, "g": {"out"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.shadowEmb.F.S != "val" {
+		t.Errorf("embedded field: expected %q, got %q", "val", s.shadowEmb.F.S)
+	}
+	if s.F != "out" {
+		t.Errorf("outer field: expected %q, got %q", "out", s.F)
+	}
+}
+
+// Two promoted fields sharing a Go name but carrying distinct aliases must
+// both be addressable by their aliases (the name-based walk used to skip or
+// reject them).
+func TestAmbiguousPromotedNamesDistinctAliases(t *testing.T) {
+	type ambA struct {
+		X string `schema:"xa"`
+	}
+	type ambB struct {
+		X string `schema:"xb"`
+	}
+	type elem struct {
+		ambA
+		ambB
+		N string `schema:"n"`
+	}
+	type s struct {
+		Items []elem `schema:"items"`
+	}
+
+	var dst s
+	err := NewDecoder().Decode(&dst, map[string][]string{
+		"items.0.n":  {"ok"},
+		"items.0.xa": {"va"},
+		"items.0.xb": {"vb"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := dst.Items[0]
+	if got.N != "ok" || got.ambA.X != "va" || got.ambB.X != "vb" {
+		t.Errorf("unexpected result: %+v", got)
+	}
+}
+
+// Growing a slice must never write into spare capacity of the caller's
+// original backing array — other slices may alias it.
+func TestSliceGrowthDetachesFromCallerArray(t *testing.T) {
+	type item struct {
+		P int `schema:"p"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	backing := make([]item, 8)
+	for i := range backing {
+		backing[i] = item{P: -1}
+	}
+	c := cart{Items: backing[:2]}
+	if err := NewDecoder().Decode(&c, map[string][]string{"items.4.p": {"7"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 5 || c.Items[4].P != 7 {
+		t.Fatalf("unexpected decode result: %+v", c.Items)
+	}
+	for i := 2; i < 8; i++ {
+		if backing[i].P != -1 {
+			t.Fatalf("caller backing array mutated at %d: %+v", i, backing[i])
+		}
+	}
+}
+
 // Reused destination slices must not leak stale element data into slots the
 // decoder grows into, and out-of-order indices must land correctly.
 func TestDecodeSliceIndexGrowth(t *testing.T) {
@@ -3607,10 +3727,10 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 	decoder := NewDecoder()
 	v := reflect.ValueOf(s)
 	// v = v.Elem()
-	t := v.Type()
+	info := decoder.cache.get(v.Type())
 
 	for b.Loop() {
-		_ = decoder.checkRequired(t, data)
+		_ = decoder.checkRequired(info, data)
 	}
 }
 

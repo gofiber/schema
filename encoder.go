@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	utils "github.com/gofiber/utils/v2"
 )
@@ -24,6 +25,11 @@ type Encoder struct {
 	// (map[reflect.Type][]encField) so tags are parsed and encoder
 	// functions resolved once per type instead of on every Encode call.
 	encCache sync.Map
+	// encGen is bumped before encCache is cleared on configuration changes;
+	// structInfo snapshots it before building a plan and refuses to store
+	// the plan if it changed, so a build racing a reconfiguration cannot
+	// re-insert a stale plan after the clear.
+	encGen atomic.Uint64
 }
 
 // encField is the precomputed encoding plan for one struct field.
@@ -55,27 +61,38 @@ func (e *Encoder) Encode(src interface{}, dst map[string][]string) error {
 
 // RegisterEncoder registers a converter for encoding a custom type.
 func (e *Encoder) RegisterEncoder(value interface{}, encoder func(reflect.Value) string) {
+	e.cache.l.Lock()
 	e.regenc[reflect.TypeOf(value)] = encoder
+	e.cache.l.Unlock()
+	e.encGen.Add(1)
 	e.encCache.Clear()
 }
 
 // SetAliasTag changes the tag used to locate custom field aliases.
 // The default tag is "schema".
 func (e *Encoder) SetAliasTag(tag string) {
+	e.cache.l.Lock()
 	e.cache.tag = tag
+	e.cache.l.Unlock()
+	e.encGen.Add(1)
 	e.encCache.Clear()
 }
 
 // structInfo returns the cached encoding plan for struct type t, building it
-// on first use.
+// on first use. The build reads the tag and registered encoders under the
+// configuration lock; the generation re-checks around the cache store keep a
+// build racing a reconfiguration from inserting a stale plan.
 func (e *Encoder) structInfo(t reflect.Type) []encField {
 	if cached, ok := e.encCache.Load(t); ok {
 		return cached.([]encField)
 	}
+	gen := e.encGen.Load()
+	e.cache.l.RLock()
+	tag := e.cache.tag
 	fields := make([]encField, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
-		name, opts := fieldAlias(sf, e.cache.tag)
+		name, opts := fieldAlias(sf, tag)
 		if name == "-" {
 			continue
 		}
@@ -98,13 +115,21 @@ func (e *Encoder) structInfo(t reflect.Type) []encField {
 		}
 		fields = append(fields, f)
 	}
-	e.encCache.Store(t, fields)
+	e.cache.l.RUnlock()
+	// Don't cache a plan whose inputs (tag, registered encoders) may have
+	// changed while it was being built; the next call rebuilds it fresh.
+	// The re-check after Store closes the race where a reconfiguration
+	// clears the cache between the first check and the Store: if the
+	// generation moved, our entry may have landed after the clear, so drop
+	// it (possibly discarding a concurrent fresh build, which just rebuilds
+	// on the next call).
+	if e.encGen.Load() == gen {
+		e.encCache.Store(t, fields)
+		if e.encGen.Load() != gen {
+			e.encCache.Delete(t)
+		}
+	}
 	return fields
-}
-
-// isValidStructPointer test if input value is a valid struct pointer.
-func isValidStructPointer(v reflect.Value) bool {
-	return v.Type().Kind() == reflect.Ptr && v.Elem().IsValid() && v.Elem().Type().Kind() == reflect.Struct
 }
 
 func isZero(v reflect.Value) bool {

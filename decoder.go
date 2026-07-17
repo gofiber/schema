@@ -129,15 +129,13 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	rootInfo := d.cache.get(t)
 	var multiErrors MultiError
 	for path, values := range src {
-		if parts, err := d.cache.parsePathInfo(path, t, rootInfo); err == nil {
-			if filesSlice, ok := multipartFiles[path]; ok {
-				if err = d.decode(v, path, parts, values, filesSlice); err != nil {
-					multiErrors = appendError(multiErrors, path, err)
-				}
-			} else {
-				if err = d.decode(v, path, parts, values, nil); err != nil {
-					multiErrors = appendError(multiErrors, path, err)
-				}
+		if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
+			var filesSlice []*multipart.FileHeader
+			if multipartFiles != nil {
+				filesSlice = multipartFiles[path]
+			}
+			if err = d.decode(v, path, parts, values, filesSlice); err != nil {
+				multiErrors = appendError(multiErrors, path, err)
 			}
 		} else {
 			if errors.Is(err, errIndexTooLarge) {
@@ -147,8 +145,10 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 			}
 		}
 	}
-	multiErrors = mergeErrors(multiErrors, d.setDefaults(t, v, src, ""))
-	multiErrors = mergeErrors(multiErrors, d.checkRequired(t, src))
+	if rootInfo.needsDefaultsWalk {
+		multiErrors = mergeErrors(multiErrors, d.setDefaults(t, v, src, ""))
+	}
+	multiErrors = mergeErrors(multiErrors, d.checkRequired(rootInfo, src))
 	if len(multiErrors) > 0 {
 		return multiErrors
 	}
@@ -164,25 +164,25 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		// unexpected, cache.get never return nil
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
-	// Skip the walk entirely when no default tags exist anywhere in the
-	// struct tree — the overwhelmingly common case.
-	if !struc.hasDefaults {
+	// Skip the walk entirely when it can have no effect (no default tags and
+	// no anonymous embedded pointers to allocate anywhere in the tree) — the
+	// overwhelmingly common case.
+	if !struc.needsDefaultsWalk {
 		return nil
 	}
 
 	var errs MultiError
 
-	if v.Type().Kind() == reflect.Struct {
-		for i := 0; i < v.NumField(); i++ {
-			field := v.Field(i)
-			if field.Type().Kind() == reflect.Ptr && field.IsNil() && v.Type().Field(i).Anonymous {
-				field.Set(reflect.New(field.Type().Elem()))
-			}
+	// Allocate nil anonymous embedded pointer fields so their promoted
+	// fields stay reachable.
+	for _, idx := range struc.anonymousPtrFields {
+		if field := v.Field(idx); field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
 		}
 	}
 
 	for _, f := range struc.fields {
-		vCurrent := v.FieldByName(f.name)
+		vCurrent := walkIndexChain(v, f.index)
 
 		if vCurrent.Type().Kind() == reflect.Struct && f.defaultValue == "" {
 			errs = mergeErrors(errs, d.setDefaults(vCurrent.Type(), vCurrent, src, prefix+f.canonicalAlias+"."))
@@ -260,9 +260,9 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 // only performs the per-request emptiness checks against src.
 //
 // src is the source map for decoding, we use it here to see if those required fields are included in src
-func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiError {
+func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
 	var errs MultiError
-	for key, fields := range d.cache.get(t).requiredFields {
+	for key, fields := range info.requiredFields {
 		if isEmptyFields(fields, src) {
 			errs = appendError(errs, key, EmptyFieldError{Key: key})
 		}
@@ -273,18 +273,38 @@ func (d *Decoder) checkRequired(t reflect.Type, src map[string][]string) MultiEr
 type fieldWithPrefix struct {
 	*fieldInfo
 	prefix string
+	// searchPaths lists the src keys this required field answers to, and
+	// searchPathDots the corresponding nested-key prefixes; both are
+	// precomputed at cache-build time so per-request checks allocate
+	// nothing.
+	searchPaths    []string
+	searchPathDots []string
+}
+
+func newFieldWithPrefix(f *fieldInfo, prefix string) fieldWithPrefix {
+	paths := f.paths(prefix)
+	dots := make([]string, len(paths))
+	for i, p := range paths {
+		dots[i] = p + "."
+	}
+	return fieldWithPrefix{
+		fieldInfo:      f,
+		prefix:         prefix,
+		searchPaths:    paths,
+		searchPathDots: dots,
+	}
 }
 
 // isEmptyFields returns true if all of specified fields are empty.
 func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
 	for _, f := range fields {
-		for _, path := range f.paths(f.prefix) {
+		for i, path := range f.searchPaths {
 			v, ok := src[path]
 			if ok && !isEmpty(f.typ, v) {
 				return false
 			}
 			// Check for nested keys that match this field.
-			pathDot := path + "."
+			pathDot := f.searchPathDots[i]
 			for key, val := range src {
 				if len(val) == 0 {
 					continue
@@ -385,6 +405,22 @@ func isMultipartField(typ reflect.Type) bool {
 	return false
 }
 
+// walkIndexChain walks v along a struct field index chain. Chains longer
+// than one element traverse embedded structs; intermediate nil pointers are
+// allocated so promoted fields stay reachable.
+func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
+	for j, fi := range chain {
+		if j > 0 && v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		}
+		v = v.Field(fi)
+	}
+	return v
+}
+
 // decode fills a struct field using a parsed path.
 func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
 	// Get the field walking the struct fields by index.
@@ -403,18 +439,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			}
 		}
 
-		// Walk the precomputed field index chain; chains longer than one
-		// element traverse embedded structs, allocating intermediate nil
-		// pointers so promoted fields stay reachable.
-		for j, fi := range hop.index {
-			if j > 0 && v.Kind() == reflect.Ptr {
-				if v.IsNil() {
-					v.Set(reflect.New(v.Type().Elem()))
-				}
-				v = v.Elem()
-			}
-			v = v.Field(fi)
-		}
+		v = walkIndexChain(v, hop.index)
 	}
 
 	// Don't even bother for unexported fields.
@@ -445,30 +470,15 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return fmt.Errorf("%v index %d is larger than the configured maxSize %d", v.Kind(), idx, d.maxSize)
 		}
 		if v.IsNil() || v.Len() < idx+1 {
-			if !v.IsNil() && v.Cap() >= idx+1 {
-				// Extend within existing capacity, zeroing the exposed
-				// slots: the backing array may hold stale caller data, and
-				// fresh elements must start from zero like MakeSlice ones.
-				oldLen := v.Len()
-				v.SetLen(idx + 1)
-				for i := oldLen; i <= idx; i++ {
-					v.Index(i).SetZero()
-				}
-			} else {
-				// Grow with headroom so consecutive indices don't trigger a
-				// reallocation and full copy each ("items.0" ... "items.N"
-				// would otherwise cost O(N^2) copying).
-				newCap := idx + 1
-				if double := 2 * v.Cap(); double > newCap {
-					newCap = double
-				}
-				value := reflect.MakeSlice(t, idx+1, newCap)
-				if v.Len() > 0 {
-					// Resize it.
-					reflect.Copy(value, v)
-				}
-				v.Set(value)
+			// Grow into a fresh backing array: extending within existing
+			// capacity would write into memory the caller may still share
+			// through other slices aliasing the original array.
+			value := reflect.MakeSlice(t, idx+1, idx+1)
+			if v.Len() > 0 {
+				// Resize it.
+				reflect.Copy(value, v)
 			}
+			v.Set(value)
 		}
 		return d.decode(v.Index(idx), path, parts[1:], values, files)
 	}
@@ -476,11 +486,11 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	// Get the converter early in case there is one for a slice type.
 	conv := d.cache.converter(t)
 	// The encoding.TextUnmarshaler facts for v's type are precomputed per
-	// field; instances are bound to live values where needed below. A final
-	// part without hops means the path terminated at a slice index, so v is
-	// an element of the slice field rather than the field itself.
+	// field; instances are bound to live values where needed below. For an
+	// elem part (path terminated at a slice index) v is an element of the
+	// slice field, so the element type's facts apply.
 	m := parts[0].field.derefUnmarshaler
-	if len(parts[0].hops) == 0 {
+	if parts[0].elem {
 		m = parts[0].field.elemUnmarshaler
 	}
 	if conv == nil && t.Kind() == reflect.Slice && m.IsSliceElement {
@@ -663,9 +673,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 //
 // A value that fails to parse as a whole is retried as a comma-separated
 // list. For non-string kinds a value containing a comma can never parse as a
-// whole (no builtin syntax admits commas), and string values always parse,
-// so the element count is knowable upfront: a cheap counting pass sizes the
-// slice exactly and the fill pass parses each item once.
+// whole (no builtin syntax admits commas — pinned by a test), and string
+// values always parse, so item boundaries are knowable upfront: the slice is
+// sized by a cheap comma count (an upper bound, since empty items may be
+// skipped) and truncated to the filled length at the end.
 func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
 	elemT := t.Elem()
 	k := elemT.Kind()
@@ -673,20 +684,10 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 
 	n := 0
 	for _, value := range values {
-		switch {
-		case value == "":
-			if d.zeroEmpty {
-				n++
-			}
-		case split && strings.IndexByte(value, ',') != -1:
-			for item := range strings.SplitSeq(value, ",") {
-				if item != "" || d.zeroEmpty {
-					n++
-				}
-			}
-		default:
-			n++
+		if split {
+			n += strings.Count(value, ",")
 		}
+		n++
 	}
 
 	sl := reflect.MakeSlice(t, n, n)
@@ -725,6 +726,9 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 			i++
 		}
 	}
+	if i < n {
+		sl = sl.Slice(0, i)
+	}
 	v.Set(sl)
 	return nil
 }
@@ -732,13 +736,13 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 func isTextUnmarshaler(v reflect.Value) unmarshaler {
 	// Create a new unmarshaller instance
 	m := unmarshaler{}
-	if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
+	if _, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
 		return m
 	}
 	// As the UnmarshalText function should be applied to the pointer of the
 	// type, we check that type to see if it implements the necessary
 	// method.
-	if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.New(v.Type())); m.IsValid {
+	if _, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.New(v.Type())); m.IsValid {
 		m.IsPtr = true
 		return m
 	}
@@ -750,7 +754,7 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 	}
 	if t.Kind() == reflect.Slice {
 		// Check if the slice implements encoding.TextUnmarshaller
-		if m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
+		if _, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
 			return m
 		}
 		// If t is a pointer slice, check if its elements implement
@@ -758,22 +762,21 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 		m.IsSliceElement = true
 		if t = t.Elem(); t.Kind() == reflect.Ptr {
 			t = reflect.PointerTo(t.Elem())
-			v = reflect.Zero(t)
 			m.IsSliceElementPtr = true
-			m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v)
+			_, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.Zero(t))
 			return m
 		}
 	}
 
-	v = reflect.New(t)
-	m.Unmarshaler, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v)
+	_, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.New(t))
 	return m
 }
 
 // TextUnmarshaler helpers ----------------------------------------------------
-// unmarshaller contains information about a TextUnmarshaler type
+// unmarshaler describes how a type relates to encoding.TextUnmarshaler.
+// It carries type-level facts only; the decoder binds instances to live
+// values at the point of use.
 type unmarshaler struct {
-	Unmarshaler encoding.TextUnmarshaler
 	// IsValid indicates whether the resolved type indicated by the other
 	// flags implements the encoding.TextUnmarshaler interface.
 	IsValid bool
@@ -853,14 +856,6 @@ func (e MultiError) Error() string {
 		return s + " (and 1 other error)"
 	}
 	return fmt.Sprintf("%s (and %d other errors)", s, len(e)-1)
-}
-
-func (e MultiError) merge(errors MultiError) {
-	for key, err := range errors {
-		if e[key] == nil {
-			e[key] = err
-		}
-	}
 }
 
 func appendRequiredField(m map[string][]fieldWithPrefix, key string, field fieldWithPrefix) map[string][]fieldWithPrefix {

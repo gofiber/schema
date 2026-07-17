@@ -90,8 +90,8 @@ func convertFloat64(value string) reflect.Value {
 }
 
 func convertInt(value string) reflect.Value {
-	if v, err := utils.ParseInt(value); err == nil {
-		return reflect.ValueOf(int(v))
+	if v, err := utils.ParseNativeInt(value); err == nil {
+		return reflect.ValueOf(v)
 	}
 	return invalidValue
 }
@@ -129,8 +129,8 @@ func convertString(value string) reflect.Value {
 }
 
 func convertUint(value string) reflect.Value {
-	if v, err := utils.ParseUint(value); err == nil {
-		return reflect.ValueOf(uint(v))
+	if v, err := utils.ParseNativeUint(value); err == nil {
+		return reflect.ValueOf(v)
 	}
 	return invalidValue
 }
@@ -182,11 +182,11 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 	case stringType:
 		v.SetString(val)
 	case intType:
-		n, err := utils.ParseInt(val)
+		n, err := utils.ParseNativeInt(val)
 		if err != nil {
 			return true, false
 		}
-		v.SetInt(int64(int(n)))
+		v.SetInt(int64(n))
 	case int8Type:
 		n, err := utils.ParseInt8(val)
 		if err != nil {
@@ -212,11 +212,11 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 		}
 		v.SetInt(n)
 	case uintType:
-		n, err := utils.ParseUint(val)
+		n, err := utils.ParseNativeUint(val)
 		if err != nil {
 			return true, false
 		}
-		v.SetUint(uint64(uint(n)))
+		v.SetUint(uint64(n))
 	case uint8Type:
 		n, err := utils.ParseUint8(val)
 		if err != nil {

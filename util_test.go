@@ -45,24 +45,6 @@ func TestTagOptionsContains(t *testing.T) {
 	}
 }
 
-func TestIsValidStructPointer(t *testing.T) {
-	type S struct{}
-	if !isValidStructPointer(reflect.ValueOf(&S{})) {
-		t.Errorf("expected true for struct pointer")
-	}
-	if isValidStructPointer(reflect.ValueOf(S{})) {
-		t.Errorf("expected false for struct value")
-	}
-	var sp *S
-	if isValidStructPointer(reflect.ValueOf(sp)) {
-		t.Errorf("expected false for nil pointer")
-	}
-	var i int
-	if isValidStructPointer(reflect.ValueOf(&i)) {
-		t.Errorf("expected false for pointer to non-struct")
-	}
-}
-
 func TestConvertPointer(t *testing.T) {
 	v := convertPointer(reflect.Bool, "true")
 	if !v.IsValid() || !v.Elem().Bool() {

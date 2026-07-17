@@ -792,3 +792,31 @@ func BenchmarkTimeDurationEncoding(b *testing.B) {
 		_ = enc.Encode(&testData, vals)
 	}
 }
+
+// A plan build racing SetAliasTag/RegisterEncoder must not re-insert a
+// stale plan after the invalidation; once the reconfiguration call returns,
+// every subsequent Encode must observe it.
+func TestEncoderReconfigureDuringEncode(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	for i := 0; i < 300; i++ {
+		e := NewEncoder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			dst := map[string][]string{}
+			_ = e.Encode(T1{A: "x"}, dst)
+		}()
+		e.SetAliasTag("url")
+		<-done
+
+		dst := map[string][]string{}
+		if err := e.Encode(T1{A: "x"}, dst); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := dst["urlname"]; !ok {
+			t.Fatalf("iteration %d: encode after SetAliasTag returned stale plan: %v", i, dst)
+		}
+	}
+}
