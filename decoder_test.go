@@ -2288,6 +2288,46 @@ func TestDoubleEmbedded(t *testing.T) {
 	}
 }
 
+type S26ee struct {
+	F string `schema:"f"`
+}
+
+type S26e struct {
+	*S26ee
+}
+
+type S26 struct {
+	*S26e
+	A string `schema:"a"`
+}
+
+// Fields promoted through two levels of embedded pointers must be reachable;
+// this used to panic with "indirection through nil pointer to embedded
+// struct" because only the first level was allocated.
+func TestDoubleEmbeddedPointer(t *testing.T) {
+	data := map[string][]string{
+		"f": {"raw a"},
+		"a": {"raw b"},
+	}
+
+	s := S26{}
+	decoder := NewDecoder()
+
+	if err := decoder.Decode(&s, data); err != nil {
+		t.Fatal("Error while decoding:", err)
+	}
+
+	if s.A != "raw b" {
+		t.Errorf("A: expected %q, got %q", "raw b", s.A)
+	}
+	if s.S26e == nil || s.S26ee == nil {
+		t.Fatalf("embedded pointers not allocated: %+v", s)
+	}
+	if s.F != "raw a" {
+		t.Errorf("F: expected %q, got %q", "raw a", s.F)
+	}
+}
+
 func TestDefaultValuesAreSet(t *testing.T) {
 	type N struct {
 		S1 string    `schema:"s1,default:test1"`

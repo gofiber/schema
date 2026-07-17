@@ -159,6 +159,11 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		// unexpected, cache.get never return nil
 		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
 	}
+	// Skip the walk entirely when no default tags exist anywhere in the
+	// struct tree — the overwhelmingly common case.
+	if !struc.hasDefaults {
+		return nil
+	}
 
 	var errs MultiError
 
@@ -378,8 +383,8 @@ func isMultipartField(typ reflect.Type) bool {
 // decode fills a struct field using a parsed path.
 func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
 	// Get the field walking the struct fields by index.
-	for _, name := range parts[0].path {
-		if v.Type().Kind() == reflect.Ptr {
+	for _, hop := range parts[0].hops {
+		if v.Kind() == reflect.Ptr {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
 			}
@@ -387,11 +392,24 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		}
 
 		// Allocate embedded anonymous pointers required for promoted fields.
-		if v.Type().Kind() == reflect.Struct {
-			d.ensureAnonymousPtrs(v)
+		for _, idx := range hop.ensure {
+			if f := v.Field(idx); f.IsNil() {
+				f.Set(reflect.New(f.Type().Elem()))
+			}
 		}
 
-		v = v.FieldByName(name)
+		// Walk the precomputed field index chain; chains longer than one
+		// element traverse embedded structs, allocating intermediate nil
+		// pointers so promoted fields stay reachable.
+		for j, fi := range hop.index {
+			if j > 0 && v.Kind() == reflect.Ptr {
+				if v.IsNil() {
+					v.Set(reflect.New(v.Type().Elem()))
+				}
+				v = v.Elem()
+			}
+			v = v.Field(fi)
+		}
 	}
 
 	// Don't even bother for unexported fields.
@@ -434,15 +452,15 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 
 	// Get the converter early in case there is one for a slice type.
 	conv := d.cache.converter(t)
-	m := isTextUnmarshaler(v)
+	// The encoding.TextUnmarshaler facts for v's type are precomputed per
+	// field; instances are bound to live values where needed below. A final
+	// part without hops means the path terminated at a slice index, so v is
+	// an element of the slice field rather than the field itself.
+	m := parts[0].field.derefUnmarshaler
+	if len(parts[0].hops) == 0 {
+		m = parts[0].field.elemUnmarshaler
+	}
 	if conv == nil && t.Kind() == reflect.Slice && m.IsSliceElement {
-		itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
-		items := (*itemsBuf)[:0]
-		defer func() {
-			clear(items)
-			*itemsBuf = items[:0]
-			decodeValueBufferPool.Put(itemsBuf)
-		}()
 		elemT := t.Elem()
 		isPtrElem := elemT.Kind() == reflect.Ptr
 		if isPtrElem {
@@ -450,7 +468,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		}
 
 		// Try to get a converter for the element type.
-		conv := d.cache.converter(elemT)
+		customConv := d.cache.converter(elemT)
+		conv := customConv
 		if conv == nil {
 			conv = getBuiltinConverter(elemT.Kind())
 			if conv == nil {
@@ -459,6 +478,21 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				return fmt.Errorf("schema: converter not found for %v", elemT)
 			}
 		}
+
+		// Fast path: builtin element kinds without unmarshalers, custom
+		// converters or pointer elements decode straight into a fresh slice,
+		// avoiding one reflect.Value allocation per element.
+		if customConv == nil && !m.IsValid && !isPtrElem {
+			return d.decodeBuiltinSlice(v, t, path, values)
+		}
+
+		itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
+		items := (*itemsBuf)[:0]
+		defer func() {
+			clear(items)
+			*itemsBuf = items[:0]
+			decodeValueBufferPool.Put(itemsBuf)
+		}()
 
 		for key, value := range values {
 			if value == "" {
@@ -530,7 +564,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 			}
 		}
-		value := reflect.Append(reflect.MakeSlice(t, 0, 0), items...)
+		value := reflect.MakeSlice(t, len(items), len(items))
+		for i, item := range items {
+			value.Index(i).Set(item)
+		}
 		v.Set(value)
 	} else {
 		val := ""
@@ -564,8 +601,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				v.Set(reflect.Indirect(u))
 			} else {
 				// If the value implements the encoding.TextUnmarshaler interface
-				// apply UnmarshalText as the converter
-				if err := m.Unmarshaler.UnmarshalText([]byte(val)); err != nil {
+				// apply UnmarshalText as the converter, binding it to the
+				// live value.
+				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](v)
+				if err := um.UnmarshalText([]byte(val)); err != nil {
 					return ConversionError{
 						Key:   path,
 						Type:  t,
@@ -578,10 +617,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			if d.zeroEmpty {
 				v.Set(reflect.Zero(t))
 			}
-		} else if conv := getBuiltinConverter(t.Kind()); conv != nil {
-			if value := conv(val); value.IsValid() {
-				v.Set(value.Convert(t))
-			} else {
+		} else if handled, ok := setBuiltinKind(v, t.Kind(), val); handled {
+			if !ok {
 				return ConversionError{
 					Key:   path,
 					Type:  t,
@@ -595,14 +632,61 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
-func (d *Decoder) ensureAnonymousPtrs(v reflect.Value) {
-	info := d.cache.get(v.Type())
-	for _, idx := range info.anonymousPtrFields {
-		field := v.Field(idx)
-		if field.IsNil() {
-			field.Set(reflect.New(field.Type().Elem()))
+// decodeBuiltinSlice decodes values into the slice field v of type t whose
+// elements are builtin-convertible kinds, parsing directly into slice slots
+// instead of boxing every element in a reflect.Value. The slice is built
+// detached and only assigned to v when every value parsed, matching the
+// all-or-nothing behavior of the generic path.
+func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
+	elemT := t.Elem()
+	k := elemT.Kind()
+	sl := reflect.New(t).Elem()
+	sl.Set(reflect.MakeSlice(t, 0, len(values)))
+	appendSlot := func() reflect.Value {
+		n := sl.Len()
+		if n == sl.Cap() {
+			sl.Grow(1)
+		}
+		sl.SetLen(n + 1)
+		return sl.Index(n)
+	}
+	for key, value := range values {
+		if value == "" {
+			if d.zeroEmpty {
+				appendSlot()
+			}
+			continue
+		}
+		if _, ok := setBuiltinKind(appendSlot(), k, value); !ok {
+			// The whole value did not parse; retry it as a comma-separated
+			// list. The failed slot is still zero, so shrinking undoes it.
+			sl.SetLen(sl.Len() - 1)
+			if strings.IndexByte(value, ',') == -1 {
+				return ConversionError{
+					Key:   path,
+					Type:  elemT,
+					Index: key,
+				}
+			}
+			for item := range strings.SplitSeq(value, ",") {
+				if item == "" {
+					if d.zeroEmpty {
+						appendSlot()
+					}
+					continue
+				}
+				if _, ok := setBuiltinKind(appendSlot(), k, item); !ok {
+					return ConversionError{
+						Key:   path,
+						Type:  elemT,
+						Index: key,
+					}
+				}
+			}
 		}
 	}
+	v.Set(sl)
+	return nil
 }
 
 func isTextUnmarshaler(v reflect.Value) unmarshaler {

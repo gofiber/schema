@@ -74,7 +74,7 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	var field *fieldInfo
 	var index64 int64
 	var parts []pathPart
-	var path []string
+	var hops []pathHop
 	for keyStart := 0; ; {
 		if t.Kind() != reflect.Struct {
 			return nil, errInvalidPath
@@ -89,8 +89,14 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 		if field = struc.get(segment); field == nil {
 			return nil, errInvalidPath
 		}
-		// Valid field. Append index.
-		path = append(path, field.name)
+		// Valid field. Append the hop, resolving the field index chain once
+		// here so the decoder can walk plain indices instead of repeating
+		// FieldByName lookups on every Decode call.
+		sf, ok := t.FieldByName(field.name)
+		if !ok {
+			return nil, errInvalidPath
+		}
+		hops = append(hops, pathHop{index: sf.Index, ensure: struc.anonymousPtrFields})
 		if field.isSliceOfStructs && !isMultipartField(field.typ) && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
@@ -114,11 +120,11 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 				return nil, errIndexTooLarge
 			}
 			parts = append(parts, pathPart{
-				path:  path,
+				hops:  hops,
 				field: field,
 				index: int(index64),
 			})
-			path = nil
+			hops = nil
 
 			// Get the next struct type, dropping ptrs.
 			if field.typ.Kind() == reflect.Ptr {
@@ -148,7 +154,7 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 	}
 	// Add the remaining.
 	parts = append(parts, pathPart{
-		path:  path,
+		hops:  hops,
 		field: field,
 		index: -1,
 	})
@@ -244,7 +250,35 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	info.requiredFields = c.buildRequiredFields(info)
+	info.hasDefaults = c.hasDefaultsDeep(t, map[reflect.Type]bool{})
 	return info
+}
+
+// hasDefaultsDeep reports whether t or any struct type reachable through its
+// (possibly pointer-wrapped) fields declares a default tag option. visited
+// guards against recursive types.
+func (c *cache) hasDefaultsDeep(t reflect.Type, visited map[reflect.Type]bool) bool {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	if t.Kind() != reflect.Struct || visited[t] {
+		return false
+	}
+	visited[t] = true
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		alias, options := fieldAlias(field, c.tag)
+		if alias == "-" {
+			continue
+		}
+		if options.getDefaultOptionValue() != "" {
+			return true
+		}
+		if c.hasDefaultsDeep(field.Type, visited) {
+			return true
+		}
+	}
+	return false
 }
 
 // createField creates a fieldInfo for the given field.
@@ -292,6 +326,8 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
 		unmarshalerInfo:  m,
+		derefUnmarshaler: isTextUnmarshaler(reflect.Zero(indirectType(field.Type))),
+		elemUnmarshaler:  isTextUnmarshaler(reflect.Zero(ft)),
 		isSliceOfStructs: isSlice && isStruct,
 		isAnonymous:      field.Anonymous,
 		isRequired:       options.Contains("required"),
@@ -311,6 +347,10 @@ type structInfo struct {
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
 	requiredFields     map[string][]fieldWithPrefix
+	// hasDefaults reports whether this struct or any struct reachable
+	// through its fields declares a default tag option, letting the decoder
+	// skip the setDefaults walk entirely for the common case.
+	hasDefaults bool
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
@@ -374,6 +414,16 @@ type fieldInfo struct {
 	// unmarshalerInfo contains information regarding the
 	// encoding.TextUnmarshaler implementation of the field type.
 	unmarshalerInfo unmarshaler
+	// derefUnmarshaler caches the encoding.TextUnmarshaler information for
+	// the field type after one pointer dereference, which is what the
+	// decoder sees after walking to the field. Only the type-level flags are
+	// meaningful; the decoder binds instances to live values itself.
+	derefUnmarshaler unmarshaler
+	// elemUnmarshaler is like derefUnmarshaler but for the fully unwrapped
+	// slice element type; the decoder uses it when a path terminates at a
+	// slice index (e.g. "a.0") and the value at hand is an element rather
+	// than the slice field itself.
+	elemUnmarshaler unmarshaler
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.
@@ -391,8 +441,18 @@ func (f *fieldInfo) paths(prefix string) []string {
 
 type pathPart struct {
 	field *fieldInfo
-	path  []string // path to the field: walks structs using field names.
-	index int      // struct index in slices of structs.
+	hops  []pathHop // path to the field: walks structs using field indices.
+	index int       // struct index in slices of structs.
+}
+
+// pathHop describes one named-field lookup along a path. index is the field
+// index chain relative to the struct at this level (more than one element
+// when the field is promoted from embedded structs), and ensure lists the
+// anonymous pointer fields of that struct which must be allocated before the
+// walk so promoted fields stay reachable.
+type pathHop struct {
+	index  []int
+	ensure []int
 }
 
 // ----------------------------------------------------------------------------

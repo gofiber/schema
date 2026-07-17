@@ -163,6 +163,102 @@ func convertUint64(value string) reflect.Value {
 	return invalidValue
 }
 
+// setBuiltinKind parses val and assigns it directly into v for builtin
+// convertible kinds, avoiding the reflect.Value boxing of the Converter API.
+// handled reports whether the kind is builtin-convertible; ok reports whether
+// val parsed successfully. v is only modified on success.
+func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bool) {
+	switch k {
+	case boolType:
+		if val == "on" {
+			v.SetBool(true)
+			return true, true
+		}
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetBool(b)
+	case stringType:
+		v.SetString(val)
+	case intType:
+		n, err := utils.ParseInt(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetInt(int64(int(n)))
+	case int8Type:
+		n, err := utils.ParseInt8(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetInt(int64(n))
+	case int16Type:
+		n, err := utils.ParseInt16(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetInt(int64(n))
+	case int32Type:
+		n, err := utils.ParseInt32(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetInt(int64(n))
+	case int64Type:
+		n, err := utils.ParseInt(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetInt(n)
+	case uintType:
+		n, err := utils.ParseUint(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetUint(uint64(uint(n)))
+	case uint8Type:
+		n, err := utils.ParseUint8(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetUint(uint64(n))
+	case uint16Type:
+		n, err := utils.ParseUint16(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetUint(uint64(n))
+	case uint32Type:
+		n, err := utils.ParseUint32(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetUint(uint64(n))
+	case uint64Type:
+		n, err := utils.ParseUint(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetUint(n)
+	case float32Type:
+		f, err := utils.ParseFloat32(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetFloat(float64(f))
+	case float64Type:
+		f, err := utils.ParseFloat64(val)
+		if err != nil {
+			return true, false
+		}
+		v.SetFloat(f)
+	default:
+		return false, false
+	}
+	return true, true
+}
+
 func convertPointer(k reflect.Kind, value string) reflect.Value {
 	conv := getBuiltinConverter(k)
 	if conv == nil {
