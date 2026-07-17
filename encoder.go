@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"sync"
 
 	utils "github.com/gofiber/utils/v2"
 )
@@ -15,6 +16,23 @@ type encoderFunc func(reflect.Value) string
 type Encoder struct {
 	cache  *cache
 	regenc map[reflect.Type]encoderFunc
+	// encCache memoizes the per-struct-type encoding plan
+	// (map[reflect.Type][]encField) so tags are parsed and encoder
+	// functions resolved once per type instead of on every Encode call.
+	encCache sync.Map
+}
+
+// encField is the precomputed encoding plan for one struct field.
+type encField struct {
+	name      string
+	enc       encoderFunc // immediate encoder; nil for structs and slices
+	elemEnc   encoderFunc // slice element encoder, when the field is a slice
+	idx       int
+	omitEmpty bool
+	// recurseStructPtr marks pointer-to-struct fields without a custom
+	// encoder: non-nil values are encoded by recursing into the element.
+	recurseStructPtr bool
+	isStruct         bool
 }
 
 // NewEncoder returns a new Encoder with defaults.
@@ -34,12 +52,50 @@ func (e *Encoder) Encode(src interface{}, dst map[string][]string) error {
 // RegisterEncoder registers a converter for encoding a custom type.
 func (e *Encoder) RegisterEncoder(value interface{}, encoder func(reflect.Value) string) {
 	e.regenc[reflect.TypeOf(value)] = encoder
+	e.encCache.Clear()
 }
 
 // SetAliasTag changes the tag used to locate custom field aliases.
 // The default tag is "schema".
 func (e *Encoder) SetAliasTag(tag string) {
 	e.cache.tag = tag
+	e.encCache.Clear()
+}
+
+// structInfo returns the cached encoding plan for struct type t, building it
+// on first use.
+func (e *Encoder) structInfo(t reflect.Type) []encField {
+	if cached, ok := e.encCache.Load(t); ok {
+		return cached.([]encField)
+	}
+	fields := make([]encField, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		name, opts := fieldAlias(sf, e.cache.tag)
+		if name == "-" {
+			continue
+		}
+		ft := sf.Type
+		f := encField{
+			idx:       i,
+			name:      name,
+			omitEmpty: opts.Contains("omitempty"),
+			recurseStructPtr: ft.Kind() == reflect.Ptr &&
+				ft.Elem().Kind() == reflect.Struct &&
+				!e.hasCustomEncoder(ft),
+			enc: typeEncoder(ft, e.regenc),
+		}
+		if f.enc == nil {
+			if ft.Kind() == reflect.Struct {
+				f.isStruct = true
+			} else if ft.Kind() == reflect.Slice {
+				f.elemEnc = typeEncoder(ft.Elem(), e.regenc)
+			}
+		}
+		fields = append(fields, f)
+	}
+	e.encCache.Store(t, fields)
+	return fields
 }
 
 // isValidStructPointer test if input value is a valid struct pointer.
@@ -83,71 +139,70 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	if v.Kind() != reflect.Struct {
 		return errors.New("schema: interface must be a struct")
 	}
-	t := v.Type()
 
-	errors := MultiError{}
+	var errs MultiError
 
-	for i := 0; i < v.NumField(); i++ {
-		fieldValue := v.Field(i)
-		fieldType := fieldValue.Type()
-		name, opts := fieldAlias(t.Field(i), e.cache.tag)
-		if name == "-" {
-			continue
-		}
+	fields := e.structInfo(v.Type())
+	for i := range fields {
+		f := &fields[i]
+		fieldValue := v.Field(f.idx)
 
 		// Encode struct pointer types if the field is a valid pointer and a struct.
-		if isValidStructPointer(fieldValue) && !e.hasCustomEncoder(fieldType) {
-			err := e.encode(fieldValue.Elem(), dst)
-			if err != nil {
-				errors[fieldValue.Elem().Type().String()] = err
+		if f.recurseStructPtr && !fieldValue.IsNil() {
+			if err := e.encode(fieldValue.Elem(), dst); err != nil {
+				errs = setError(errs, fieldValue.Elem().Type().String(), err)
 			}
 			continue
 		}
-
-		encFunc := typeEncoder(fieldType, e.regenc)
 
 		// Encode non-slice types and custom implementations immediately.
-		if encFunc != nil {
-			if opts.Contains("omitempty") && isZero(fieldValue) {
+		if f.enc != nil {
+			if f.omitEmpty && isZero(fieldValue) {
 				continue
 			}
-			value := encFunc(fieldValue)
-			dst[name] = append(dst[name], value)
+			dst[f.name] = append(dst[f.name], f.enc(fieldValue))
 			continue
 		}
 
-		if fieldType.Kind() == reflect.Struct {
-			err := e.encode(fieldValue, dst)
-			if err != nil {
-				errors[fieldType.String()] = err
+		if f.isStruct {
+			if err := e.encode(fieldValue, dst); err != nil {
+				errs = setError(errs, fieldValue.Type().String(), err)
 			}
 			continue
 		}
 
-		if fieldType.Kind() == reflect.Slice {
-			encFunc = typeEncoder(fieldType.Elem(), e.regenc)
-		}
-
-		if encFunc == nil {
-			errors[fieldType.String()] = fmt.Errorf("schema: encoder not found for %v", fieldValue)
+		if f.elemEnc == nil {
+			errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
 			continue
 		}
 
 		// Encode a slice.
-		if fieldValue.Len() == 0 && opts.Contains("omitempty") {
+		n := fieldValue.Len()
+		if n == 0 && f.omitEmpty {
 			continue
 		}
 
-		dst[name] = []string{}
-		for j := 0; j < fieldValue.Len(); j++ {
-			dst[name] = append(dst[name], encFunc(fieldValue.Index(j)))
+		values := make([]string, n)
+		for j := 0; j < n; j++ {
+			values[j] = f.elemEnc(fieldValue.Index(j))
 		}
+		dst[f.name] = values
 	}
 
-	if len(errors) > 0 {
-		return errors
+	if len(errs) > 0 {
+		return errs
 	}
 	return nil
+}
+
+// setError lazily allocates m and stores err under key, overwriting any
+// previous entry (matching the historical encoder error semantics).
+func setError(m MultiError, key string, err error) MultiError {
+	if m == nil {
+		m = make(MultiError)
+	}
+	m[key] = err
+	return m
 }
 
 func (e *Encoder) hasCustomEncoder(t reflect.Type) bool {
