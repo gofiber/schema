@@ -167,3 +167,12 @@ func TestNoBuiltinKindParsesCommas(t *testing.T) {
 		}
 	}
 }
+
+func TestGetBuiltinConverterOutOfRangeKind(t *testing.T) {
+	if getBuiltinConverter(reflect.Kind(200)) != nil {
+		t.Error("expected nil converter for out-of-range kind")
+	}
+	if getBuiltinConverter(reflect.Map) != nil {
+		t.Error("expected nil converter for unsupported kind")
+	}
+}

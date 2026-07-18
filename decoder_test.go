@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -4137,5 +4138,267 @@ func TestDecodeTextUnmarshalerSliceReplacesPreviousValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
 		t.Fatalf("unexpected slice after second decode: %v", s.B)
+	}
+}
+
+// Malformed path keys must all surface as invalid-path/unknown-key errors,
+// covering the parser's error branches including the SWAR word-scan hitting
+// a separator at the segment start.
+func TestDecodeMalformedPathKeys(t *testing.T) {
+	type Inner struct {
+		V string `schema:"v"`
+	}
+	type S struct {
+		A     string  `schema:"a"`
+		Items []Inner `schema:"items"`
+	}
+	for _, key := range []string{
+		"",             // empty key
+		".a",           // leading separator
+		"a.",           // trailing separator
+		"a..b",         // empty middle segment
+		"..abcdefghij", // leading separator, long enough for the word scan
+		"items.",       // slice index missing
+		"items.x.v",    // slice index not a number
+		"items.0.",     // trailing separator after index
+		"a.b",          // path continues past a scalar field
+		"nope",         // unknown field
+	} {
+		var s S
+		err := NewDecoder().Decode(&s, map[string][]string{key: {"x"}})
+		if err == nil {
+			t.Errorf("key %q: expected error, got nil", key)
+			continue
+		}
+		me, ok := err.(MultiError)
+		if !ok {
+			t.Errorf("key %q: expected MultiError, got %T %v", key, err, err)
+			continue
+		}
+		if _, ok := me[key].(UnknownKeyError); !ok {
+			t.Errorf("key %q: expected UnknownKeyError, got %v", key, me[key])
+		}
+	}
+	// With unknown keys ignored, the same keys must decode to no error.
+	for _, key := range []string{"", ".a", "a..b", "items.x.v"} {
+		var s S
+		dec := NewDecoder()
+		dec.IgnoreUnknownKeys(true)
+		if err := dec.Decode(&s, map[string][]string{key: {"x"}}); err != nil {
+			t.Errorf("key %q with IgnoreUnknownKeys: unexpected error %v", key, err)
+		}
+	}
+}
+
+// Pointer-element slices exercise the pooled decode path: comma splitting,
+// empty values with and without ZeroEmpty, and conversion errors.
+func TestDecodePointerElemSlices(t *testing.T) {
+	type S struct {
+		P []*int `schema:"p"`
+	}
+
+	deref := func(ps []*int) []int {
+		out := make([]int, len(ps))
+		for i, p := range ps {
+			if p != nil {
+				out[i] = *p
+			} else {
+				out[i] = -999
+			}
+		}
+		return out
+	}
+
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{"p": {"1", "2,3", "4"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := deref(s.P); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Errorf("expected [1 2 3 4], got %v", got)
+	}
+
+	s = S{}
+	if err := NewDecoder().Decode(&s, map[string][]string{"p": {"", "5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := deref(s.P); !reflect.DeepEqual(got, []int{5}) {
+		t.Errorf("expected [5], got %v", got)
+	}
+
+	// ZeroEmpty with pointer elements produces nil elements for empty items
+	// (this used to panic with "int is not assignable to *int").
+	s = S{}
+	dec := NewDecoder()
+	dec.ZeroEmpty(true)
+	if err := dec.Decode(&s, map[string][]string{"p": {"", "6,,7"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.P) != 4 || s.P[0] != nil || *s.P[1] != 6 || s.P[2] != nil || *s.P[3] != 7 {
+		t.Errorf("unexpected zeroEmpty result: %v", deref(s.P))
+	}
+
+	for _, vals := range [][]string{{"x"}, {"1,x"}} {
+		s = S{}
+		err := NewDecoder().Decode(&s, map[string][]string{"p": vals})
+		me, ok := err.(MultiError)
+		if !ok {
+			t.Errorf("values %v: expected MultiError, got %v", vals, err)
+			continue
+		}
+		if _, ok := me["p"].(ConversionError); !ok {
+			t.Errorf("values %v: expected ConversionError, got %v", vals, me["p"])
+		}
+	}
+}
+
+// Custom converters on slice element types route through the pooled path,
+// including the comma-split fallback and its error cases.
+func TestDecodeCustomConverterElemSlice(t *testing.T) {
+	type CV string
+	type S struct {
+		C []CV `schema:"c"`
+	}
+	dec := NewDecoder()
+	dec.RegisterConverter(CV(""), func(v string) reflect.Value {
+		if v == "bad" || strings.Contains(v, ",") {
+			return reflect.Value{}
+		}
+		// Returns the underlying kind, exercising the Convert-to-element
+		// branch of the pooled slice path.
+		return reflect.ValueOf("cv:" + v)
+	})
+
+	var s S
+	if err := dec.Decode(&s, map[string][]string{"c": {"a", "b,c"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.C) != 3 || s.C[0] != "cv:a" || s.C[1] != "cv:b" || s.C[2] != "cv:c" {
+		t.Errorf("unexpected result: %+v", s.C)
+	}
+
+	s = S{}
+	err := dec.Decode(&s, map[string][]string{"c": {"bad"}})
+	if err == nil {
+		t.Error("expected error for whole bad value")
+	}
+
+	s = S{}
+	err = dec.Decode(&s, map[string][]string{"c": {"a,bad,c"}})
+	if err == nil {
+		t.Error("expected error for bad comma item")
+	}
+}
+
+func TestHandleMultipartFieldNonMultipart(t *testing.T) {
+	// Pointer fields that are not multipart shapes must fall through.
+	type S struct {
+		P *[]int
+	}
+	v := reflect.ValueOf(&S{}).Elem().Field(0)
+	files := []*multipart.FileHeader{{Filename: "f"}}
+	if handleMultipartField(v, files) {
+		t.Error("expected false for *[]int field")
+	}
+	if handleMultipartField(reflect.ValueOf(&S{}).Elem(), files) {
+		t.Error("expected false for struct field")
+	}
+}
+
+func TestIsMultipartFieldShapes(t *testing.T) {
+	cases := []struct {
+		typ  reflect.Type
+		want bool
+	}{
+		{reflect.TypeOf(&multipart.FileHeader{}), true},
+		{reflect.TypeOf([]*multipart.FileHeader{}), true},
+		{reflect.TypeOf(&[]*multipart.FileHeader{}), true},
+		{reflect.TypeOf(multipart.FileHeader{}), false},
+		{reflect.TypeOf(0), false},
+		{reflect.TypeOf(new(int)), false},
+		{reflect.TypeOf([]int{}), false},
+	}
+	for _, c := range cases {
+		if got := isMultipartField(c.typ); got != c.want {
+			t.Errorf("isMultipartField(%v) = %v, want %v", c.typ, got, c.want)
+		}
+	}
+}
+
+func TestAppendErrorNil(t *testing.T) {
+	m := MultiError{"a": errors.New("a")}
+	if got := appendError(m, "b", nil); len(got) != 1 {
+		t.Errorf("nil error must not be appended: %v", got)
+	}
+	if got := appendError(nil, "b", nil); got != nil {
+		t.Errorf("nil error on nil map must return nil, got %v", got)
+	}
+}
+
+// Struct fields containing arrays of pointers must be walked during cache
+// building without dropping the surrounding struct's other fields.
+func TestArrayOfPointersFieldWalk(t *testing.T) {
+	type S struct {
+		A [2]*int `schema:"a"`
+		B string  `schema:"b"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.B != "ok" {
+		t.Errorf("expected ok, got %q", s.B)
+	}
+}
+
+// Reconfiguring a decoder concurrently with Decode must never latch stale
+// metadata: once SetAliasTag returns, subsequent decodes observe the new tag.
+func TestDecoderReconfigureDuringDecode(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	for i := 0; i < 300; i++ {
+		d := NewDecoder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var dst T1
+			_ = d.Decode(&dst, map[string][]string{"schemaname": {"x"}})
+		}()
+		d.SetAliasTag("url")
+		<-done
+
+		var dst T1
+		if err := d.Decode(&dst, map[string][]string{"urlname": {"y"}}); err != nil {
+			t.Fatalf("iteration %d: decode after SetAliasTag failed: %v", i, err)
+		}
+		if dst.A != "y" {
+			t.Fatalf("iteration %d: stale metadata: %+v", i, dst)
+		}
+	}
+}
+
+// Concurrent decodes of the same fresh path exercise the parse cache's
+// lost-race insertion path; results must be identical either way.
+func TestConcurrentSamePathDecode(t *testing.T) {
+	type S struct {
+		A string `schema:"a"`
+		B int    `schema:"b"`
+	}
+	for i := 0; i < 50; i++ {
+		d := NewDecoder()
+		var wg sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var s S
+				if err := d.Decode(&s, map[string][]string{"a": {"x"}, "b": {"7"}}); err != nil {
+					t.Errorf("decode failed: %v", err)
+				} else if s.A != "x" || s.B != 7 {
+					t.Errorf("wrong result: %+v", s)
+				}
+			}()
+		}
+		wg.Wait()
 	}
 }

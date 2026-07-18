@@ -82,9 +82,6 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	var parts []pathPart
 	var hops []pathHop
 	for keyStart := 0; ; {
-		if struc == nil {
-			return nil, errInvalidPath
-		}
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
 		if err != nil {
 			return nil, errInvalidPath
@@ -227,6 +224,15 @@ func (c *cache) reset() {
 	c.m.Clear()
 }
 
+// aliasTag returns the configured tag name under the configuration lock, so
+// metadata builds racing SetAliasTag read a consistent value.
+func (c *cache) aliasTag() string {
+	c.l.RLock()
+	tag := c.tag
+	c.l.RUnlock()
+	return tag
+}
+
 // create creates a structInfo with meta-data about a struct.
 func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	info := &structInfo{}
@@ -293,7 +299,7 @@ func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) 
 		if field.Anonymous && field.Type.Kind() == reflect.Ptr {
 			hasAnonPtr = true
 		}
-		alias, options := fieldAlias(field, c.tag)
+		alias, options := fieldAlias(field, c.aliasTag())
 		if alias == "-" {
 			continue
 		}
@@ -312,7 +318,7 @@ func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) 
 
 // createField creates a fieldInfo for the given field.
 func (c *cache) createField(field reflect.StructField, parentAlias string) *fieldInfo {
-	alias, options := fieldAlias(field, c.tag)
+	alias, options := fieldAlias(field, c.aliasTag())
 	if alias == "-" {
 		// Ignore this field.
 		return nil

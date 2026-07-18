@@ -160,10 +160,6 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 // nested structs can also have default tags
 func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]string, prefix string) MultiError {
 	struc := d.cache.get(t)
-	if struc == nil {
-		// unexpected, cache.get never return nil
-		return MultiError{"default-" + t.Name(): errors.New("cache fail")}
-	}
 	// Skip the walk entirely when it can have no effect (no default tags and
 	// no anonymous embedded pointers to allocate anywhere in the tree) — the
 	// overwhelmingly common case.
@@ -530,7 +526,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		for key, value := range values {
 			if value == "" {
 				if d.zeroEmpty {
-					items = append(items, reflect.Zero(elemT))
+					items = append(items, reflect.Zero(t.Elem()))
 				}
 			} else if m.IsValid {
 				u := reflect.New(elemT)
@@ -548,10 +544,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 				if m.IsSliceElementPtr {
 					items = append(items, u.Elem().Addr())
-				} else if u.Kind() == reflect.Ptr {
-					items = append(items, u.Elem())
 				} else {
-					items = append(items, u)
+					// u is always a pointer from reflect.New; store the
+					// pointed-to value.
+					items = append(items, u.Elem())
 				}
 			} else if item := conv(value); item.IsValid() {
 				if isPtrElem {
@@ -568,7 +564,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 					for value := range strings.SplitSeq(value, ",") {
 						if value == "" {
 							if d.zeroEmpty {
-								items = append(items, reflect.Zero(elemT))
+								items = append(items, reflect.Zero(t.Elem()))
 							}
 						} else if item := conv(value); item.IsValid() {
 							if isPtrElem {
@@ -753,12 +749,9 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 		t = t.Elem()
 	}
 	if t.Kind() == reflect.Slice {
-		// Check if the slice implements encoding.TextUnmarshaller
-		if _, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](v); m.IsValid {
-			return m
-		}
-		// If t is a pointer slice, check if its elements implement
-		// encoding.TextUnmarshaler
+		// The slice type itself cannot implement encoding.TextUnmarshaler
+		// here: the value-level assert above already covered it. Check
+		// whether the elements do.
 		m.IsSliceElement = true
 		if t = t.Elem(); t.Kind() == reflect.Ptr {
 			t = reflect.PointerTo(t.Elem())

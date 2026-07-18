@@ -3,6 +3,7 @@ package schema
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -818,5 +819,26 @@ func TestEncoderReconfigureDuringEncode(t *testing.T) {
 		if _, ok := dst["urlname"]; !ok {
 			t.Fatalf("iteration %d: encode after SetAliasTag returned stale plan: %v", i, dst)
 		}
+	}
+}
+
+// Errors inside recursed structs (value and pointer) must be collected under
+// the nested type's name.
+func TestEncoderNestedErrors(t *testing.T) {
+	type Bad struct {
+		M map[string]string `schema:"m"`
+	}
+	type S struct {
+		V Bad  `schema:"v"`
+		P *Bad `schema:"p"`
+	}
+	enc := NewEncoder()
+	dst := map[string][]string{}
+	err := enc.Encode(S{V: Bad{M: map[string]string{"a": "b"}}, P: &Bad{}}, dst)
+	if err == nil {
+		t.Fatal("expected error for unsupported nested field")
+	}
+	if !strings.Contains(err.Error(), "encoder not found") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
