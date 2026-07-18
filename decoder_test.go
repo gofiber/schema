@@ -4426,9 +4426,10 @@ func TestUnexportedEmbeddedPointerSkipped(t *testing.T) {
 
 	// Keys targeting fields promoted through the unsettable pointer are
 	// skipped silently once the path parses (the field exists in metadata).
+	// Default unknown-key behavior is used deliberately: if "x" ever fell
+	// out of the metadata, Decode would return an UnknownKeyError here.
 	var o2 outer
 	dec := NewDecoder()
-	dec.IgnoreUnknownKeys(true)
 	if err := dec.Decode(&o2, map[string][]string{"x": {"v"}, "a": {"ok"}}); err != nil {
 		t.Fatal(err)
 	}
@@ -4493,14 +4494,15 @@ func TestDecoderRegisterConverterDuringDecode(t *testing.T) {
 	conv := func(v string) reflect.Value { return reflect.ValueOf(CV("conv:" + v)) }
 	for i := 0; i < 200; i++ {
 		d := NewDecoder()
-		done := make(chan struct{})
+		done := make(chan error, 1)
 		go func() {
-			defer close(done)
 			var s S
-			_ = d.Decode(&s, map[string][]string{"a": {"x"}})
+			done <- d.Decode(&s, map[string][]string{"a": {"x"}})
 		}()
 		d.RegisterConverter(CV(""), conv)
-		<-done
+		if err := <-done; err != nil {
+			t.Fatalf("iteration %d: concurrent decode failed: %v", i, err)
+		}
 
 		var s S
 		if err := d.Decode(&s, map[string][]string{"c": {"v"}, "a": {"x"}}); err != nil {
