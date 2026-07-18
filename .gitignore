@@ -1,2 +1,7 @@
+coverage.coverprofile
+vendor
+
+.idea
+
 # Binaries
 *.test

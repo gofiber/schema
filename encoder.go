@@ -32,6 +32,14 @@ type Encoder struct {
 	encGen atomic.Uint64
 }
 
+// encPlan tags a per-type encoding plan with the configuration generation it
+// was built under, so plans stored by builds that raced a reconfiguration
+// are never served afterwards.
+type encPlan struct {
+	fields []encField
+	gen    uint64
+}
+
 // encField is the precomputed encoding plan for one struct field.
 type encField struct {
 	name      string
@@ -83,10 +91,14 @@ func (e *Encoder) SetAliasTag(tag string) {
 // configuration lock; the generation re-checks around the cache store keep a
 // build racing a reconfiguration from inserting a stale plan.
 func (e *Encoder) structInfo(t reflect.Type) []encField {
-	if cached, ok := e.encCache.Load(t); ok {
-		return cached.([]encField)
-	}
 	gen := e.encGen.Load()
+	if cached, ok := e.encCache.Load(t); ok {
+		// Ignore plans built under an older configuration; fall through and
+		// rebuild (the fresh plan overwrites the stale entry).
+		if p := cached.(*encPlan); p.gen == gen {
+			return p.fields
+		}
+	}
 	e.cache.l.RLock()
 	tag := e.cache.tag
 	fields := make([]encField, 0, t.NumField())
@@ -116,18 +128,12 @@ func (e *Encoder) structInfo(t reflect.Type) []encField {
 		fields = append(fields, f)
 	}
 	e.cache.l.RUnlock()
-	// Don't cache a plan whose inputs (tag, registered encoders) may have
-	// changed while it was being built; the next call rebuilds it fresh.
-	// The re-check after Store closes the race where a reconfiguration
-	// clears the cache between the first check and the Store: if the
-	// generation moved, our entry may have landed after the clear, so drop
-	// it (possibly discarding a concurrent fresh build, which just rebuilds
-	// on the next call).
+	// Don't cache a plan whose inputs (tag, registered encoders) changed
+	// while it was being built; the next call rebuilds it fresh. Even if a
+	// stale plan slips in after the clear, its generation tag keeps it from
+	// ever being served.
 	if e.encGen.Load() == gen {
-		e.encCache.Store(t, fields)
-		if e.encGen.Load() != gen {
-			e.encCache.Delete(t)
-		}
+		e.encCache.Store(t, &encPlan{fields: fields, gen: gen})
 	}
 	return fields
 }

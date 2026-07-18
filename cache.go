@@ -6,6 +6,7 @@ package schema
 
 import (
 	"errors"
+	"maps"
 	"reflect"
 	"strings"
 	"sync"
@@ -26,29 +27,43 @@ var (
 // newCache returns a new cache.
 func newCache() *cache {
 	c := cache{
-		regconv: make(map[reflect.Type]Converter),
-		tag:     "schema",
+		tag: "schema",
 	}
 	return &c
 }
 
 // cache caches meta-data about a struct.
 type cache struct {
-	l       sync.RWMutex // serializes configuration writes (tag, regconv)
-	m       sync.Map     // map[reflect.Type]*structInfo
-	regconv map[reflect.Type]Converter
+	l sync.RWMutex // serializes configuration writes (tag, regconv)
+	m sync.Map     // map[reflect.Type]cacheEntry
+	// regconv holds the registered converters as an immutable map published
+	// atomically: registerConverter replaces the whole map (copy-on-write
+	// under l), so readers never touch a map that is being written.
+	regconv atomic.Pointer[map[reflect.Type]Converter]
 	tag     string
 	// gen is bumped (under l) before m is cleared on configuration changes;
-	// get snapshots it before building a structInfo and refuses to cache the
-	// result if it changed, so a build racing a reconfiguration cannot
-	// re-insert stale metadata after the clear.
+	// cached entries are tagged with the generation they were built under
+	// and ignored on mismatch, so a build racing a reconfiguration can
+	// neither insert nor serve stale metadata.
 	gen atomic.Uint64
+}
+
+// cacheEntry tags a structInfo with the configuration generation it was
+// built under.
+type cacheEntry struct {
+	info *structInfo
+	gen  uint64
 }
 
 // registerConverter registers a converter function for a custom type.
 func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
 	c.l.Lock()
-	c.regconv[reflect.TypeOf(value)] = converterFunc
+	next := make(map[reflect.Type]Converter)
+	if prev := c.regconv.Load(); prev != nil {
+		maps.Copy(next, *prev)
+	}
+	next[reflect.TypeOf(value)] = converterFunc
+	c.regconv.Store(&next)
 	c.reset()
 	c.l.Unlock()
 }
@@ -196,25 +211,23 @@ func nextPathSegment(path string, start int) (int, string, error) {
 
 // get returns a cached structInfo, creating it if necessary.
 func (c *cache) get(t reflect.Type) *structInfo {
-	if info, ok := c.m.Load(t); ok {
-		return info.(*structInfo)
-	}
 	gen := c.gen.Load()
+	if v, ok := c.m.Load(t); ok {
+		// Ignore entries built under an older configuration: a build racing
+		// a reconfiguration may store one after the clear, and it must
+		// never be served once the reconfiguration returned.
+		if e := v.(cacheEntry); e.gen == gen {
+			return e.info
+		}
+	}
 	info := c.create(t, "")
-	if c.gen.Load() != gen {
-		// Configuration changed while building; serve the result once but
-		// don't cache it — the next call rebuilds with the new config.
-		return info
+	if c.gen.Load() == gen {
+		c.m.Store(t, cacheEntry{info: info, gen: gen})
 	}
-	cached, _ := c.m.LoadOrStore(t, info)
-	if c.gen.Load() != gen {
-		// A reconfiguration cleared the cache between the check and the
-		// store; drop the entry so stale metadata cannot stick (a discarded
-		// concurrent fresh build just rebuilds on the next call).
-		c.m.Delete(t)
-		return info
-	}
-	return cached.(*structInfo)
+	// If the configuration changed while building, serve the result once
+	// without caching it (or with a stale tag that hit-validation ignores);
+	// the next call rebuilds fresh.
+	return info
 }
 
 // reset clears cached metadata and must be called with c.l held. Parsed
@@ -240,7 +253,9 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	var anonymousIdx [][]int
 	for i := 0; i < t.NumField(); i++ {
 		structField := t.Field(i)
-		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr {
+		// Only exported anonymous pointers can be allocated; unexported ones
+		// are not settable and Set would panic.
+		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr && structField.IsExported() {
 			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
 		}
 		if f := c.createField(structField, parentAlias); f != nil {
@@ -385,10 +400,11 @@ func (c *cache) createField(field reflect.StructField, parentAlias string) *fiel
 
 // converter returns the converter for a type.
 func (c *cache) converter(t reflect.Type) Converter {
-	if len(c.regconv) == 0 {
+	reg := c.regconv.Load()
+	if reg == nil {
 		return nil
 	}
-	return c.regconv[t]
+	return (*reg)[t]
 }
 
 // ----------------------------------------------------------------------------

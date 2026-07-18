@@ -842,3 +842,35 @@ func TestEncoderNestedErrors(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// An encoding plan stored by a build that raced a reconfiguration carries
+// the old generation and must never be served after the reconfiguration
+// returned, even if it lands in the cache.
+func TestEncoderStaleCacheEntryIgnored(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	e := NewEncoder()
+	typ := reflect.TypeOf(T1{})
+
+	dst := map[string][]string{}
+	if err := e.Encode(T1{A: "x"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	stalePlan, ok := e.encCache.Load(typ)
+	if !ok {
+		t.Fatal("expected cached plan")
+	}
+
+	e.SetAliasTag("url")
+	// Simulate a delayed store from a build that raced the reconfiguration.
+	e.encCache.Store(typ, stalePlan)
+
+	dst = map[string][]string{}
+	if err := e.Encode(T1{A: "y"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dst["urlname"]; !ok {
+		t.Fatalf("stale plan served: %v", dst)
+	}
+}

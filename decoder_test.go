@@ -4402,3 +4402,112 @@ func TestConcurrentSamePathDecode(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// Unexported embedded pointers are not settable; decoding must skip them
+// instead of panicking, and sibling fields must still decode.
+func TestUnexportedEmbeddedPointerSkipped(t *testing.T) {
+	type inner struct {
+		X string `schema:"x"`
+	}
+	type outer struct {
+		*inner
+		A string `schema:"a"`
+	}
+	var o outer
+	if err := NewDecoder().Decode(&o, map[string][]string{"a": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o.A != "ok" {
+		t.Errorf("sibling field not decoded: %+v", o)
+	}
+	if o.inner != nil {
+		t.Errorf("unsettable embedded pointer unexpectedly allocated")
+	}
+
+	// Keys targeting fields promoted through the unsettable pointer are
+	// skipped silently once the path parses (the field exists in metadata).
+	var o2 outer
+	dec := NewDecoder()
+	dec.IgnoreUnknownKeys(true)
+	if err := dec.Decode(&o2, map[string][]string{"x": {"v"}, "a": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o2.A != "ok" {
+		t.Errorf("sibling field not decoded: %+v", o2)
+	}
+
+	// Defaults walks must also skip unreachable chains.
+	type outerDefaults struct {
+		*inner
+		B string `schema:"b,default:zz"`
+	}
+	var o3 outerDefaults
+	if err := NewDecoder().Decode(&o3, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if o3.B != "zz" {
+		t.Errorf("default not applied: %+v", o3)
+	}
+}
+
+// A structInfo stored by a build that raced a reconfiguration carries the
+// old generation and must never be served after the reconfiguration
+// returned, even if it lands in the cache.
+func TestDecoderStaleCacheEntryIgnored(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(T1{})
+
+	var dst T1
+	if err := d.Decode(&dst, map[string][]string{"schemaname": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	staleEntry, ok := d.cache.m.Load(typ)
+	if !ok {
+		t.Fatal("expected cached structInfo")
+	}
+
+	d.SetAliasTag("url")
+	// Simulate a delayed store from a build that raced the reconfiguration.
+	d.cache.m.Store(typ, staleEntry)
+
+	dst = T1{}
+	if err := d.Decode(&dst, map[string][]string{"urlname": {"y"}}); err != nil {
+		t.Fatalf("stale entry served: %v", err)
+	}
+	if dst.A != "y" {
+		t.Fatalf("stale entry served: %+v", dst)
+	}
+}
+
+// Registering converters concurrently with decoding must be safe and take
+// effect once registration returns.
+func TestDecoderRegisterConverterDuringDecode(t *testing.T) {
+	type CV string
+	type S struct {
+		C CV     `schema:"c"`
+		A string `schema:"a"`
+	}
+	conv := func(v string) reflect.Value { return reflect.ValueOf(CV("conv:" + v)) }
+	for i := 0; i < 200; i++ {
+		d := NewDecoder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var s S
+			_ = d.Decode(&s, map[string][]string{"a": {"x"}})
+		}()
+		d.RegisterConverter(CV(""), conv)
+		<-done
+
+		var s S
+		if err := d.Decode(&s, map[string][]string{"c": {"v"}, "a": {"x"}}); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if s.C != "conv:v" {
+			t.Fatalf("iteration %d: converter not effective: %+v", i, s)
+		}
+	}
+}

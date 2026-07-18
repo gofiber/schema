@@ -179,6 +179,10 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 
 	for _, f := range struc.fields {
 		vCurrent := walkIndexChain(v, f.index)
+		if !vCurrent.IsValid() {
+			// Unreachable behind an unsettable nil embedded pointer.
+			continue
+		}
 
 		if vCurrent.Type().Kind() == reflect.Struct && f.defaultValue == "" {
 			errs = mergeErrors(errs, d.setDefaults(vCurrent.Type(), vCurrent, src, prefix+f.canonicalAlias+"."))
@@ -403,11 +407,17 @@ func isMultipartField(typ reflect.Type) bool {
 
 // walkIndexChain walks v along a struct field index chain. Chains longer
 // than one element traverse embedded structs; intermediate nil pointers are
-// allocated so promoted fields stay reachable.
+// allocated so promoted fields stay reachable. It returns the zero Value
+// when the chain is blocked by a nil pointer that cannot be set (an
+// unexported embedded pointer), which callers treat as an unreachable
+// field.
 func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 	for j, fi := range chain {
 		if j > 0 && v.Kind() == reflect.Ptr {
 			if v.IsNil() {
+				if !v.CanSet() {
+					return reflect.Value{}
+				}
 				v.Set(reflect.New(v.Type().Elem()))
 			}
 			v = v.Elem()
@@ -421,6 +431,11 @@ func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
 	// Get the field walking the struct fields by index.
 	for _, hop := range parts[0].hops {
+		// A previous hop may have been blocked by an unsettable nil
+		// embedded pointer; the field is unreachable then.
+		if !v.IsValid() {
+			return nil
+		}
 		if v.Kind() == reflect.Ptr {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
