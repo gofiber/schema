@@ -4511,3 +4511,28 @@ func TestDecoderRegisterConverterDuringDecode(t *testing.T) {
 		}
 	}
 }
+
+// Decoding with a nil src map and multipart files used to panic before the
+// recovery handler was installed, crashing the caller.
+func TestDecodeNilSrcWithMultipartFiles(t *testing.T) {
+	type S struct {
+		F *multipart.FileHeader `schema:"f"`
+	}
+	var s S
+	files := map[string][]*multipart.FileHeader{"f": {{Filename: "x"}}}
+	if err := NewDecoder().Decode(&s, nil, files); err != nil {
+		t.Fatal(err)
+	}
+	if s.F == nil || s.F.Filename != "x" {
+		t.Errorf("file not decoded: %+v", s.F)
+	}
+
+	// Plain nil src still decodes to nothing without error.
+	type P struct {
+		A string `schema:"a"`
+	}
+	var p P
+	if err := NewDecoder().Decode(&p, nil); err != nil {
+		t.Fatal(err)
+	}
+}

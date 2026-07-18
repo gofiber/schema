@@ -921,3 +921,75 @@ func TestEncodeStructPointerClassification(t *testing.T) {
 		t.Errorf("nil pointer to non-struct: expected [null], got %v", got)
 	}
 }
+
+// Encoding into a nil destination map used to panic and crash the caller.
+func TestEncodeNilDstReturnsError(t *testing.T) {
+	type S struct {
+		A string `schema:"a"`
+	}
+	err := NewEncoder().Encode(S{A: "x"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "dst map must not be nil") {
+		t.Fatalf("expected nil-dst error, got %v", err)
+	}
+}
+
+// Non-nil pointers to unsupported element types used to invoke a nil inner
+// encoder and panic, crashing the caller; they must error instead, while
+// nil pointers keep encoding as "null".
+func TestEncodePointerToUnsupported(t *testing.T) {
+	type S struct {
+		M *map[string]string `schema:"m"`
+		L *[]int             `schema:"l"`
+		A string             `schema:"a"`
+	}
+
+	m := map[string]string{"k": "v"}
+	l := []int{1}
+	dst := map[string][]string{}
+	err := NewEncoder().Encode(S{M: &m, L: &l, A: "x"}, dst)
+	if err == nil || !strings.Contains(err.Error(), "encoder not found") {
+		t.Fatalf("expected encoder-not-found error, got %v", err)
+	}
+	if got := dst["a"]; len(got) != 1 || got[0] != "x" {
+		t.Errorf("supported sibling must still encode: %v", dst)
+	}
+
+	// Nil pointers to unsupported types keep the historical "null" output.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(S{A: "x"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := dst["m"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil *map: expected [null], got %v", dst["m"])
+	}
+	if got := dst["l"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil *slice: expected [null], got %v", dst["l"])
+	}
+
+	// omitempty suppresses the null.
+	type SO struct {
+		M *map[string]string `schema:"m,omitempty"`
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SO{}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dst["m"]; ok {
+		t.Errorf("omitempty nil pointer must be skipped: %v", dst)
+	}
+}
+
+// Panics from user-registered encoders (or reflection) must surface as
+// errors, mirroring Decode's recovery, instead of crashing the caller.
+func TestEncodeRecoversEncoderPanic(t *testing.T) {
+	type PT struct{ V int }
+	type S struct {
+		P PT `schema:"p"`
+	}
+	enc := NewEncoder()
+	enc.RegisterEncoder(PT{}, func(reflect.Value) string { panic("boom") })
+	err := enc.Encode(S{P: PT{V: 1}}, map[string][]string{})
+	if err == nil || !strings.Contains(err.Error(), "panic while encoding: boom") {
+		t.Fatalf("expected recovered panic error, got %v", err)
+	}
+}

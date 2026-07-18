@@ -17,6 +17,10 @@ type encoderFunc func(reflect.Value) string
 // check does not allocate on every call.
 var errNotStruct = errors.New("schema: interface must be a struct")
 
+// errNilDst is returned by Encode when the destination map is nil, which
+// would otherwise panic on the first map assignment.
+var errNilDst = errors.New("schema: dst map must not be nil")
+
 // Encoder encodes values from a struct into url.Values.
 type Encoder struct {
 	cache  *cache
@@ -51,6 +55,11 @@ type encField struct {
 	// encoder: non-nil values are encoded by recursing into the element.
 	recurseStructPtr bool
 	isStruct         bool
+	// nilAsNull marks pointer fields whose element has no immediate
+	// encoder (structs recursed via recurseStructPtr, or unsupported
+	// types): nil values encode as "null", matching the closure behavior
+	// pointer fields with encodable elements get.
+	nilAsNull bool
 }
 
 // NewEncoder returns a new Encoder with defaults.
@@ -61,7 +70,23 @@ func NewEncoder() *Encoder {
 // Encode encodes a struct into map[string][]string.
 //
 // Intended for use with url.Values.
-func (e *Encoder) Encode(src interface{}, dst map[string][]string) error {
+func (e *Encoder) Encode(src interface{}, dst map[string][]string) (err error) {
+	if dst == nil {
+		return errNilDst
+	}
+
+	// Catch panics from reflection or user-registered encoders and return
+	// them as an error instead of crashing the caller, mirroring Decode.
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else {
+				err = fmt.Errorf("schema: panic while encoding: %v", r)
+			}
+		}
+	}()
+
 	v := reflect.ValueOf(src)
 
 	return e.encode(v, dst)
@@ -119,10 +144,13 @@ func (e *Encoder) structInfo(t reflect.Type) []encField {
 			enc: typeEncoder(ft, e.regenc),
 		}
 		if f.enc == nil {
-			if ft.Kind() == reflect.Struct {
+			switch ft.Kind() {
+			case reflect.Struct:
 				f.isStruct = true
-			} else if ft.Kind() == reflect.Slice {
+			case reflect.Slice:
 				f.elemEnc = typeEncoder(ft.Elem(), e.regenc)
+			case reflect.Ptr:
+				f.nilAsNull = true
 			}
 		}
 		fields = append(fields, f)
@@ -199,6 +227,14 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			continue
 		}
 
+		if f.nilAsNull && fieldValue.IsNil() {
+			if f.omitEmpty {
+				continue
+			}
+			dst[f.name] = append(dst[f.name], "null")
+			continue
+		}
+
 		if f.isStruct {
 			if err := e.encode(fieldValue, dst); err != nil {
 				errs = setError(errs, fieldValue.Type().String(), err)
@@ -263,6 +299,12 @@ func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 		return encodeFloat64
 	case reflect.Ptr:
 		f := typeEncoder(t.Elem(), reg)
+		if f == nil {
+			// No encoder for the element: report unsupported instead of
+			// returning a closure that would panic on non-nil values.
+			// Nil handling for such fields is done by encField.nilAsNull.
+			return nil
+		}
 		return func(v reflect.Value) string {
 			if v.IsNil() {
 				return "null"

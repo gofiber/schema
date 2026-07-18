@@ -96,24 +96,14 @@ func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) 
 //
 // See the package documentation for a full explanation of the mechanics.
 func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) (err error) {
-	var multipartFiles map[string][]*multipart.FileHeader
-
-	if len(files) > 0 {
-		multipartFiles = files[0]
-	}
-
-	// Add files as empty string values to src in order to make path parsing work easily
-	for path := range multipartFiles {
-		src[path] = []string{""}
-	}
-
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
 		return errNotPointerToStruct
 	}
 
 	// Catch panics from the decoder and return them as an error.
-	// This is needed because the decoder calls reflect and reflect panics
+	// This is needed because the decoder calls reflect and reflect panics.
+	// Installed before any other work so nothing can crash the caller.
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(error); ok {
@@ -123,6 +113,20 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 			}
 		}
 	}()
+
+	var multipartFiles map[string][]*multipart.FileHeader
+
+	if len(files) > 0 {
+		multipartFiles = files[0]
+	}
+
+	// Add files as empty string values to src in order to make path parsing work easily
+	if multipartFiles != nil && src == nil {
+		src = make(map[string][]string, len(multipartFiles))
+	}
+	for path := range multipartFiles {
+		src[path] = []string{""}
+	}
 
 	v = v.Elem()
 	t := v.Type()
