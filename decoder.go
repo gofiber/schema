@@ -207,6 +207,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 					continue
 				}
 
+				elemT := f.typ.Elem()
 				defaultSlice := reflect.MakeSlice(f.typ, 0, strings.Count(f.defaultValue, "|")+1)
 				for val := range strings.SplitSeq(f.defaultValue, "|") {
 					// this check is to handle if the wrong value is provided
@@ -215,7 +216,10 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 						errs = appendError(errs, "default-"+f.name, fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name))
 						break
 					}
-					defaultSlice = reflect.Append(defaultSlice, convertedVal)
+					// Builtin converters return the underlying kind; convert to
+					// the (possibly named) element type before appending, else
+					// reflect.Append panics for e.g. []MyInt.
+					defaultSlice = reflect.Append(defaultSlice, convertedVal.Convert(elemT))
 				}
 				vCurrent.Set(defaultSlice)
 			} else if f.typ.Kind() == reflect.Ptr {
@@ -227,7 +231,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 
 				// this check is to handle if the wrong value is provided
 				if convertedVal := convertPointer(t1.Kind(), f.defaultValue); convertedVal.IsValid() {
-					vCurrent.Set(convertedVal)
+					// convertPointer returns *baseKind; convert to the field's
+					// (possibly named) pointer type before assigning.
+					vCurrent.Set(convertedVal.Convert(f.typ))
 				}
 			} else {
 				// this check is to handle if the wrong value is provided
@@ -235,7 +241,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				if conv == nil {
 					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
 				} else if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
-					vCurrent.Set(convertedVal)
+					// Builtin converters return the underlying kind; convert to
+					// the field's (possibly named) type before assigning.
+					vCurrent.Set(convertedVal.Convert(f.typ))
 				}
 			}
 		}

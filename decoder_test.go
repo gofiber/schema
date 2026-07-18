@@ -4593,3 +4593,50 @@ func TestRequiredInt16AndUintEmpty(t *testing.T) {
 		}
 	}
 }
+
+type (
+	dfRole  string
+	dfLevel int
+	dfFlag  bool
+	dfRatio float64
+)
+
+// Defaults on named types (scalar, pointer-to-named, and named-element slice)
+// must be applied, not panic. The builtin converters return the underlying
+// kind, which must be converted to the named target before Set/Append.
+func TestDefaultsOnNamedTypes(t *testing.T) {
+	type S struct {
+		R  dfRole    `schema:"r,default:admin"`
+		L  dfLevel   `schema:"l,default:7"`
+		F  dfFlag    `schema:"f,default:true"`
+		X  dfRatio   `schema:"x,default:1.5"`
+		P  *dfLevel  `schema:"p,default:9"`
+		SL []dfLevel `schema:"sl,default:1|2|3"`
+		SS []dfRole  `schema:"ss,default:a|b"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{}); err != nil {
+		t.Fatalf("decode with named-type defaults failed: %v", err)
+	}
+	if s.R != "admin" {
+		t.Errorf("R: got %q want admin", s.R)
+	}
+	if s.L != 7 {
+		t.Errorf("L: got %d want 7", s.L)
+	}
+	if s.F != true {
+		t.Errorf("F: got %v want true", s.F)
+	}
+	if s.X != 1.5 {
+		t.Errorf("X: got %v want 1.5", s.X)
+	}
+	if s.P == nil || *s.P != 9 {
+		t.Errorf("P: got %v want *9", s.P)
+	}
+	if len(s.SL) != 3 || s.SL[0] != 1 || s.SL[1] != 2 || s.SL[2] != 3 {
+		t.Errorf("SL: got %v want [1 2 3]", s.SL)
+	}
+	if len(s.SS) != 2 || s.SS[0] != "a" || s.SS[1] != "b" {
+		t.Errorf("SS: got %v want [a b]", s.SS)
+	}
+}
