@@ -4538,3 +4538,58 @@ func TestDecodeNilSrcWithMultipartFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+type namedIntElem int
+
+type myStr string
+
+// Slices of pointers to named builtin types must decode without panicking:
+// the converter yields the underlying kind, which must be Converted to the
+// named element type before being stored into the *Named pointer.
+func TestDecodeNamedPointerElemSlice(t *testing.T) {
+	type S struct {
+		P  []*namedIntElem `schema:"p"`
+		PS []*myStr        `schema:"ps"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{
+		"p":  {"1", "2,3"},
+		"ps": {"a", "b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.P) != 3 || *s.P[0] != 1 || *s.P[1] != 2 || *s.P[2] != 3 {
+		got := make([]namedIntElem, len(s.P))
+		for i, p := range s.P {
+			got[i] = *p
+		}
+		t.Errorf("[]*namedIntElem: expected [1 2 3], got %v", got)
+	}
+	if len(s.PS) != 2 || *s.PS[0] != "a" || *s.PS[1] != "b" {
+		t.Errorf("[]*myStr: unexpected result %v", s.PS)
+	}
+}
+
+// A required int16 or uint field submitted empty must be reported empty
+// (isEmpty must cover every builtin kind the decoder accepts).
+func TestRequiredInt16AndUintEmpty(t *testing.T) {
+	type S struct {
+		A int16  `schema:"a,required"`
+		B uint   `schema:"b,required"`
+		C string `schema:"c,required"`
+	}
+	err := NewDecoder().Decode(&S{}, map[string][]string{
+		"a": {""},
+		"b": {""},
+		"c": {""},
+	})
+	me, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("expected MultiError, got %T %v", err, err)
+	}
+	for _, key := range []string{"a", "b", "c"} {
+		if _, ok := me[key].(EmptyFieldError); !ok {
+			t.Errorf("required field %q empty value not reported: %v", key, me[key])
+		}
+	}
+}

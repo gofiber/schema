@@ -248,6 +248,10 @@ func (c *cache) aliasTag() string {
 
 // create creates a structInfo with meta-data about a struct.
 func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
+	// Snapshot the alias tag once so every field of this type is analyzed
+	// under a consistent configuration and we don't churn the config lock
+	// per field.
+	tag := c.aliasTag()
 	info := &structInfo{}
 	var anonymousInfos []*structInfo
 	var anonymousIdx [][]int
@@ -258,7 +262,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr && structField.IsExported() {
 			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
 		}
-		if f := c.createField(structField, parentAlias); f != nil {
+		if f := c.createField(structField, parentAlias, tag); f != nil {
 			f.index = structField.Index
 			info.fields = append(info.fields, f)
 			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous {
@@ -289,24 +293,24 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	info.requiredFields = c.buildRequiredFields(info)
-	hasDefaults, hasAnonPtr := c.scanDefaultsTree(t, map[reflect.Type]bool{})
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
 	// so it can only be skipped when neither defaults nor such pointers
 	// exist anywhere in the tree.
-	info.needsDefaultsWalk = hasDefaults || hasAnonPtr
+	info.needsDefaultsWalk = c.needsDefaultsWalk(t, tag, map[reflect.Type]bool{})
 	return info
 }
 
-// scanDefaultsTree reports whether t or any struct type reachable through
-// its (possibly pointer-wrapped) fields declares a default tag option, and
-// whether any reachable struct has anonymous pointer fields. visited guards
-// against recursive types.
-func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) (hasDefaults, hasAnonPtr bool) {
+// needsDefaultsWalk reports whether the setDefaults walk can have any effect
+// on the struct tree rooted at t: it declares a default tag option, or has an
+// (exported) anonymous pointer field the walk allocates, anywhere in the
+// tree. visited guards against recursive types. tag is the alias tag
+// snapshot for this build, so no per-field config lock is taken.
+func (c *cache) needsDefaultsWalk(t reflect.Type, tag string, visited map[reflect.Type]bool) bool {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct || visited[t] {
-		return false, false
+		return false
 	}
 	visited[t] = true
 	for i := 0; i < t.NumField(); i++ {
@@ -314,28 +318,26 @@ func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) 
 		// Mirror the anonymousPtrFields filter: only exported anonymous
 		// pointers are ever allocated, so only they justify the walk.
 		if field.Anonymous && field.Type.Kind() == reflect.Ptr && field.IsExported() {
-			hasAnonPtr = true
+			return true
 		}
-		alias, options := fieldAlias(field, c.aliasTag())
+		alias, options := fieldAlias(field, tag)
 		if alias == "-" {
 			continue
 		}
 		if options.getDefaultOptionValue() != "" {
-			hasDefaults = true
+			return true
 		}
-		d, a := c.scanDefaultsTree(field.Type, visited)
-		hasDefaults = hasDefaults || d
-		hasAnonPtr = hasAnonPtr || a
-		if hasDefaults && hasAnonPtr {
-			return true, true
+		if c.needsDefaultsWalk(field.Type, tag, visited) {
+			return true
 		}
 	}
-	return hasDefaults, hasAnonPtr
+	return false
 }
 
-// createField creates a fieldInfo for the given field.
-func (c *cache) createField(field reflect.StructField, parentAlias string) *fieldInfo {
-	alias, options := fieldAlias(field, c.aliasTag())
+// createField creates a fieldInfo for the given field. tag is the alias tag
+// snapshot for the enclosing type's build.
+func (c *cache) createField(field reflect.StructField, parentAlias, tag string) *fieldInfo {
+	alias, options := fieldAlias(field, tag)
 	if alias == "-" {
 		// Ignore this field.
 		return nil

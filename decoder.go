@@ -331,7 +331,10 @@ func isEmpty(t reflect.Type, value []string) bool {
 		return true
 	}
 	switch t.Kind() {
-	case boolType, float32Type, float64Type, intType, int8Type, int32Type, int64Type, stringType, uint8Type, uint16Type, uint32Type, uint64Type:
+	case boolType, float32Type, float64Type,
+		intType, int8Type, int16Type, int32Type, int64Type,
+		stringType,
+		uintType, uint8Type, uint16Type, uint32Type, uint64Type:
 		return len(value[0]) == 0
 	}
 	return false
@@ -569,15 +572,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 					items = append(items, u.Elem())
 				}
 			} else if item := conv(value); item.IsValid() {
-				if isPtrElem {
-					ptr := reflect.New(elemT)
-					ptr.Elem().Set(item)
-					item = ptr
-				}
-				if item.Type() != elemT && !isPtrElem {
-					item = item.Convert(elemT)
-				}
-				items = append(items, item)
+				items = appendConvertedItem(items, item, elemT, isPtrElem)
 			} else {
 				if strings.IndexByte(value, ',') != -1 {
 					for value := range strings.SplitSeq(value, ",") {
@@ -586,15 +581,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 								items = append(items, reflect.Zero(t.Elem()))
 							}
 						} else if item := conv(value); item.IsValid() {
-							if isPtrElem {
-								ptr := reflect.New(elemT)
-								ptr.Elem().Set(item)
-								item = ptr
-							}
-							if item.Type() != elemT && !isPtrElem {
-								item = item.Convert(elemT)
-							}
-							items = append(items, item)
+							items = appendConvertedItem(items, item, elemT, isPtrElem)
 						} else {
 							return ConversionError{
 								Key:   path,
@@ -678,6 +665,24 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		}
 	}
 	return nil
+}
+
+// appendConvertedItem converts a builtin/custom converter result to the slice
+// element type and appends it, wrapping it in a freshly allocated pointer for
+// pointer-element slices. The conversion must happen before the pointer wrap:
+// builtin converters return the underlying kind (e.g. int for a named
+// `type MyInt int`), which is not assignable to the named element type, so
+// Set-ing it into a *MyInt without converting first panics.
+func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflect.Type, isPtrElem bool) []reflect.Value {
+	if item.Type() != elemT {
+		item = item.Convert(elemT)
+	}
+	if isPtrElem {
+		ptr := reflect.New(elemT)
+		ptr.Elem().Set(item)
+		item = ptr
+	}
+	return append(items, item)
 }
 
 // decodeBuiltinSlice decodes values into the slice field v of type t whose
