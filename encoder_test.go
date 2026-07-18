@@ -874,3 +874,50 @@ func TestEncoderStaleCacheEntryIgnored(t *testing.T) {
 		t.Fatalf("stale plan served: %v", dst)
 	}
 }
+
+// Pins the four cases the removed isValidStructPointer helper used to
+// classify, now decided by the cached plan's recurseStructPtr flag plus a
+// runtime nil check: valid struct pointers recurse, nil struct pointers
+// encode as "null", struct values recurse, and pointers to non-structs
+// encode their element (or "null" when nil).
+func TestEncodeStructPointerClassification(t *testing.T) {
+	type Inner struct {
+		X string `schema:"x"`
+	}
+	type S struct {
+		SP  *Inner `schema:"sp"`  // valid struct pointer -> recursed
+		NP  *Inner `schema:"np"`  // nil struct pointer -> "null"
+		SV  Inner  `schema:"sv"`  // struct value -> recursed
+		IP  *int   `schema:"ip"`  // pointer to non-struct -> element
+		NIP *int   `schema:"nip"` // nil pointer to non-struct -> "null"
+	}
+
+	seven := 7
+	src := S{
+		SP: &Inner{X: "from-ptr"},
+		SV: Inner{X: "from-val"},
+		IP: &seven,
+	}
+	// SP and SV both recurse and write under the inner field's alias; SV is
+	// encoded after SP overwrote nothing (values append under "x").
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(src, dst); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := dst["x"]; len(got) != 2 || got[0] != "from-ptr" || got[1] != "from-val" {
+		t.Errorf("struct pointer/value recursion: expected [from-ptr from-val] under \"x\", got %v", got)
+	}
+	if _, ok := dst["sp"]; ok {
+		t.Error("valid struct pointer must recurse, not encode under its own alias")
+	}
+	if got := dst["np"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil struct pointer: expected [null], got %v", got)
+	}
+	if got := dst["ip"]; len(got) != 1 || got[0] != "7" {
+		t.Errorf("pointer to non-struct: expected [7], got %v", got)
+	}
+	if got := dst["nip"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil pointer to non-struct: expected [null], got %v", got)
+	}
+}
