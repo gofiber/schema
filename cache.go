@@ -311,7 +311,9 @@ func (c *cache) scanDefaultsTree(t reflect.Type, visited map[reflect.Type]bool) 
 	visited[t] = true
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		if field.Anonymous && field.Type.Kind() == reflect.Ptr {
+		// Mirror the anonymousPtrFields filter: only exported anonymous
+		// pointers are ever allocated, so only they justify the walk.
+		if field.Anonymous && field.Type.Kind() == reflect.Ptr && field.IsExported() {
 			hasAnonPtr = true
 		}
 		alias, options := fieldAlias(field, c.aliasTag())

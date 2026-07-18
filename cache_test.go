@@ -62,6 +62,41 @@ func BenchmarkNextPathSegment(b *testing.B) {
 	}
 }
 
+// The setDefaults fast path must not be defeated by anonymous pointers the
+// walk can never allocate (unexported ones).
+func TestNeedsDefaultsWalk(t *testing.T) {
+	type hidden struct {
+		X string `schema:"x"`
+	}
+	type onlyUnexported struct {
+		*hidden
+		A string `schema:"a"`
+	}
+
+	d := NewDecoder()
+	if d.cache.get(reflect.TypeOf(onlyUnexported{})).needsDefaultsWalk {
+		t.Error("unexported anonymous pointer must not force the defaults walk")
+	}
+
+	type Inner struct {
+		Y string `schema:"y"`
+	}
+	type withExported struct {
+		*Inner
+		A string `schema:"a"`
+	}
+	if !d.cache.get(reflect.TypeOf(withExported{})).needsDefaultsWalk {
+		t.Error("exported anonymous pointer must keep the defaults walk (it allocates)")
+	}
+
+	type withDefaults struct {
+		A string `schema:"a,default:z"`
+	}
+	if !d.cache.get(reflect.TypeOf(withDefaults{})).needsDefaultsWalk {
+		t.Error("default tags must keep the defaults walk")
+	}
+}
+
 func BenchmarkParsePathCacheMiss(b *testing.B) {
 	type Nested struct {
 		Value string `schema:"value"`
