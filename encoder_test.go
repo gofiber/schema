@@ -993,3 +993,59 @@ func TestEncodeRecoversEncoderPanic(t *testing.T) {
 		t.Fatalf("expected recovered panic error, got %v", err)
 	}
 }
+
+// An empty slice whose element type has no encoder (e.g. []*Struct) must be
+// skipped under omitempty and emitted empty otherwise, not spuriously error;
+// only a non-empty such slice errors. Non-slice unencodable fields still error.
+func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
+	type Inner struct {
+		A string `schema:"a"`
+	}
+
+	// omitempty + nil slice -> skipped, no error.
+	type SOmit struct {
+		Children []*Inner `schema:"children,omitempty"`
+		Name     string   `schema:"name"`
+	}
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(SOmit{Name: "bob"}, dst); err != nil {
+		t.Fatalf("omitempty empty slice should not error: %v", err)
+	}
+	if _, ok := dst["children"]; ok {
+		t.Errorf("omitempty empty slice should be skipped, got %v", dst["children"])
+	}
+	if got := dst["name"]; len(got) != 1 || got[0] != "bob" {
+		t.Errorf("sibling not encoded: %v", dst)
+	}
+
+	// no omitempty + nil slice -> emitted empty, no error.
+	type SPlain struct {
+		Children []*Inner `schema:"children"`
+		Name     string   `schema:"name"`
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Name: "bob"}, dst); err != nil {
+		t.Fatalf("empty slice should not error: %v", err)
+	}
+	if got, ok := dst["children"]; !ok || len(got) != 0 {
+		t.Errorf("empty slice should emit empty, got %v (present=%v)", got, ok)
+	}
+
+	// non-empty slice of unencodable element -> error.
+	dst = map[string][]string{}
+	err := NewEncoder().Encode(SPlain{Children: []*Inner{{A: "x"}}, Name: "bob"}, dst)
+	if err == nil || !strings.Contains(err.Error(), "encoder not found") {
+		t.Errorf("non-empty unencodable-elem slice should error, got %v", err)
+	}
+
+	// non-slice unencodable field (map) still errors regardless of emptiness.
+	type SMap struct {
+		M map[string]string `schema:"m"`
+	}
+	if err := NewEncoder().Encode(SMap{}, map[string][]string{}); err == nil {
+		t.Errorf("empty map field should still error 'encoder not found'")
+	}
+	if err := NewEncoder().Encode(SMap{M: map[string]string{"k": "v"}}, map[string][]string{}); err == nil {
+		t.Errorf("non-empty map field should error 'encoder not found'")
+	}
+}

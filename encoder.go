@@ -242,14 +242,25 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			continue
 		}
 
-		if f.elemEnc == nil {
+		// A non-slice field with no encoder (map, chan, array, or a non-nil
+		// pointer to an unencodable type) cannot be encoded.
+		if fieldValue.Kind() != reflect.Slice {
 			errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
 			continue
 		}
 
-		// Encode a slice.
+		// Encode a slice. An empty slice has nothing to encode, so it is
+		// skipped under omitempty (and otherwise emitted empty) even when its
+		// element type has no encoder — only a non-empty slice needs elemEnc.
+		// The element-encoder check must come after the empty check so an
+		// empty omitempty slice of an unencodable element type (e.g.
+		// []*Struct) is skipped rather than spuriously erroring.
 		n := fieldValue.Len()
 		if n == 0 && f.omitEmpty {
+			continue
+		}
+		if n > 0 && f.elemEnc == nil {
+			errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
 			continue
 		}
 
