@@ -43,13 +43,15 @@ type cache struct {
 	tag     string
 	// gen is bumped (under l) before m is cleared on configuration changes;
 	// cached entries are tagged with the generation they were built under
-	// and ignored on mismatch, so a build racing a reconfiguration can
-	// neither insert nor serve stale metadata.
+	// and ignored on mismatch, so any call starting after a reconfiguration
+	// returns observes the new configuration even if a racing build stored
+	// a stale entry after the clear.
 	gen atomic.Uint64
 }
 
 // cacheEntry tags a structInfo with the configuration generation it was
-// built under.
+// built under; entries are stored by pointer in c.m (matching the encoder's
+// encPlan pattern).
 type cacheEntry struct {
 	info *structInfo
 	gen  uint64
@@ -214,15 +216,18 @@ func (c *cache) get(t reflect.Type) *structInfo {
 	gen := c.gen.Load()
 	if v, ok := c.m.Load(t); ok {
 		// Ignore entries built under an older configuration: a build racing
-		// a reconfiguration may store one after the clear, and it must
-		// never be served once the reconfiguration returned.
-		if e := v.(cacheEntry); e.gen == gen {
+		// a reconfiguration may store one after the clear. Hit-validation
+		// guarantees that any call starting after the reconfiguration
+		// returned observes the new configuration (a call already in flight
+		// during the reconfiguration may still briefly use old metadata,
+		// which is inherent to concurrent reconfiguration).
+		if e := v.(*cacheEntry); e.gen == gen {
 			return e.info
 		}
 	}
 	info := c.create(t, "")
 	if c.gen.Load() == gen {
-		c.m.Store(t, cacheEntry{info: info, gen: gen})
+		c.m.Store(t, &cacheEntry{info: info, gen: gen})
 	}
 	// If the configuration changed while building, serve the result once
 	// without caching it (or with a stale tag that hit-validation ignores);

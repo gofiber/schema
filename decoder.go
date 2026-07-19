@@ -8,6 +8,7 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
+	"maps"
 	"mime/multipart"
 	"reflect"
 	"strings"
@@ -120,12 +121,17 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 		multipartFiles = files[0]
 	}
 
-	// Add files as empty string values to src in order to make path parsing work easily
-	if multipartFiles != nil && src == nil {
-		src = make(map[string][]string, len(multipartFiles))
-	}
-	for path := range multipartFiles {
-		src[path] = []string{""}
+	// Add files as empty string values to the decode view so path parsing
+	// works uniformly. Work on a copy: the caller's src map must not be
+	// mutated (and a caller-provided value under a file's key must not be
+	// overwritten in it).
+	if len(multipartFiles) > 0 {
+		merged := make(map[string][]string, len(src)+len(multipartFiles))
+		maps.Copy(merged, src)
+		for path := range multipartFiles {
+			merged[path] = []string{""}
+		}
+		src = merged
 	}
 
 	v = v.Elem()

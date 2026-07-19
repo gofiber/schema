@@ -4649,3 +4649,50 @@ func TestDefaultsOnNamedTypes(t *testing.T) {
 		t.Errorf("SS: got %v want [a b]", s.SS)
 	}
 }
+
+// Decode must not mutate the caller's src map when multipart files are
+// passed: file keys are merged into an internal copy, and a caller-provided
+// value under the same key stays intact in the caller's map.
+func TestDecodeDoesNotMutateCallerSrc(t *testing.T) {
+	type S struct {
+		F *multipart.FileHeader `schema:"f"`
+		A string                `schema:"a"`
+	}
+	src := map[string][]string{"a": {"x"}, "f": {"caller-value"}}
+	files := map[string][]*multipart.FileHeader{"f": {{Filename: "fn"}}}
+
+	var s S
+	if err := NewDecoder().Decode(&s, src, files); err != nil {
+		t.Fatal(err)
+	}
+	if s.F == nil || s.F.Filename != "fn" {
+		t.Errorf("file not decoded: %+v", s.F)
+	}
+	if s.A != "x" {
+		t.Errorf("sibling not decoded: %+v", s)
+	}
+	if len(src) != 2 {
+		t.Errorf("caller src gained/lost keys: %v", src)
+	}
+	if got := src["f"]; len(got) != 1 || got[0] != "caller-value" {
+		t.Errorf("caller src value overwritten: %v", src["f"])
+	}
+
+	// File-only keys must not appear in the caller's map either.
+	src2 := map[string][]string{"a": {"y"}}
+	files2 := map[string][]*multipart.FileHeader{"g": {{Filename: "gn"}}}
+	type S2 struct {
+		G *multipart.FileHeader `schema:"g"`
+		A string                `schema:"a"`
+	}
+	var s2 S2
+	if err := NewDecoder().Decode(&s2, src2, files2); err != nil {
+		t.Fatal(err)
+	}
+	if s2.G == nil || s2.G.Filename != "gn" {
+		t.Errorf("file not decoded: %+v", s2.G)
+	}
+	if _, ok := src2["g"]; ok || len(src2) != 1 {
+		t.Errorf("caller src mutated with file key: %v", src2)
+	}
+}

@@ -37,8 +37,9 @@ type Encoder struct {
 }
 
 // encPlan tags a per-type encoding plan with the configuration generation it
-// was built under, so plans stored by builds that raced a reconfiguration
-// are never served afterwards.
+// was built under: hit-validation ignores plans from older generations, so
+// any Encode starting after a reconfiguration returns observes the new
+// configuration even if a racing build stored a stale plan after the clear.
 type encPlan struct {
 	fields []encField
 	gen    uint64
