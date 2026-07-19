@@ -1018,6 +1018,16 @@ func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
 		t.Errorf("sibling not encoded: %v", dst)
 	}
 
+	// omitempty + non-nil empty slice -> also skipped (the check is Len-based,
+	// not a nil check).
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SOmit{Children: make([]*Inner, 0), Name: "bob"}, dst); err != nil {
+		t.Fatalf("omitempty non-nil empty slice should not error: %v", err)
+	}
+	if _, ok := dst["children"]; ok {
+		t.Errorf("omitempty non-nil empty slice should be skipped, got %v", dst["children"])
+	}
+
 	// no omitempty + nil slice -> emitted empty, no error.
 	type SPlain struct {
 		Children []*Inner `schema:"children"`
@@ -1029,6 +1039,15 @@ func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
 	}
 	if got, ok := dst["children"]; !ok || len(got) != 0 {
 		t.Errorf("empty slice should emit empty, got %v (present=%v)", got, ok)
+	}
+
+	// no omitempty + non-nil empty slice -> also emitted empty, no error.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Children: make([]*Inner, 0), Name: "bob"}, dst); err != nil {
+		t.Fatalf("non-nil empty slice should not error: %v", err)
+	}
+	if got, ok := dst["children"]; !ok || len(got) != 0 {
+		t.Errorf("non-nil empty slice should emit empty, got %v (present=%v)", got, ok)
 	}
 
 	// non-empty slice of unencodable element -> error.
