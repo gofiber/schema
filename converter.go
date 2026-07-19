@@ -89,9 +89,30 @@ func convertFloat64(value string) reflect.Value {
 	return invalidValue
 }
 
+// parseNativeInt parses value as a native int via utils.ParseInt's fast
+// (SWAR) path and rejects values that don't fit a native int. The fit check
+// is a no-op on 64-bit (int == int64) and rejects out-of-range values on
+// 32-bit, where a plain int() conversion would silently truncate.
+func parseNativeInt(value string) (int64, bool) {
+	v, err := utils.ParseInt(value)
+	if err != nil || int64(int(v)) != v {
+		return 0, false
+	}
+	return v, true
+}
+
+// parseNativeUint is parseNativeInt for unsigned native uints.
+func parseNativeUint(value string) (uint64, bool) {
+	v, err := utils.ParseUint(value)
+	if err != nil || uint64(uint(v)) != v {
+		return 0, false
+	}
+	return v, true
+}
+
 func convertInt(value string) reflect.Value {
-	if v, err := utils.ParseNativeInt(value); err == nil {
-		return reflect.ValueOf(v)
+	if v, ok := parseNativeInt(value); ok {
+		return reflect.ValueOf(int(v))
 	}
 	return invalidValue
 }
@@ -129,8 +150,8 @@ func convertString(value string) reflect.Value {
 }
 
 func convertUint(value string) reflect.Value {
-	if v, err := utils.ParseNativeUint(value); err == nil {
-		return reflect.ValueOf(v)
+	if v, ok := parseNativeUint(value); ok {
+		return reflect.ValueOf(uint(v))
 	}
 	return invalidValue
 }
@@ -182,11 +203,11 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 	case stringType:
 		v.SetString(val)
 	case intType:
-		n, err := utils.ParseNativeInt(val)
-		if err != nil {
+		n, ok := parseNativeInt(val)
+		if !ok {
 			return true, false
 		}
-		v.SetInt(int64(n))
+		v.SetInt(n)
 	case int8Type:
 		n, err := utils.ParseInt8(val)
 		if err != nil {
@@ -212,11 +233,11 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 		}
 		v.SetInt(n)
 	case uintType:
-		n, err := utils.ParseNativeUint(val)
-		if err != nil {
+		n, ok := parseNativeUint(val)
+		if !ok {
 			return true, false
 		}
-		v.SetUint(uint64(n))
+		v.SetUint(n)
 	case uint8Type:
 		n, err := utils.ParseUint8(val)
 		if err != nil {
