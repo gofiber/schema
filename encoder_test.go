@@ -1038,6 +1038,24 @@ func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
 		t.Errorf("non-empty unencodable-elem slice should error, got %v", err)
 	}
 
+	// []*Struct with nil elements encodes each nil as "null" (as historically),
+	// matching a scalar nil *Struct; a non-nil element is an error.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Children: []*Inner{nil, nil}, Name: "bob"}, dst); err != nil {
+		t.Fatalf("[]*Struct nil elements should encode as null, got %v", err)
+	}
+	if got := dst["children"]; len(got) != 2 || got[0] != "null" || got[1] != "null" {
+		t.Errorf("nil elements: expected [null null], got %v", got)
+	}
+
+	// A value-struct slice ([]Struct) is unencodable and errors even when empty.
+	type SVal struct {
+		Items []Inner `schema:"items"`
+	}
+	if err := NewEncoder().Encode(SVal{}, map[string][]string{}); err == nil {
+		t.Errorf("empty []Struct (value) should error, matching historical behavior")
+	}
+
 	// non-slice unencodable field (map) still errors regardless of emptiness.
 	type SMap struct {
 		M map[string]string `schema:"m"`

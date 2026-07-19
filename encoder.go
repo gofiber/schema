@@ -60,6 +60,10 @@ type encField struct {
 	// types): nil values encode as "null", matching the closure behavior
 	// pointer fields with encodable elements get.
 	nilAsNull bool
+	// elemPtrNil marks slice fields whose element is a pointer type with no
+	// encoder (e.g. []*Struct): nil elements encode as "null" (as they did
+	// historically), while a non-nil such element is an error.
+	elemPtrNil bool
 }
 
 // NewEncoder returns a new Encoder with defaults.
@@ -149,6 +153,9 @@ func (e *Encoder) structInfo(t reflect.Type) []encField {
 				f.isStruct = true
 			case reflect.Slice:
 				f.elemEnc = typeEncoder(ft.Elem(), e.regenc)
+				if f.elemEnc == nil && ft.Elem().Kind() == reflect.Ptr {
+					f.elemPtrNil = true
+				}
 			case reflect.Ptr:
 				f.nilAsNull = true
 			}
@@ -243,30 +250,42 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 		}
 
 		// A non-slice field with no encoder (map, chan, array, or a non-nil
-		// pointer to an unencodable type) cannot be encoded.
-		if fieldValue.Kind() != reflect.Slice {
+		// pointer to an unencodable type), or a slice whose element type is
+		// itself unencodable and not a pointer (e.g. []Struct), cannot be
+		// encoded — historically this errored unconditionally.
+		if fieldValue.Kind() != reflect.Slice || (f.elemEnc == nil && !f.elemPtrNil) {
 			errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
 			continue
 		}
 
 		// Encode a slice. An empty slice has nothing to encode, so it is
-		// skipped under omitempty (and otherwise emitted empty) even when its
-		// element type has no encoder — only a non-empty slice needs elemEnc.
-		// The element-encoder check must come after the empty check so an
-		// empty omitempty slice of an unencodable element type (e.g.
-		// []*Struct) is skipped rather than spuriously erroring.
+		// skipped under omitempty (and otherwise emitted empty).
 		n := fieldValue.Len()
 		if n == 0 && f.omitEmpty {
 			continue
 		}
-		if n > 0 && f.elemEnc == nil {
-			errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
-			continue
-		}
 
 		values := make([]string, n)
-		for j := 0; j < n; j++ {
-			values[j] = f.elemEnc(fieldValue.Index(j))
+		if f.elemEnc == nil {
+			// Pointer elements with no encoder (elemPtrNil): nil encodes as
+			// "null" (as historically), a non-nil such element is an error.
+			bad := false
+			for j := 0; j < n; j++ {
+				if fieldValue.Index(j).IsNil() {
+					values[j] = "null"
+					continue
+				}
+				errs = setError(errs, fieldValue.Type().String(), fmt.Errorf("schema: encoder not found for %v", fieldValue))
+				bad = true
+				break
+			}
+			if bad {
+				continue
+			}
+		} else {
+			for j := 0; j < n; j++ {
+				values[j] = f.elemEnc(fieldValue.Index(j))
+			}
 		}
 		dst[f.name] = values
 	}
