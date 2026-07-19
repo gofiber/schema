@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"mime/multipart"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -2288,6 +2290,240 @@ func TestDoubleEmbedded(t *testing.T) {
 	}
 }
 
+type S26ee struct {
+	F string `schema:"f"`
+}
+
+type S26e struct {
+	*S26ee
+}
+
+type S26 struct {
+	*S26e
+	A string `schema:"a"`
+}
+
+// Fields promoted through two levels of embedded pointers must be reachable;
+// this used to panic with "indirection through nil pointer to embedded
+// struct" because only the first level was allocated.
+func TestDoubleEmbeddedPointer(t *testing.T) {
+	data := map[string][]string{
+		"f": {"raw a"},
+		"a": {"raw b"},
+	}
+
+	s := S26{}
+	decoder := NewDecoder()
+
+	if err := decoder.Decode(&s, data); err != nil {
+		t.Fatal("Error while decoding:", err)
+	}
+
+	if s.A != "raw b" {
+		t.Errorf("A: expected %q, got %q", "raw b", s.A)
+	}
+	if s.S26e == nil || s.S26ee == nil {
+		t.Fatalf("embedded pointers not allocated: %+v", s)
+	}
+	if s.F != "raw a" {
+		t.Errorf("F: expected %q, got %q", "raw a", s.F)
+	}
+}
+
+// Embedded anonymous pointers must be allocated by Decode even when the
+// struct declares no defaults and src contains no matching keys — callers
+// rely on promoted fields being reachable after Decode.
+func TestEmbeddedPointerAllocatedWithoutDefaults(t *testing.T) {
+	type Inner struct {
+		X string `schema:"x"`
+	}
+	type Outer struct {
+		*Inner
+		Y string `schema:"y"`
+	}
+
+	var o Outer
+	if err := NewDecoder().Decode(&o, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if o.Inner == nil {
+		t.Fatal("embedded pointer not allocated for empty src")
+	}
+
+	var o2 Outer
+	if err := NewDecoder().Decode(&o2, map[string][]string{"y": {"v"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o2.Inner == nil {
+		t.Fatal("embedded pointer not allocated when src only touches siblings")
+	}
+}
+
+type shadowTU struct{ S string }
+
+func (c *shadowTU) UnmarshalText(b []byte) error { c.S = string(b); return nil }
+
+type shadowEmb struct {
+	F shadowTU `schema:"f"`
+}
+
+type shadowOuter struct {
+	shadowEmb
+	F string `schema:"g"`
+}
+
+// A promoted field whose Go name is shadowed by an outer field with a
+// different alias must decode into the embedded field its alias identifies
+// (this used to panic via mismatched cached unmarshaler metadata).
+func TestShadowedPromotedFieldDecodes(t *testing.T) {
+	var s shadowOuter
+	if err := NewDecoder().Decode(&s, map[string][]string{"f": {"val"}, "g": {"out"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.shadowEmb.F.S != "val" {
+		t.Errorf("embedded field: expected %q, got %q", "val", s.shadowEmb.F.S)
+	}
+	if s.F != "out" {
+		t.Errorf("outer field: expected %q, got %q", "out", s.F)
+	}
+}
+
+// Two promoted fields sharing a Go name but carrying distinct aliases must
+// both be addressable by their aliases (the name-based walk used to skip or
+// reject them).
+func TestAmbiguousPromotedNamesDistinctAliases(t *testing.T) {
+	type ambA struct {
+		X string `schema:"xa"`
+	}
+	type ambB struct {
+		X string `schema:"xb"`
+	}
+	type elem struct {
+		ambA
+		ambB
+		N string `schema:"n"`
+	}
+	type s struct {
+		Items []elem `schema:"items"`
+	}
+
+	var dst s
+	err := NewDecoder().Decode(&dst, map[string][]string{
+		"items.0.n":  {"ok"},
+		"items.0.xa": {"va"},
+		"items.0.xb": {"vb"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := dst.Items[0]
+	if got.N != "ok" || got.ambA.X != "va" || got.ambB.X != "vb" {
+		t.Errorf("unexpected result: %+v", got)
+	}
+}
+
+// Growing a slice must never write into spare capacity of the caller's
+// original backing array — other slices may alias it.
+func TestSliceGrowthDetachesFromCallerArray(t *testing.T) {
+	type item struct {
+		P int `schema:"p"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	backing := make([]item, 8)
+	for i := range backing {
+		backing[i] = item{P: -1}
+	}
+	c := cart{Items: backing[:2]}
+	if err := NewDecoder().Decode(&c, map[string][]string{"items.4.p": {"7"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 5 || c.Items[4].P != 7 {
+		t.Fatalf("unexpected decode result: %+v", c.Items)
+	}
+	for i := 2; i < 8; i++ {
+		if backing[i].P != -1 {
+			t.Fatalf("caller backing array mutated at %d: %+v", i, backing[i])
+		}
+	}
+}
+
+// Reused destination slices must not leak stale element data into slots the
+// decoder grows into, and out-of-order indices must land correctly.
+func TestDecodeSliceIndexGrowth(t *testing.T) {
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	src := map[string][]string{}
+	for i := 0; i < 50; i++ {
+		src["items."+strconv.Itoa(i)+".price"] = []string{strconv.Itoa(i * 3)}
+	}
+	d := NewDecoder()
+
+	var c cart
+	if err := d.Decode(&c, src); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 50 {
+		t.Fatalf("len = %d, want 50", len(c.Items))
+	}
+	for i, it := range c.Items {
+		if it.Price != i*3 {
+			t.Fatalf("Items[%d].Price = %d, want %d", i, it.Price, i*3)
+		}
+	}
+
+	// A destination with spare capacity full of stale data must decode the
+	// same way: grown slots start from zero.
+	stale := cart{Items: make([]item, 0, 64)}
+	full := stale.Items[:64]
+	for i := range full {
+		full[i] = item{Name: "stale", Price: -1}
+	}
+	if err := d.Decode(&stale, src); err != nil {
+		t.Fatal(err)
+	}
+	if len(stale.Items) != 50 {
+		t.Fatalf("len = %d, want 50", len(stale.Items))
+	}
+	for i, it := range stale.Items {
+		if it.Name != "" || it.Price != i*3 {
+			t.Fatalf("Items[%d] = %+v, want zero Name and Price %d", i, it, i*3)
+		}
+	}
+}
+
+func BenchmarkSliceManyIndicesDecode(b *testing.B) {
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+	src := map[string][]string{}
+	for i := 0; i < 100; i++ {
+		idx := strconv.Itoa(i)
+		src["items."+idx+".name"] = []string{"x"}
+		src["items."+idx+".price"] = []string{idx}
+	}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var c cart
+		if err := d.Decode(&c, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func TestDefaultValuesAreSet(t *testing.T) {
 	type N struct {
 		S1 string    `schema:"s1,default:test1"`
@@ -3492,10 +3728,10 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 	decoder := NewDecoder()
 	v := reflect.ValueOf(s)
 	// v = v.Elem()
-	t := v.Type()
+	info := decoder.cache.get(v.Type())
 
 	for b.Loop() {
-		_ = decoder.checkRequired(t, data)
+		_ = decoder.checkRequired(info, data)
 	}
 }
 
@@ -3902,5 +4138,561 @@ func TestDecodeTextUnmarshalerSliceReplacesPreviousValues(t *testing.T) {
 	}
 	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
 		t.Fatalf("unexpected slice after second decode: %v", s.B)
+	}
+}
+
+// Malformed path keys must all surface as invalid-path/unknown-key errors,
+// covering the parser's error branches including the SWAR word-scan hitting
+// a separator at the segment start.
+func TestDecodeMalformedPathKeys(t *testing.T) {
+	type Inner struct {
+		V string `schema:"v"`
+	}
+	type S struct {
+		A     string  `schema:"a"`
+		Items []Inner `schema:"items"`
+	}
+	for _, key := range []string{
+		"",             // empty key
+		".a",           // leading separator
+		"a.",           // trailing separator
+		"a..b",         // empty middle segment
+		"..abcdefghij", // leading separator, long enough for the word scan
+		"items.",       // slice index missing
+		"items.x.v",    // slice index not a number
+		"items.0.",     // trailing separator after index
+		"a.b",          // path continues past a scalar field
+		"nope",         // unknown field
+	} {
+		var s S
+		err := NewDecoder().Decode(&s, map[string][]string{key: {"x"}})
+		if err == nil {
+			t.Errorf("key %q: expected error, got nil", key)
+			continue
+		}
+		me, ok := err.(MultiError)
+		if !ok {
+			t.Errorf("key %q: expected MultiError, got %T %v", key, err, err)
+			continue
+		}
+		if _, ok := me[key].(UnknownKeyError); !ok {
+			t.Errorf("key %q: expected UnknownKeyError, got %v", key, me[key])
+		}
+	}
+	// With unknown keys ignored, the same keys must decode to no error.
+	for _, key := range []string{"", ".a", "a..b", "items.x.v"} {
+		var s S
+		dec := NewDecoder()
+		dec.IgnoreUnknownKeys(true)
+		if err := dec.Decode(&s, map[string][]string{key: {"x"}}); err != nil {
+			t.Errorf("key %q with IgnoreUnknownKeys: unexpected error %v", key, err)
+		}
+	}
+}
+
+// Pointer-element slices exercise the pooled decode path: comma splitting,
+// empty values with and without ZeroEmpty, and conversion errors.
+func TestDecodePointerElemSlices(t *testing.T) {
+	type S struct {
+		P []*int `schema:"p"`
+	}
+
+	deref := func(ps []*int) []int {
+		out := make([]int, len(ps))
+		for i, p := range ps {
+			if p != nil {
+				out[i] = *p
+			} else {
+				out[i] = -999
+			}
+		}
+		return out
+	}
+
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{"p": {"1", "2,3", "4"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := deref(s.P); !reflect.DeepEqual(got, []int{1, 2, 3, 4}) {
+		t.Errorf("expected [1 2 3 4], got %v", got)
+	}
+
+	s = S{}
+	if err := NewDecoder().Decode(&s, map[string][]string{"p": {"", "5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := deref(s.P); !reflect.DeepEqual(got, []int{5}) {
+		t.Errorf("expected [5], got %v", got)
+	}
+
+	// ZeroEmpty with pointer elements produces nil elements for empty items
+	// (this used to panic with "int is not assignable to *int").
+	s = S{}
+	dec := NewDecoder()
+	dec.ZeroEmpty(true)
+	if err := dec.Decode(&s, map[string][]string{"p": {"", "6,,7"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.P) != 4 || s.P[0] != nil || *s.P[1] != 6 || s.P[2] != nil || *s.P[3] != 7 {
+		t.Errorf("unexpected zeroEmpty result: %v", deref(s.P))
+	}
+
+	for _, vals := range [][]string{{"x"}, {"1,x"}} {
+		s = S{}
+		err := NewDecoder().Decode(&s, map[string][]string{"p": vals})
+		me, ok := err.(MultiError)
+		if !ok {
+			t.Errorf("values %v: expected MultiError, got %v", vals, err)
+			continue
+		}
+		if _, ok := me["p"].(ConversionError); !ok {
+			t.Errorf("values %v: expected ConversionError, got %v", vals, me["p"])
+		}
+	}
+}
+
+// Custom converters on slice element types route through the pooled path,
+// including the comma-split fallback and its error cases.
+func TestDecodeCustomConverterElemSlice(t *testing.T) {
+	type CV string
+	type S struct {
+		C []CV `schema:"c"`
+	}
+	dec := NewDecoder()
+	dec.RegisterConverter(CV(""), func(v string) reflect.Value {
+		if v == "bad" || strings.Contains(v, ",") {
+			return reflect.Value{}
+		}
+		// Returns the underlying kind, exercising the Convert-to-element
+		// branch of the pooled slice path.
+		return reflect.ValueOf("cv:" + v)
+	})
+
+	var s S
+	if err := dec.Decode(&s, map[string][]string{"c": {"a", "b,c"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.C) != 3 || s.C[0] != "cv:a" || s.C[1] != "cv:b" || s.C[2] != "cv:c" {
+		t.Errorf("unexpected result: %+v", s.C)
+	}
+
+	s = S{}
+	err := dec.Decode(&s, map[string][]string{"c": {"bad"}})
+	if err == nil {
+		t.Error("expected error for whole bad value")
+	}
+
+	s = S{}
+	err = dec.Decode(&s, map[string][]string{"c": {"a,bad,c"}})
+	if err == nil {
+		t.Error("expected error for bad comma item")
+	}
+}
+
+func TestHandleMultipartFieldNonMultipart(t *testing.T) {
+	// Pointer fields that are not multipart shapes must fall through.
+	type S struct {
+		P *[]int
+	}
+	v := reflect.ValueOf(&S{}).Elem().Field(0)
+	files := []*multipart.FileHeader{{Filename: "f"}}
+	if handleMultipartField(v, files) {
+		t.Error("expected false for *[]int field")
+	}
+	if handleMultipartField(reflect.ValueOf(&S{}).Elem(), files) {
+		t.Error("expected false for struct field")
+	}
+}
+
+func TestIsMultipartFieldShapes(t *testing.T) {
+	cases := []struct {
+		typ  reflect.Type
+		want bool
+	}{
+		{reflect.TypeOf(&multipart.FileHeader{}), true},
+		{reflect.TypeOf([]*multipart.FileHeader{}), true},
+		{reflect.TypeOf(&[]*multipart.FileHeader{}), true},
+		{reflect.TypeOf(multipart.FileHeader{}), false},
+		{reflect.TypeOf(0), false},
+		{reflect.TypeOf(new(int)), false},
+		{reflect.TypeOf([]int{}), false},
+	}
+	for _, c := range cases {
+		if got := isMultipartField(c.typ); got != c.want {
+			t.Errorf("isMultipartField(%v) = %v, want %v", c.typ, got, c.want)
+		}
+	}
+}
+
+func TestAppendErrorNil(t *testing.T) {
+	m := MultiError{"a": errors.New("a")}
+	if got := appendError(m, "b", nil); len(got) != 1 {
+		t.Errorf("nil error must not be appended: %v", got)
+	}
+	if got := appendError(nil, "b", nil); got != nil {
+		t.Errorf("nil error on nil map must return nil, got %v", got)
+	}
+}
+
+// Struct fields containing arrays of pointers must be walked during cache
+// building without dropping the surrounding struct's other fields.
+func TestArrayOfPointersFieldWalk(t *testing.T) {
+	type S struct {
+		A [2]*int `schema:"a"`
+		B string  `schema:"b"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.B != "ok" {
+		t.Errorf("expected ok, got %q", s.B)
+	}
+}
+
+// Reconfiguring a decoder concurrently with Decode must never latch stale
+// metadata: once SetAliasTag returns, subsequent decodes observe the new tag.
+func TestDecoderReconfigureDuringDecode(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	for i := 0; i < 300; i++ {
+		d := NewDecoder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			var dst T1
+			_ = d.Decode(&dst, map[string][]string{"schemaname": {"x"}})
+		}()
+		d.SetAliasTag("url")
+		<-done
+
+		var dst T1
+		if err := d.Decode(&dst, map[string][]string{"urlname": {"y"}}); err != nil {
+			t.Fatalf("iteration %d: decode after SetAliasTag failed: %v", i, err)
+		}
+		if dst.A != "y" {
+			t.Fatalf("iteration %d: stale metadata: %+v", i, dst)
+		}
+	}
+}
+
+// Concurrent decodes of the same fresh path exercise the parse cache's
+// lost-race insertion path; results must be identical either way.
+func TestConcurrentSamePathDecode(t *testing.T) {
+	type S struct {
+		A string `schema:"a"`
+		B int    `schema:"b"`
+	}
+	for i := 0; i < 50; i++ {
+		d := NewDecoder()
+		var wg sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var s S
+				if err := d.Decode(&s, map[string][]string{"a": {"x"}, "b": {"7"}}); err != nil {
+					t.Errorf("decode failed: %v", err)
+				} else if s.A != "x" || s.B != 7 {
+					t.Errorf("wrong result: %+v", s)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+}
+
+// Unexported embedded pointers are not settable; decoding must skip them
+// instead of panicking, and sibling fields must still decode.
+func TestUnexportedEmbeddedPointerSkipped(t *testing.T) {
+	type inner struct {
+		X string `schema:"x"`
+	}
+	type outer struct {
+		*inner
+		A string `schema:"a"`
+	}
+	var o outer
+	if err := NewDecoder().Decode(&o, map[string][]string{"a": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o.A != "ok" {
+		t.Errorf("sibling field not decoded: %+v", o)
+	}
+	if o.inner != nil {
+		t.Errorf("unsettable embedded pointer unexpectedly allocated")
+	}
+
+	// Keys targeting fields promoted through the unsettable pointer are
+	// skipped silently once the path parses (the field exists in metadata).
+	// Default unknown-key behavior is used deliberately: if "x" ever fell
+	// out of the metadata, Decode would return an UnknownKeyError here.
+	var o2 outer
+	dec := NewDecoder()
+	if err := dec.Decode(&o2, map[string][]string{"x": {"v"}, "a": {"ok"}}); err != nil {
+		t.Fatal(err)
+	}
+	if o2.A != "ok" {
+		t.Errorf("sibling field not decoded: %+v", o2)
+	}
+
+	// Defaults walks must also skip unreachable chains.
+	type outerDefaults struct {
+		*inner
+		B string `schema:"b,default:zz"`
+	}
+	var o3 outerDefaults
+	if err := NewDecoder().Decode(&o3, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if o3.B != "zz" {
+		t.Errorf("default not applied: %+v", o3)
+	}
+}
+
+// A structInfo stored by a build that raced a reconfiguration carries the
+// old generation and must never be served after the reconfiguration
+// returned, even if it lands in the cache.
+func TestDecoderStaleCacheEntryIgnored(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(T1{})
+
+	var dst T1
+	if err := d.Decode(&dst, map[string][]string{"schemaname": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	staleEntry, ok := d.cache.m.Load(typ)
+	if !ok {
+		t.Fatal("expected cached structInfo")
+	}
+
+	d.SetAliasTag("url")
+	// Simulate a delayed store from a build that raced the reconfiguration.
+	d.cache.m.Store(typ, staleEntry)
+
+	dst = T1{}
+	if err := d.Decode(&dst, map[string][]string{"urlname": {"y"}}); err != nil {
+		t.Fatalf("stale entry served: %v", err)
+	}
+	if dst.A != "y" {
+		t.Fatalf("stale entry served: %+v", dst)
+	}
+}
+
+// Registering converters concurrently with decoding must be safe and take
+// effect once registration returns.
+func TestDecoderRegisterConverterDuringDecode(t *testing.T) {
+	type CV string
+	type S struct {
+		C CV     `schema:"c"`
+		A string `schema:"a"`
+	}
+	conv := func(v string) reflect.Value { return reflect.ValueOf(CV("conv:" + v)) }
+	for i := 0; i < 200; i++ {
+		d := NewDecoder()
+		done := make(chan error, 1)
+		go func() {
+			var s S
+			done <- d.Decode(&s, map[string][]string{"a": {"x"}})
+		}()
+		d.RegisterConverter(CV(""), conv)
+		if err := <-done; err != nil {
+			t.Fatalf("iteration %d: concurrent decode failed: %v", i, err)
+		}
+
+		var s S
+		if err := d.Decode(&s, map[string][]string{"c": {"v"}, "a": {"x"}}); err != nil {
+			t.Fatalf("iteration %d: %v", i, err)
+		}
+		if s.C != "conv:v" {
+			t.Fatalf("iteration %d: converter not effective: %+v", i, s)
+		}
+	}
+}
+
+// Decoding with a nil src map and multipart files used to panic before the
+// recovery handler was installed, crashing the caller.
+func TestDecodeNilSrcWithMultipartFiles(t *testing.T) {
+	type S struct {
+		F *multipart.FileHeader `schema:"f"`
+	}
+	var s S
+	files := map[string][]*multipart.FileHeader{"f": {{Filename: "x"}}}
+	if err := NewDecoder().Decode(&s, nil, files); err != nil {
+		t.Fatal(err)
+	}
+	if s.F == nil || s.F.Filename != "x" {
+		t.Errorf("file not decoded: %+v", s.F)
+	}
+
+	// Plain nil src still decodes to nothing without error.
+	type P struct {
+		A string `schema:"a"`
+	}
+	var p P
+	if err := NewDecoder().Decode(&p, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type namedIntElem int
+
+type myStr string
+
+// Slices of pointers to named builtin types must decode without panicking:
+// the converter yields the underlying kind, which must be Converted to the
+// named element type before being stored into the *Named pointer.
+func TestDecodeNamedPointerElemSlice(t *testing.T) {
+	type S struct {
+		P  []*namedIntElem `schema:"p"`
+		PS []*myStr        `schema:"ps"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{
+		"p":  {"1", "2,3"},
+		"ps": {"a", "b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.P) != 3 || *s.P[0] != 1 || *s.P[1] != 2 || *s.P[2] != 3 {
+		got := make([]namedIntElem, len(s.P))
+		for i, p := range s.P {
+			got[i] = *p
+		}
+		t.Errorf("[]*namedIntElem: expected [1 2 3], got %v", got)
+	}
+	if len(s.PS) != 2 || *s.PS[0] != "a" || *s.PS[1] != "b" {
+		t.Errorf("[]*myStr: unexpected result %v", s.PS)
+	}
+}
+
+// A required int16 or uint field submitted empty must be reported empty
+// (isEmpty must cover every builtin kind the decoder accepts).
+func TestRequiredInt16AndUintEmpty(t *testing.T) {
+	type S struct {
+		A int16  `schema:"a,required"`
+		B uint   `schema:"b,required"`
+		C string `schema:"c,required"`
+	}
+	err := NewDecoder().Decode(&S{}, map[string][]string{
+		"a": {""},
+		"b": {""},
+		"c": {""},
+	})
+	me, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("expected MultiError, got %T %v", err, err)
+	}
+	for _, key := range []string{"a", "b", "c"} {
+		if _, ok := me[key].(EmptyFieldError); !ok {
+			t.Errorf("required field %q empty value not reported: %v", key, me[key])
+		}
+	}
+}
+
+type (
+	dfRole  string
+	dfLevel int
+	dfFlag  bool
+	dfRatio float64
+)
+
+// dfLevelPtr is a named pointer type: *int is NOT convertible to it, so the
+// default must be built as a *dfLevel (which is assignable) rather than
+// converted from a base-kind pointer.
+type dfLevelPtr *dfLevel
+
+// Defaults on named types (scalar, pointer-to-named, and named-element slice)
+// must be applied, not panic. The builtin converters return the underlying
+// kind, which must be converted to the named target before Set/Append.
+func TestDefaultsOnNamedTypes(t *testing.T) {
+	type S struct {
+		R  dfRole     `schema:"r,default:admin"`
+		L  dfLevel    `schema:"l,default:7"`
+		F  dfFlag     `schema:"f,default:true"`
+		X  dfRatio    `schema:"x,default:1.5"`
+		P  *dfLevel   `schema:"p,default:9"`
+		NP dfLevelPtr `schema:"np,default:12"`
+		SL []dfLevel  `schema:"sl,default:1|2|3"`
+		SS []dfRole   `schema:"ss,default:a|b"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{}); err != nil {
+		t.Fatalf("decode with named-type defaults failed: %v", err)
+	}
+	if s.R != "admin" {
+		t.Errorf("R: got %q want admin", s.R)
+	}
+	if s.L != 7 {
+		t.Errorf("L: got %d want 7", s.L)
+	}
+	if s.F != true {
+		t.Errorf("F: got %v want true", s.F)
+	}
+	if s.X != 1.5 {
+		t.Errorf("X: got %v want 1.5", s.X)
+	}
+	if s.P == nil || *s.P != 9 {
+		t.Errorf("P: got %v want *9", s.P)
+	}
+	if s.NP == nil || *s.NP != 12 {
+		t.Errorf("NP (named pointer type): got %v want *12", s.NP)
+	}
+	if len(s.SL) != 3 || s.SL[0] != 1 || s.SL[1] != 2 || s.SL[2] != 3 {
+		t.Errorf("SL: got %v want [1 2 3]", s.SL)
+	}
+	if len(s.SS) != 2 || s.SS[0] != "a" || s.SS[1] != "b" {
+		t.Errorf("SS: got %v want [a b]", s.SS)
+	}
+}
+
+// Decode must not mutate the caller's src map when multipart files are
+// passed: file keys are merged into an internal copy, and a caller-provided
+// value under the same key stays intact in the caller's map.
+func TestDecodeDoesNotMutateCallerSrc(t *testing.T) {
+	type S struct {
+		F *multipart.FileHeader `schema:"f"`
+		A string                `schema:"a"`
+	}
+	src := map[string][]string{"a": {"x"}, "f": {"caller-value"}}
+	files := map[string][]*multipart.FileHeader{"f": {{Filename: "fn"}}}
+
+	var s S
+	if err := NewDecoder().Decode(&s, src, files); err != nil {
+		t.Fatal(err)
+	}
+	if s.F == nil || s.F.Filename != "fn" {
+		t.Errorf("file not decoded: %+v", s.F)
+	}
+	if s.A != "x" {
+		t.Errorf("sibling not decoded: %+v", s)
+	}
+	if len(src) != 2 {
+		t.Errorf("caller src gained/lost keys: %v", src)
+	}
+	if got := src["f"]; len(got) != 1 || got[0] != "caller-value" {
+		t.Errorf("caller src value overwritten: %v", src["f"])
+	}
+
+	// File-only keys must not appear in the caller's map either.
+	src2 := map[string][]string{"a": {"y"}}
+	files2 := map[string][]*multipart.FileHeader{"g": {{Filename: "gn"}}}
+	type S2 struct {
+		G *multipart.FileHeader `schema:"g"`
+		A string                `schema:"a"`
+	}
+	var s2 S2
+	if err := NewDecoder().Decode(&s2, src2, files2); err != nil {
+		t.Fatal(err)
+	}
+	if s2.G == nil || s2.G.Filename != "gn" {
+		t.Errorf("file not decoded: %+v", s2.G)
+	}
+	if _, ok := src2["g"]; ok || len(src2) != 1 {
+		t.Errorf("caller src mutated with file key: %v", src2)
 	}
 }

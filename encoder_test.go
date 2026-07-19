@@ -3,6 +3,7 @@ package schema
 import (
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -790,5 +791,298 @@ func BenchmarkTimeDurationEncoding(b *testing.B) {
 	vals := map[string][]string{}
 	for b.Loop() {
 		_ = enc.Encode(&testData, vals)
+	}
+}
+
+// A plan build racing SetAliasTag/RegisterEncoder must not re-insert a
+// stale plan after the invalidation; once the reconfiguration call returns,
+// every subsequent Encode must observe it.
+func TestEncoderReconfigureDuringEncode(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	for i := 0; i < 300; i++ {
+		e := NewEncoder()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			dst := map[string][]string{}
+			_ = e.Encode(T1{A: "x"}, dst)
+		}()
+		e.SetAliasTag("url")
+		<-done
+
+		dst := map[string][]string{}
+		if err := e.Encode(T1{A: "x"}, dst); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := dst["urlname"]; !ok {
+			t.Fatalf("iteration %d: encode after SetAliasTag returned stale plan: %v", i, dst)
+		}
+	}
+}
+
+// Errors inside recursed structs (value and pointer) must be collected under
+// the nested type's name.
+func TestEncoderNestedErrors(t *testing.T) {
+	type Bad struct {
+		M map[string]string `schema:"m"`
+	}
+	type S struct {
+		V Bad  `schema:"v"`
+		P *Bad `schema:"p"`
+	}
+	enc := NewEncoder()
+	dst := map[string][]string{}
+	err := enc.Encode(S{V: Bad{M: map[string]string{"a": "b"}}, P: &Bad{}}, dst)
+	if err == nil {
+		t.Fatal("expected error for unsupported nested field")
+	}
+	if !strings.Contains(err.Error(), "encoder not found") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// An encoding plan stored by a build that raced a reconfiguration carries
+// the old generation and must never be served after the reconfiguration
+// returned, even if it lands in the cache.
+func TestEncoderStaleCacheEntryIgnored(t *testing.T) {
+	type T1 struct {
+		A string `schema:"schemaname" url:"urlname"`
+	}
+	e := NewEncoder()
+	typ := reflect.TypeOf(T1{})
+
+	dst := map[string][]string{}
+	if err := e.Encode(T1{A: "x"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	stalePlan, ok := e.encCache.Load(typ)
+	if !ok {
+		t.Fatal("expected cached plan")
+	}
+
+	e.SetAliasTag("url")
+	// Simulate a delayed store from a build that raced the reconfiguration.
+	e.encCache.Store(typ, stalePlan)
+
+	dst = map[string][]string{}
+	if err := e.Encode(T1{A: "y"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dst["urlname"]; !ok {
+		t.Fatalf("stale plan served: %v", dst)
+	}
+}
+
+// Pins the four cases the removed isValidStructPointer helper used to
+// classify, now decided by the cached plan's recurseStructPtr flag plus a
+// runtime nil check: valid struct pointers recurse, nil struct pointers
+// encode as "null", struct values recurse, and pointers to non-structs
+// encode their element (or "null" when nil).
+func TestEncodeStructPointerClassification(t *testing.T) {
+	type Inner struct {
+		X string `schema:"x"`
+	}
+	type S struct {
+		SP  *Inner `schema:"sp"`  // valid struct pointer -> recursed
+		NP  *Inner `schema:"np"`  // nil struct pointer -> "null"
+		SV  Inner  `schema:"sv"`  // struct value -> recursed
+		IP  *int   `schema:"ip"`  // pointer to non-struct -> element
+		NIP *int   `schema:"nip"` // nil pointer to non-struct -> "null"
+	}
+
+	seven := 7
+	src := S{
+		SP: &Inner{X: "from-ptr"},
+		SV: Inner{X: "from-val"},
+		IP: &seven,
+	}
+	// SP and SV both recurse and write under the inner field's alias; SV is
+	// encoded after SP overwrote nothing (values append under "x").
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(src, dst); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := dst["x"]; len(got) != 2 || got[0] != "from-ptr" || got[1] != "from-val" {
+		t.Errorf("struct pointer/value recursion: expected [from-ptr from-val] under \"x\", got %v", got)
+	}
+	if _, ok := dst["sp"]; ok {
+		t.Error("valid struct pointer must recurse, not encode under its own alias")
+	}
+	if got := dst["np"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil struct pointer: expected [null], got %v", got)
+	}
+	if got := dst["ip"]; len(got) != 1 || got[0] != "7" {
+		t.Errorf("pointer to non-struct: expected [7], got %v", got)
+	}
+	if got := dst["nip"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil pointer to non-struct: expected [null], got %v", got)
+	}
+}
+
+// Encoding into a nil destination map used to panic and crash the caller.
+func TestEncodeNilDstReturnsError(t *testing.T) {
+	type S struct {
+		A string `schema:"a"`
+	}
+	err := NewEncoder().Encode(S{A: "x"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "dst map must not be nil") {
+		t.Fatalf("expected nil-dst error, got %v", err)
+	}
+}
+
+// Non-nil pointers to unsupported element types used to invoke a nil inner
+// encoder and panic, crashing the caller; they must error instead, while
+// nil pointers keep encoding as "null".
+func TestEncodePointerToUnsupported(t *testing.T) {
+	type S struct {
+		M *map[string]string `schema:"m"`
+		L *[]int             `schema:"l"`
+		A string             `schema:"a"`
+	}
+
+	m := map[string]string{"k": "v"}
+	l := []int{1}
+	dst := map[string][]string{}
+	err := NewEncoder().Encode(S{M: &m, L: &l, A: "x"}, dst)
+	if err == nil || !strings.Contains(err.Error(), "encoder not found") {
+		t.Fatalf("expected encoder-not-found error, got %v", err)
+	}
+	if got := dst["a"]; len(got) != 1 || got[0] != "x" {
+		t.Errorf("supported sibling must still encode: %v", dst)
+	}
+
+	// Nil pointers to unsupported types keep the historical "null" output.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(S{A: "x"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if got := dst["m"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil *map: expected [null], got %v", dst["m"])
+	}
+	if got := dst["l"]; len(got) != 1 || got[0] != "null" {
+		t.Errorf("nil *slice: expected [null], got %v", dst["l"])
+	}
+
+	// omitempty suppresses the null.
+	type SO struct {
+		M *map[string]string `schema:"m,omitempty"`
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SO{}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := dst["m"]; ok {
+		t.Errorf("omitempty nil pointer must be skipped: %v", dst)
+	}
+}
+
+// Panics from user-registered encoders (or reflection) must surface as
+// errors, mirroring Decode's recovery, instead of crashing the caller.
+func TestEncodeRecoversEncoderPanic(t *testing.T) {
+	type PT struct{ V int }
+	type S struct {
+		P PT `schema:"p"`
+	}
+	enc := NewEncoder()
+	enc.RegisterEncoder(PT{}, func(reflect.Value) string { panic("boom") })
+	err := enc.Encode(S{P: PT{V: 1}}, map[string][]string{})
+	if err == nil || !strings.Contains(err.Error(), "panic while encoding: boom") {
+		t.Fatalf("expected recovered panic error, got %v", err)
+	}
+}
+
+// An empty slice whose element type has no encoder (e.g. []*Struct) must be
+// skipped under omitempty and emitted empty otherwise, not spuriously error;
+// only a non-empty such slice errors. Non-slice unencodable fields still error.
+func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
+	type Inner struct {
+		A string `schema:"a"`
+	}
+
+	// omitempty + nil slice -> skipped, no error.
+	type SOmit struct {
+		Children []*Inner `schema:"children,omitempty"`
+		Name     string   `schema:"name"`
+	}
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(SOmit{Name: "bob"}, dst); err != nil {
+		t.Fatalf("omitempty empty slice should not error: %v", err)
+	}
+	if _, ok := dst["children"]; ok {
+		t.Errorf("omitempty empty slice should be skipped, got %v", dst["children"])
+	}
+	if got := dst["name"]; len(got) != 1 || got[0] != "bob" {
+		t.Errorf("sibling not encoded: %v", dst)
+	}
+
+	// omitempty + non-nil empty slice -> also skipped (the check is Len-based,
+	// not a nil check).
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SOmit{Children: make([]*Inner, 0), Name: "bob"}, dst); err != nil {
+		t.Fatalf("omitempty non-nil empty slice should not error: %v", err)
+	}
+	if _, ok := dst["children"]; ok {
+		t.Errorf("omitempty non-nil empty slice should be skipped, got %v", dst["children"])
+	}
+
+	// no omitempty + nil slice -> emitted empty, no error.
+	type SPlain struct {
+		Children []*Inner `schema:"children"`
+		Name     string   `schema:"name"`
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Name: "bob"}, dst); err != nil {
+		t.Fatalf("empty slice should not error: %v", err)
+	}
+	if got, ok := dst["children"]; !ok || len(got) != 0 {
+		t.Errorf("empty slice should emit empty, got %v (present=%v)", got, ok)
+	}
+
+	// no omitempty + non-nil empty slice -> also emitted empty, no error.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Children: make([]*Inner, 0), Name: "bob"}, dst); err != nil {
+		t.Fatalf("non-nil empty slice should not error: %v", err)
+	}
+	if got, ok := dst["children"]; !ok || len(got) != 0 {
+		t.Errorf("non-nil empty slice should emit empty, got %v (present=%v)", got, ok)
+	}
+
+	// non-empty slice of unencodable element -> error.
+	dst = map[string][]string{}
+	err := NewEncoder().Encode(SPlain{Children: []*Inner{{A: "x"}}, Name: "bob"}, dst)
+	if err == nil || !strings.Contains(err.Error(), "encoder not found") {
+		t.Errorf("non-empty unencodable-elem slice should error, got %v", err)
+	}
+
+	// []*Struct with nil elements encodes each nil as "null" (as historically),
+	// matching a scalar nil *Struct; a non-nil element is an error.
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(SPlain{Children: []*Inner{nil, nil}, Name: "bob"}, dst); err != nil {
+		t.Fatalf("[]*Struct nil elements should encode as null, got %v", err)
+	}
+	if got := dst["children"]; len(got) != 2 || got[0] != "null" || got[1] != "null" {
+		t.Errorf("nil elements: expected [null null], got %v", got)
+	}
+
+	// A value-struct slice ([]Struct) is unencodable and errors even when empty.
+	type SVal struct {
+		Items []Inner `schema:"items"`
+	}
+	if err := NewEncoder().Encode(SVal{}, map[string][]string{}); err == nil {
+		t.Errorf("empty []Struct (value) should error, matching historical behavior")
+	}
+
+	// non-slice unencodable field (map) still errors regardless of emptiness.
+	type SMap struct {
+		M map[string]string `schema:"m"`
+	}
+	if err := NewEncoder().Encode(SMap{}, map[string][]string{}); err == nil {
+		t.Errorf("empty map field should still error 'encoder not found'")
+	}
+	if err := NewEncoder().Encode(SMap{M: map[string]string{"k": "v"}}, map[string][]string{}); err == nil {
+		t.Errorf("non-empty map field should error 'encoder not found'")
 	}
 }

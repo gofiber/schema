@@ -36,12 +36,12 @@ func TestMultiErrorError(t *testing.T) {
 	}
 }
 
-func TestMultiErrorMerge(t *testing.T) {
+func TestMergeErrors(t *testing.T) {
 	errA := errors.New("a")
 	m1 := MultiError{"a": errA}
 	errB := errors.New("b")
 	m2 := MultiError{"a": errors.New("ignore"), "b": errB}
-	m1.merge(m2)
+	m1 = mergeErrors(m1, m2)
 	if len(m1) != 2 {
 		t.Fatalf("expected len 2, got %d", len(m1))
 	}
@@ -50,6 +50,12 @@ func TestMultiErrorMerge(t *testing.T) {
 	}
 	if m1["b"].Error() != errB.Error() {
 		t.Errorf("missing merged error")
+	}
+	if merged := mergeErrors(nil, m2); len(merged) != 2 {
+		t.Errorf("expected lazily allocated merge, got %v", merged)
+	}
+	if merged := mergeErrors(m1, nil); len(merged) != len(m1) {
+		t.Errorf("expected unchanged map, got %v", merged)
 	}
 }
 
