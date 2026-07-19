@@ -230,10 +230,19 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 				}
 
 				// this check is to handle if the wrong value is provided
-				if convertedVal := convertPointer(t1.Kind(), f.defaultValue); convertedVal.IsValid() {
-					// convertPointer returns *baseKind; convert to the field's
-					// (possibly named) pointer type before assigning.
-					vCurrent.Set(convertedVal.Convert(f.typ))
+				if conv := getBuiltinConverter(t1.Kind()); conv != nil {
+					if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
+						// Build a pointer of the field's actual element type:
+						// the converter yields the underlying kind, which is
+						// convertible to the (possibly named) element type,
+						// and *elem is assignable to the field even when the
+						// field's type is itself a named pointer type (e.g.
+						// type MyIntPtr *MyInt), where converting a *int
+						// directly would panic.
+						p := reflect.New(t1)
+						p.Elem().Set(convertedVal.Convert(t1))
+						vCurrent.Set(p)
+					}
 				}
 			} else {
 				// this check is to handle if the wrong value is provided

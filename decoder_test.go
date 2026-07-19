@@ -4601,18 +4601,24 @@ type (
 	dfRatio float64
 )
 
+// dfLevelPtr is a named pointer type: *int is NOT convertible to it, so the
+// default must be built as a *dfLevel (which is assignable) rather than
+// converted from a base-kind pointer.
+type dfLevelPtr *dfLevel
+
 // Defaults on named types (scalar, pointer-to-named, and named-element slice)
 // must be applied, not panic. The builtin converters return the underlying
 // kind, which must be converted to the named target before Set/Append.
 func TestDefaultsOnNamedTypes(t *testing.T) {
 	type S struct {
-		R  dfRole    `schema:"r,default:admin"`
-		L  dfLevel   `schema:"l,default:7"`
-		F  dfFlag    `schema:"f,default:true"`
-		X  dfRatio   `schema:"x,default:1.5"`
-		P  *dfLevel  `schema:"p,default:9"`
-		SL []dfLevel `schema:"sl,default:1|2|3"`
-		SS []dfRole  `schema:"ss,default:a|b"`
+		R  dfRole     `schema:"r,default:admin"`
+		L  dfLevel    `schema:"l,default:7"`
+		F  dfFlag     `schema:"f,default:true"`
+		X  dfRatio    `schema:"x,default:1.5"`
+		P  *dfLevel   `schema:"p,default:9"`
+		NP dfLevelPtr `schema:"np,default:12"`
+		SL []dfLevel  `schema:"sl,default:1|2|3"`
+		SS []dfRole   `schema:"ss,default:a|b"`
 	}
 	var s S
 	if err := NewDecoder().Decode(&s, map[string][]string{}); err != nil {
@@ -4632,6 +4638,9 @@ func TestDefaultsOnNamedTypes(t *testing.T) {
 	}
 	if s.P == nil || *s.P != 9 {
 		t.Errorf("P: got %v want *9", s.P)
+	}
+	if s.NP == nil || *s.NP != 12 {
+		t.Errorf("NP (named pointer type): got %v want *12", s.NP)
 	}
 	if len(s.SL) != 3 || s.SL[0] != 1 || s.SL[1] != 2 || s.SL[2] != 3 {
 		t.Errorf("SL: got %v want [1 2 3]", s.SL)

@@ -45,28 +45,6 @@ func TestTagOptionsContains(t *testing.T) {
 	}
 }
 
-func TestConvertPointer(t *testing.T) {
-	v := convertPointer(reflect.Bool, "true")
-	if !v.IsValid() || !v.Elem().Bool() {
-		t.Fatalf("expected true, got %v", v)
-	}
-
-	v = convertPointer(reflect.Int, "10")
-	if !v.IsValid() || v.Elem().Int() != 10 {
-		t.Fatalf("expected 10, got %v", v)
-	}
-
-	v = convertPointer(reflect.String, "abc")
-	if !v.IsValid() || v.Elem().String() != "abc" {
-		t.Fatalf("expected abc, got %v", v)
-	}
-
-	v = convertPointer(reflect.Complex64, "1")
-	if v.IsValid() {
-		t.Fatalf("expected invalid value for unsupported kind")
-	}
-}
-
 func BenchmarkParseTag(b *testing.B) {
 	for b.Loop() {
 		parseTag("field,omitempty,default:value")
@@ -78,12 +56,6 @@ func BenchmarkIsZero(b *testing.B) {
 	v := reflect.ValueOf(S{})
 	for b.Loop() {
 		isZero(v)
-	}
-}
-
-func BenchmarkConvertPointer(b *testing.B) {
-	for b.Loop() {
-		convertPointer(reflect.Int, "42")
 	}
 }
 
