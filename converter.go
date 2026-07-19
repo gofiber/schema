@@ -89,29 +89,14 @@ func convertFloat64(value string) reflect.Value {
 	return invalidValue
 }
 
-// parseNativeInt parses value as a native int via utils.ParseInt's fast
-// (SWAR) path and rejects values that don't fit a native int. The fit check
-// is a no-op on 64-bit (int == int64) and rejects out-of-range values on
-// 32-bit, where a plain int() conversion would silently truncate.
-func parseNativeInt(value string) (int64, bool) {
-	v, err := utils.ParseInt(value)
-	if err != nil || int64(int(v)) != v {
-		return 0, false
-	}
-	return v, true
-}
-
-// parseNativeUint is parseNativeInt for unsigned native uints.
-func parseNativeUint(value string) (uint64, bool) {
-	v, err := utils.ParseUint(value)
-	if err != nil || uint64(uint(v)) != v {
-		return 0, false
-	}
-	return v, true
-}
+// Native int/uint parsing goes through utils.ParseInt/ParseUint (which have
+// a SWAR fast path) with an inline native-fit guard: `int64(int(v)) == v`
+// compiles away on 64-bit and rejects values on 32-bit that a plain int()
+// conversion would silently truncate. The guard is written inline at each
+// call site so the ~8ns parse doesn't pay a wrapper call frame.
 
 func convertInt(value string) reflect.Value {
-	if v, ok := parseNativeInt(value); ok {
+	if v, err := utils.ParseInt(value); err == nil && int64(int(v)) == v {
 		return reflect.ValueOf(int(v))
 	}
 	return invalidValue
@@ -150,7 +135,7 @@ func convertString(value string) reflect.Value {
 }
 
 func convertUint(value string) reflect.Value {
-	if v, ok := parseNativeUint(value); ok {
+	if v, err := utils.ParseUint(value); err == nil && uint64(uint(v)) == v {
 		return reflect.ValueOf(uint(v))
 	}
 	return invalidValue
@@ -203,8 +188,8 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 	case stringType:
 		v.SetString(val)
 	case intType:
-		n, ok := parseNativeInt(val)
-		if !ok {
+		n, err := utils.ParseInt(val)
+		if err != nil || int64(int(n)) != n {
 			return true, false
 		}
 		v.SetInt(n)
@@ -233,8 +218,8 @@ func setBuiltinKind(v reflect.Value, k reflect.Kind, val string) (handled, ok bo
 		}
 		v.SetInt(n)
 	case uintType:
-		n, ok := parseNativeUint(val)
-		if !ok {
+		n, err := utils.ParseUint(val)
+		if err != nil || uint64(uint(n)) != n {
 			return true, false
 		}
 		v.SetUint(n)
