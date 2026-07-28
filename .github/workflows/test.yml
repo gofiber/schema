@@ -53,7 +53,9 @@ jobs:
           verbose: true
 
   repeated:
-    runs-on: ubuntu-latest
+    # single package with barely any t.Parallel(), so this is effectively serial:
+    # per-core speed is what helps here, not core count
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
       - name: Fetch Repository
