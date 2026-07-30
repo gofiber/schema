@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1785363955832,
+  "lastUpdate": 1785396704513,
   "repoUrl": "https://github.com/gofiber/schema",
   "entries": {
     "Benchmark": [
@@ -9504,6 +9504,702 @@ window.BENCHMARK_DATA = {
             "value": 0,
             "unit": "allocs/op",
             "extra": "54036194 times\n4 procs"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "rene@gofiber.io",
+            "name": "René",
+            "username": "ReneWerner87"
+          },
+          "committer": {
+            "email": "rene@gofiber.io",
+            "name": "René",
+            "username": "ReneWerner87"
+          },
+          "distinct": true,
+          "id": "09d22a75520e733a2de4cccc824482ae0e59d07f",
+          "message": "feat(ci): implement retry logic for automatic PR merges to handle base branch race conditions",
+          "timestamp": "2026-07-30T09:30:01+02:00",
+          "tree_id": "7b75e61b708c60ad329534d7348343a30396c9f7",
+          "url": "https://github.com/gofiber/schema/commit/09d22a75520e733a2de4cccc824482ae0e59d07f"
+        },
+        "date": 1785396703394,
+        "tool": "go",
+        "benches": [
+          {
+            "name": "BenchmarkNextPathSegment",
+            "value": 17.02,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "70074903 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkNextPathSegment - ns/op",
+            "value": 17.02,
+            "unit": "ns/op",
+            "extra": "70074903 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkNextPathSegment - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "70074903 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkNextPathSegment - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "70074903 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParsePathCacheMiss",
+            "value": 860.8,
+            "unit": "ns/op\t     504 B/op\t       9 allocs/op",
+            "extra": "1389229 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParsePathCacheMiss - ns/op",
+            "value": 860.8,
+            "unit": "ns/op",
+            "extra": "1389229 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParsePathCacheMiss - B/op",
+            "value": 504,
+            "unit": "B/op",
+            "extra": "1389229 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParsePathCacheMiss - allocs/op",
+            "value": 9,
+            "unit": "allocs/op",
+            "extra": "1389229 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertBool",
+            "value": 6.98,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "171978578 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertBool - ns/op",
+            "value": 6.98,
+            "unit": "ns/op",
+            "extra": "171978578 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertBool - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "171978578 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertBool - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "171978578 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertInt",
+            "value": 8.091,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "148213531 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertInt - ns/op",
+            "value": 8.091,
+            "unit": "ns/op",
+            "extra": "148213531 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertInt - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "148213531 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkConvertInt - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "148213531 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkAll",
+            "value": 6.691,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "178903383 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkAll - ns/op",
+            "value": 6.691,
+            "unit": "ns/op",
+            "extra": "178903383 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkAll - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "178903383 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkAll - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "178903383 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSliceManyIndicesDecode",
+            "value": 31092,
+            "unit": "ns/op\t   16700 B/op\t      17 allocs/op",
+            "extra": "38112 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSliceManyIndicesDecode - ns/op",
+            "value": 31092,
+            "unit": "ns/op",
+            "extra": "38112 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSliceManyIndicesDecode - B/op",
+            "value": 16700,
+            "unit": "B/op",
+            "extra": "38112 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSliceManyIndicesDecode - allocs/op",
+            "value": 17,
+            "unit": "allocs/op",
+            "extra": "38112 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkDecoderMultipartFiles",
+            "value": 1715,
+            "unit": "ns/op\t      96 B/op\t       5 allocs/op",
+            "extra": "697976 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkDecoderMultipartFiles - ns/op",
+            "value": 1715,
+            "unit": "ns/op",
+            "extra": "697976 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkDecoderMultipartFiles - B/op",
+            "value": 96,
+            "unit": "B/op",
+            "extra": "697976 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkDecoderMultipartFiles - allocs/op",
+            "value": 5,
+            "unit": "allocs/op",
+            "extra": "697976 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-0",
+            "value": 6.688,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "179432523 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-0 - ns/op",
+            "value": 6.688,
+            "unit": "ns/op",
+            "extra": "179432523 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-0 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "179432523 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-0 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "179432523 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-1",
+            "value": 6.696,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "179087997 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-1 - ns/op",
+            "value": 6.696,
+            "unit": "ns/op",
+            "extra": "179087997 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-1 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "179087997 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-1 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "179087997 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-2",
+            "value": 6.589,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "182091386 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-2 - ns/op",
+            "value": 6.589,
+            "unit": "ns/op",
+            "extra": "182091386 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-2 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "182091386 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-2 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "182091386 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-3",
+            "value": 6.692,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "179325301 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-3 - ns/op",
+            "value": 6.692,
+            "unit": "ns/op",
+            "extra": "179325301 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-3 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "179325301 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-3 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "179325301 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-4",
+            "value": 6.425,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "186765116 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-4 - ns/op",
+            "value": 6.425,
+            "unit": "ns/op",
+            "extra": "186765116 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-4 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "186765116 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-4 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "186765116 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-5",
+            "value": 6.689,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "179425022 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-5 - ns/op",
+            "value": 6.689,
+            "unit": "ns/op",
+            "extra": "179425022 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-5 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "179425022 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-5 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "179425022 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-6",
+            "value": 12,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "100000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-6 - ns/op",
+            "value": 12,
+            "unit": "ns/op",
+            "extra": "100000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-6 - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "100000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsMultipartFile/IsMultipartFile-6 - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "100000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkHandleMultipartField",
+            "value": 210,
+            "unit": "ns/op\t      48 B/op\t       2 allocs/op",
+            "extra": "5640087 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkHandleMultipartField - ns/op",
+            "value": 210,
+            "unit": "ns/op",
+            "extra": "5640087 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkHandleMultipartField - B/op",
+            "value": 48,
+            "unit": "B/op",
+            "extra": "5640087 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkHandleMultipartField - allocs/op",
+            "value": 2,
+            "unit": "allocs/op",
+            "extra": "5640087 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecode",
+            "value": 1312,
+            "unit": "ns/op\t     144 B/op\t       4 allocs/op",
+            "extra": "903912 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecode - ns/op",
+            "value": 1312,
+            "unit": "ns/op",
+            "extra": "903912 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecode - B/op",
+            "value": 144,
+            "unit": "B/op",
+            "extra": "903912 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecode - allocs/op",
+            "value": 4,
+            "unit": "allocs/op",
+            "extra": "903912 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecodeParallel",
+            "value": 336.6,
+            "unit": "ns/op\t     144 B/op\t       4 allocs/op",
+            "extra": "3561554 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecodeParallel - ns/op",
+            "value": 336.6,
+            "unit": "ns/op",
+            "extra": "3561554 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecodeParallel - B/op",
+            "value": 144,
+            "unit": "B/op",
+            "extra": "3561554 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructDecodeParallel - allocs/op",
+            "value": 4,
+            "unit": "allocs/op",
+            "extra": "3561554 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructDecode",
+            "value": 492.8,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "2433992 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructDecode - ns/op",
+            "value": 492.8,
+            "unit": "ns/op",
+            "extra": "2433992 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructDecode - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "2433992 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructDecode - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "2433992 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkCheckRequiredFields",
+            "value": 248.3,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "4825040 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkCheckRequiredFields - ns/op",
+            "value": 248.3,
+            "unit": "ns/op",
+            "extra": "4825040 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkCheckRequiredFields - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "4825040 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkCheckRequiredFields - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "4825040 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationDecoding",
+            "value": 297,
+            "unit": "ns/op\t      16 B/op\t       2 allocs/op",
+            "extra": "4020529 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationDecoding - ns/op",
+            "value": 297,
+            "unit": "ns/op",
+            "extra": "4020529 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationDecoding - B/op",
+            "value": 16,
+            "unit": "B/op",
+            "extra": "4020529 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationDecoding - allocs/op",
+            "value": 2,
+            "unit": "allocs/op",
+            "extra": "4020529 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncode",
+            "value": 1369,
+            "unit": "ns/op\t     464 B/op\t       3 allocs/op",
+            "extra": "1000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncode - ns/op",
+            "value": 1369,
+            "unit": "ns/op",
+            "extra": "1000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncode - B/op",
+            "value": 464,
+            "unit": "B/op",
+            "extra": "1000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncode - allocs/op",
+            "value": 3,
+            "unit": "allocs/op",
+            "extra": "1000000 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncodeParallel",
+            "value": 409,
+            "unit": "ns/op\t     489 B/op\t       3 allocs/op",
+            "extra": "3021309 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncodeParallel - ns/op",
+            "value": 409,
+            "unit": "ns/op",
+            "extra": "3021309 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncodeParallel - B/op",
+            "value": 489,
+            "unit": "B/op",
+            "extra": "3021309 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkSimpleStructEncodeParallel - allocs/op",
+            "value": 3,
+            "unit": "allocs/op",
+            "extra": "3021309 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncode",
+            "value": 1518,
+            "unit": "ns/op\t     929 B/op\t       6 allocs/op",
+            "extra": "924583 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncode - ns/op",
+            "value": 1518,
+            "unit": "ns/op",
+            "extra": "924583 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncode - B/op",
+            "value": 929,
+            "unit": "B/op",
+            "extra": "924583 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncode - allocs/op",
+            "value": 6,
+            "unit": "allocs/op",
+            "extra": "924583 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncodeParallel",
+            "value": 565.1,
+            "unit": "ns/op\t     829 B/op\t       6 allocs/op",
+            "extra": "2300304 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncodeParallel - ns/op",
+            "value": 565.1,
+            "unit": "ns/op",
+            "extra": "2300304 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncodeParallel - B/op",
+            "value": 829,
+            "unit": "B/op",
+            "extra": "2300304 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkLargeStructEncodeParallel - allocs/op",
+            "value": 6,
+            "unit": "allocs/op",
+            "extra": "2300304 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationEncoding",
+            "value": 140,
+            "unit": "ns/op\t      97 B/op\t       1 allocs/op",
+            "extra": "8688836 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationEncoding - ns/op",
+            "value": 140,
+            "unit": "ns/op",
+            "extra": "8688836 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationEncoding - B/op",
+            "value": 97,
+            "unit": "B/op",
+            "extra": "8688836 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkTimeDurationEncoding - allocs/op",
+            "value": 1,
+            "unit": "allocs/op",
+            "extra": "8688836 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMultiErrorError",
+            "value": 205.6,
+            "unit": "ns/op\t      40 B/op\t       2 allocs/op",
+            "extra": "5610950 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMultiErrorError - ns/op",
+            "value": 205.6,
+            "unit": "ns/op",
+            "extra": "5610950 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMultiErrorError - B/op",
+            "value": 40,
+            "unit": "B/op",
+            "extra": "5610950 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkMultiErrorError - allocs/op",
+            "value": 2,
+            "unit": "allocs/op",
+            "extra": "5610950 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParseTag",
+            "value": 6.921,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "173608650 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParseTag - ns/op",
+            "value": 6.921,
+            "unit": "ns/op",
+            "extra": "173608650 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParseTag - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "173608650 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkParseTag - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "173608650 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsZero",
+            "value": 22.04,
+            "unit": "ns/op\t       0 B/op\t       0 allocs/op",
+            "extra": "54231397 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsZero - ns/op",
+            "value": 22.04,
+            "unit": "ns/op",
+            "extra": "54231397 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsZero - B/op",
+            "value": 0,
+            "unit": "B/op",
+            "extra": "54231397 times\n4 procs"
+          },
+          {
+            "name": "BenchmarkIsZero - allocs/op",
+            "value": 0,
+            "unit": "allocs/op",
+            "extra": "54231397 times\n4 procs"
           }
         ]
       }
