@@ -733,6 +733,26 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 		n++
 	}
 
+	// Exact builtin slice types fill a native Go slice and assign it in one
+	// Set, skipping reflect.MakeSlice and the per-element Index/Set calls.
+	// Named slice or element types fall through to the generic path.
+	switch t {
+	case typSliceString:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeString)
+	case typSliceInt:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeInt)
+	case typSliceInt64:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeInt64)
+	case typSliceUint:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeUint)
+	case typSliceUint64:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeUint64)
+	case typSliceFloat64:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeFloat64)
+	case typSliceBool:
+		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeBool)
+	}
+
 	sl := reflect.MakeSlice(t, n, n)
 	i := 0
 	for key, value := range values {
@@ -773,6 +793,72 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 		sl = sl.Slice(0, i)
 	}
 	v.Set(sl)
+	return nil
+}
+
+// Exact (unnamed) builtin slice types eligible for the native decode path.
+var (
+	typSliceString  = reflect.TypeOf([]string(nil))
+	typSliceInt     = reflect.TypeOf([]int(nil))
+	typSliceInt64   = reflect.TypeOf([]int64(nil))
+	typSliceUint    = reflect.TypeOf([]uint(nil))
+	typSliceUint64  = reflect.TypeOf([]uint64(nil))
+	typSliceFloat64 = reflect.TypeOf([]float64(nil))
+	typSliceBool    = reflect.TypeOf([]bool(nil))
+)
+
+// decodeNativeSlice mirrors the generic decodeBuiltinSlice loop for a slice
+// field whose type is exactly []T: elements are parsed into a native Go slice
+// and assigned with a single Set, so no reflect calls happen per element. The
+// slice is built detached and only assigned when every value parsed, keeping
+// the all-or-nothing behavior. n is the precomputed element upper bound.
+func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, values []string, elemT reflect.Type, n int, split bool, parse func(string) (T, bool)) error {
+	out := make([]T, 0, n)
+	var zero T
+	for key, value := range values {
+		switch {
+		case value == "":
+			if zeroEmpty {
+				out = append(out, zero)
+			}
+		case split && strings.IndexByte(value, ',') != -1:
+			for item := range strings.SplitSeq(value, ",") {
+				if item == "" {
+					if zeroEmpty {
+						out = append(out, zero)
+					}
+					continue
+				}
+				ev, ok := parse(item)
+				if !ok {
+					return ConversionError{
+						Key:   path,
+						Type:  elemT,
+						Index: key,
+					}
+				}
+				out = append(out, ev)
+			}
+		default:
+			ev, ok := parse(value)
+			if !ok {
+				return ConversionError{
+					Key:   path,
+					Type:  elemT,
+					Index: key,
+				}
+			}
+			out = append(out, ev)
+		}
+	}
+	// v's type is exactly []T here, so assign through the typed pointer;
+	// this skips reflect.ValueOf's escape of the slice header and Set's
+	// assignability checks.
+	if p, ok := v.Addr().Interface().(*[]T); ok {
+		*p = out
+	} else {
+		v.Set(reflect.ValueOf(out))
+	}
 	return nil
 }
 

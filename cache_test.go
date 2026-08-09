@@ -119,21 +119,27 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 // Decode callers (e.g. Fiber binders) pass map keys aliasing reused request
 // buffers; pathCache must clone the key so later buffer reuse cannot poison it.
 func TestParsePathDetachesCacheKey(t *testing.T) {
+	// Use a slice-index path: statically resolvable keys are served from the
+	// precomputed direct map and never stored in the sync.Map path cache, so
+	// only index-carrying paths exercise the clone-on-store behavior.
+	type Item struct {
+		Value string `schema:"value"`
+	}
 	type S struct {
-		Entity string `schema:"entity"`
+		Items []Item `schema:"items"`
 	}
 	d := NewDecoder()
-	buf := []byte("entity")
+	buf := []byte("items.0.value")
 	var s S
 	if err := d.Decode(&s, map[string][]string{utils.UnsafeString(buf): {"x"}}); err != nil {
 		t.Fatal(err)
 	}
-	copy(buf, "policy") // simulate fasthttp buffer reuse mutating the key bytes
+	copy(buf, "xtems.9.qalue") // simulate fasthttp buffer reuse mutating the key bytes
 
 	count := 0
 	d.cache.get(reflect.TypeOf(s)).paths.Range(func(key, _ any) bool {
 		count++
-		if k := key.(string); k != "entity" {
+		if k := key.(string); k != "items.0.value" {
 			t.Fatalf("path cache key mutated to %q; key must be cloned before caching", k)
 		}
 		return true

@@ -1,0 +1,206 @@
+package schema
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
+
+// Keys served by the precomputed direct-path map must behave exactly like the
+// generic parser: case-insensitive, covering flat aliases and dotted chains
+// through non-pointer nested structs.
+func TestDirectPathLookup(t *testing.T) {
+	type Inner struct {
+		Value string `schema:"value"`
+	}
+	type Outer struct {
+		Name   string `schema:"name"`
+		Nested Inner  `schema:"nested"`
+	}
+
+	for _, keys := range []struct {
+		name, nested string
+	}{
+		{"name", "nested.value"},
+		{"NAME", "NESTED.VALUE"},
+		{"NaMe", "NeStEd.VaLuE"},
+	} {
+		var s Outer
+		data := map[string][]string{
+			keys.name:   {"x"},
+			keys.nested: {"y"},
+		}
+		if err := NewDecoder().Decode(&s, data); err != nil {
+			t.Fatalf("Decode(%q, %q): %v", keys.name, keys.nested, err)
+		}
+		if s.Name != "x" || s.Nested.Value != "y" {
+			t.Fatalf("Decode(%q, %q) = %+v, want Name=x Nested.Value=y", keys.name, keys.nested, s)
+		}
+	}
+}
+
+// Direct-path entries exist for statically-resolvable keys only; everything
+// else must keep flowing through the generic parser unchanged.
+func TestDirectPathLookupFallbacks(t *testing.T) {
+	// Keys longer than the case-fold buffer take the generic path.
+	longAlias := strings.Repeat("a", maxDirectKeyLen+8)
+	type Long struct {
+		Field string `schema:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`
+	}
+	if len(longAlias) != maxDirectKeyLen+8 {
+		t.Fatal("bad test setup")
+	}
+	var l Long
+	if err := NewDecoder().Decode(&l, map[string][]string{longAlias: {"v"}}); err != nil {
+		t.Fatalf("long key: %v", err)
+	}
+	if l.Field != "v" {
+		t.Fatalf("long key decoded %+v", l)
+	}
+
+	// A bare slice-of-structs alias still needs a slice index; the direct map
+	// must not make it valid.
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type WithItems struct {
+		Items []Item `schema:"items"`
+	}
+	var w WithItems
+	err := NewDecoder().Decode(&w, map[string][]string{"items": {"x"}})
+	if err == nil {
+		t.Fatal("bare slice-of-structs alias must remain an invalid path")
+	}
+	if _, ok := err.(MultiError)["items"].(UnknownKeyError); !ok {
+		t.Fatalf("want UnknownKeyError, got %v", err)
+	}
+
+	// Pointer-to-struct chains are not precomputed but must keep decoding.
+	type Inner struct {
+		Value string `schema:"value"`
+	}
+	type WithPtr struct {
+		Nested *Inner `schema:"nested"`
+	}
+	var p WithPtr
+	if err := NewDecoder().Decode(&p, map[string][]string{"NESTED.value": {"y"}}); err != nil {
+		t.Fatalf("pointer chain: %v", err)
+	}
+	if p.Nested == nil || p.Nested.Value != "y" {
+		t.Fatalf("pointer chain decoded %+v", p)
+	}
+}
+
+// The native slice decode path must keep the generic path's semantics:
+// comma splitting, zeroEmpty handling, all-or-nothing assignment, and
+// ConversionError details.
+func TestNativeSliceDecode(t *testing.T) {
+	type S struct {
+		Tags   []string  `schema:"tags"`
+		IDs    []int     `schema:"ids"`
+		Scores []float64 `schema:"scores"`
+		Flags  []bool    `schema:"flags"`
+		Big    []int64   `schema:"big"`
+		U      []uint    `schema:"u"`
+		U64    []uint64  `schema:"u64"`
+	}
+
+	var s S
+	data := map[string][]string{
+		"tags":   {"a", "b,c", ""}, // strings never split on commas
+		"ids":    {"1,2", "3"},
+		"scores": {"1.5", "2.5"},
+		"flags":  {"true", "on"},
+		"big":    {"9007199254740993"},
+		"u":      {"7"},
+		"u64":    {"18446744073709551615"},
+	}
+	if err := NewDecoder().Decode(&s, data); err != nil {
+		t.Fatal(err)
+	}
+	want := S{
+		Tags:   []string{"a", "b,c"},
+		IDs:    []int{1, 2, 3},
+		Scores: []float64{1.5, 2.5},
+		Flags:  []bool{true, true},
+		Big:    []int64{9007199254740993},
+		U:      []uint{7},
+		U64:    []uint64{18446744073709551615},
+	}
+	if !reflect.DeepEqual(s, want) {
+		t.Fatalf("got %+v, want %+v", s, want)
+	}
+
+	// zeroEmpty appends zero values for empty items.
+	var z S
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	if err := d.Decode(&z, map[string][]string{"ids": {"1,,2", ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(z.IDs, []int{1, 0, 2, 0}) {
+		t.Fatalf("zeroEmpty got %v", z.IDs)
+	}
+
+	// A parse failure must leave the field untouched and carry the value's
+	// index in the ConversionError.
+	pre := S{IDs: []int{42}}
+	err := NewDecoder().Decode(&pre, map[string][]string{"ids": {"1", "oops"}})
+	if err == nil {
+		t.Fatal("want conversion error")
+	}
+	convErr, ok := err.(MultiError)["ids"].(ConversionError)
+	if !ok {
+		t.Fatalf("want ConversionError, got %v", err)
+	}
+	if convErr.Index != 1 {
+		t.Fatalf("want Index=1, got %d", convErr.Index)
+	}
+	if !reflect.DeepEqual(pre.IDs, []int{42}) {
+		t.Fatalf("field must stay untouched on error, got %v", pre.IDs)
+	}
+}
+
+type sliceHeavyStruct struct {
+	Tags   []string  `schema:"tags"`
+	IDs    []int     `schema:"ids"`
+	Scores []float64 `schema:"scores"`
+	Flags  []bool    `schema:"flags"`
+}
+
+func BenchmarkSliceHeavyDecode(b *testing.B) {
+	data := map[string][]string{
+		"tags":   {"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu", "nu", "xi", "omicron", "pi"},
+		"ids":    {"1,2,3,4,5,6,7,8", "9,10,11,12,13,14,15,16"},
+		"scores": {"1.5", "2.5", "3.5", "4.5", "5.5", "6.5", "7.5", "8.5"},
+		"flags":  {"true", "false", "true", "false", "true", "false", "true", "false"},
+	}
+	decoder := NewDecoder()
+	s := &sliceHeavyStruct{}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decoder.Decode(s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMixedCaseKeyDecode(b *testing.B) {
+	type S struct {
+		FirstName string `schema:"firstName"`
+		LastName  string `schema:"lastName"`
+		Age       int    `schema:"age"`
+	}
+	data := map[string][]string{
+		"FirstName": {"Grace"},
+		"LASTNAME":  {"Hopper"},
+		"age":       {"85"},
+	}
+	decoder := NewDecoder()
+	s := &S{}
+	for b.Loop() {
+		if err := decoder.Decode(s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

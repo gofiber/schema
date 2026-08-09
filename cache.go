@@ -19,6 +19,11 @@ import (
 
 const maxParserIndex = 1000
 
+// maxDirectKeyLen bounds the stack buffer used to case-fold keys probed
+// against the precomputed direct-path map; longer keys take the generic
+// parse-and-cache path.
+const maxDirectKeyLen = 64
+
 var (
 	errInvalidPath   = errors.New("schema: invalid path")
 	errIndexTooLarge = errors.New("schema: index exceeds parser limit")
@@ -88,6 +93,40 @@ func (c *cache) parsePath(p string, t reflect.Type) ([]pathPart, error) {
 // parsed-path cache lives on that structInfo, keyed by the plain path
 // string, which hashes much cheaper than a composite key.
 func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error) {
+	// Fast path: keys that resolve without runtime state (flat aliases and
+	// dotted chains through non-pointer nested structs) were precomputed into
+	// rootInfo.direct at build time. Lower the key word-at-a-time (SWAR) into
+	// a stack buffer so the lookup is case-insensitive without allocating,
+	// and probe the plain immutable map instead of the sync.Map path cache.
+	// Mixed-case keys hitting here also never pollute the path cache with
+	// per-casing clones.
+	if n := len(p); n <= maxDirectKeyLen && len(rootInfo.direct) > 0 {
+		var buf [maxDirectKeyLen]byte
+		changed := false
+		i := 0
+		for ; i+swar.WordLen <= n; i += swar.WordLen {
+			w := swar.Load8(p, i)
+			lw := swar.ToLowerWord(w)
+			changed = changed || lw != w
+			swar.Store8(buf[:], i, lw)
+		}
+		for ; i < n; i++ {
+			ch := p[i]
+			if ch >= 'A' && ch <= 'Z' {
+				ch += 'a' - 'A'
+				changed = true
+			}
+			buf[i] = ch
+		}
+		if changed {
+			if parts, ok := rootInfo.direct[string(buf[:n])]; ok {
+				return parts, nil
+			}
+		} else if parts, ok := rootInfo.direct[p]; ok {
+			return parts, nil
+		}
+	}
+
 	if cached, ok := rootInfo.paths.Load(p); ok {
 		return cached.([]pathPart), nil
 	}
@@ -298,11 +337,58 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	info.requiredFields = c.buildRequiredFields(info)
+	info.direct = c.buildDirectPaths(info)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
 	// so it can only be skipped when neither defaults nor such pointers
 	// exist anywhere in the tree.
 	info.needsDefaultsWalk = c.needsDefaultsWalk(t, tag, map[reflect.Type]bool{})
 	return info
+}
+
+// buildDirectPaths precomputes the parsed paths parsePathInfo would produce
+// for every key that resolves without runtime state: each field alias, plus
+// dotted chains through nested non-pointer struct fields (their child maps
+// compose recursively). Slice-of-structs fields that require a slice index in
+// the path and aliases containing '.' are left to the generic parser, as are
+// chains through pointer fields (whose element type could reach back to a
+// struct currently being built). Keys are lowercase, mirroring the
+// case-insensitive per-segment lookups of the generic parser.
+func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
+	direct := make(map[string][]pathPart, len(info.fieldsByName))
+	for aliasKey, f := range info.fieldsByName {
+		if strings.IndexByte(aliasKey, '.') >= 0 {
+			continue
+		}
+		if f.isSliceOfStructs && !f.isMultipart && (!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement) {
+			// The path must continue with a slice index; a bare alias is
+			// invalid, so the generic parser handles this field.
+			continue
+		}
+		hop := pathHop{index: f.index, ensure: info.anonymousPtrFields}
+		direct[aliasKey] = []pathPart{{
+			hops:  []pathHop{hop},
+			field: f,
+			index: -1,
+		}}
+		if f.typ.Kind() != reflect.Struct {
+			continue
+		}
+		// Non-pointer struct nesting cannot recurse (the type would be
+		// illegal), so the child's info — including its own direct map — is
+		// always buildable here.
+		for childKey, childParts := range c.get(f.typ).direct {
+			cp := childParts[0]
+			hops := make([]pathHop, 0, len(cp.hops)+1)
+			hops = append(hops, hop)
+			hops = append(hops, cp.hops...)
+			direct[aliasKey+"."+childKey] = []pathPart{{
+				hops:  hops,
+				field: cp.field,
+				index: -1,
+			}}
+		}
+	}
+	return direct
 }
 
 // needsDefaultsWalk reports whether the setDefaults walk can have any effect
@@ -423,6 +509,12 @@ type structInfo struct {
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
 	requiredFields     map[string][]fieldWithPrefix
+	// direct maps lowercase keys that resolve without runtime state — flat
+	// field aliases and dotted chains through non-pointer nested structs —
+	// to their precomputed parsed paths. It is built once with the
+	// structInfo and immutable afterwards, so parsePathInfo can serve the
+	// common case with a plain map probe instead of the sync.Map below.
+	direct map[string][]pathPart
 	// paths caches parsed paths rooted at this struct type
 	// (map[string][]pathPart); keys are cloned so they never alias reused
 	// request buffers.
