@@ -26,4 +26,4 @@ jobs:
     uses: gofiber/.github/.github/workflows/benchmark.yml@main
     with:
       # pushes are rare here; the cap mainly bounds the data file size
-      max-items-in-chart: 60
+      max-items-in-chart: 180

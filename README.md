@@ -126,6 +126,16 @@ Fiber is an open-source project that runs on donations to pay the bills, e.g., o
     <img width="280" height="96" alt="Blacksmith" src="https://raw.githubusercontent.com/gofiber/.github/main/assets/sponsors/blacksmith.png">
   </a>
 </p>
+<p align="center">
+  <sub><b>Tool Sponsors</b> - supporting Fiber with free IDE licenses and AI credits</sub>
+</p>
+<p align="center">
+  <a href="https://www.jetbrains.com/?from=gofiber" title="JetBrains - IDE licenses"><img width="36" height="36" alt="JetBrains" src="https://github.com/JetBrains.png?size=72"></a>
+  &nbsp;
+  <a href="https://openai.com/?utm_source=gofiber&utm_medium=sponsor&utm_content=readme" title="OpenAI - AI credits"><img width="36" height="36" alt="OpenAI" src="https://github.com/openai.png?size=72"></a>
+  &nbsp;
+  <a href="https://www.anthropic.com/?utm_source=gofiber&utm_medium=sponsor&utm_content=readme" title="Anthropic - AI credits"><img width="36" height="36" alt="Anthropic" src="https://github.com/anthropics.png?size=72"></a>
+</p>
 
 <!-- sponsors -->
 
@@ -141,6 +151,7 @@ Fiber is an open-source project that runs on donations to pay the bills, e.g., o
 
 <table>
 <tr><td valign="top"><strong>🚀 Fiber Hero</strong></td><td><a href="https://www.thanks.dev" title="@thnxdev"><img src="https://github.com/thnxdev.png" width="40" alt="@thnxdev" /></a></td></tr>
+<tr><td valign="top"><strong>🪴 Fiber Friend</strong></td><td><a href="https://github.com/Gl1tchedPixzl" title="@Gl1tchedPixzl"><img src="https://github.com/Gl1tchedPixzl.png" width="26" alt="@Gl1tchedPixzl" /></a></td></tr>
 </table>
 <!-- sponsors -->
 <!-- skip-docs -->
