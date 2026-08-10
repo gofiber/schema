@@ -229,19 +229,25 @@ func TestGenericScalarFallbacks(t *testing.T) {
 }
 
 // Two fields sharing an alias must both land under the key when encoding into
-// a fresh dst (the scratch path's append branch).
+// a fresh dst (the scratch path's append branch), and values longer than
+// maxScratchValueLen must bypass the shared scratch array.
 func TestEncodeDuplicateAliasFreshDst(t *testing.T) {
 	type S struct {
 		A string `schema:"k"`
 		B string `schema:"k"`
 		C string `schema:"c"`
+		L string `schema:"l"`
 	}
+	long := strings.Repeat("x", maxScratchValueLen+1)
 	dst := map[string][]string{}
-	if err := NewEncoder().Encode(S{A: "1", B: "2", C: "3"}, dst); err != nil {
+	if err := NewEncoder().Encode(S{A: "1", B: "2", C: "3", L: long}, dst); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(dst["k"], []string{"1", "2"}) || !reflect.DeepEqual(dst["c"], []string{"3"}) {
 		t.Fatalf("got %v", dst)
+	}
+	if !reflect.DeepEqual(dst["l"], []string{long}) {
+		t.Fatalf("long value got %v", dst["l"])
 	}
 }
 

@@ -21,6 +21,11 @@ var errNotStruct = errors.New("schema: interface must be a struct")
 // would otherwise panic on the first map assignment.
 var errNilDst = errors.New("schema: dst map must not be nil")
 
+// maxScratchValueLen bounds values stored in encode's shared scratch array,
+// capping how much data a surviving dst entry can keep reachable after the
+// caller deletes neighboring keys.
+const maxScratchValueLen = 64
+
 // Encoder encodes values from a struct into url.Values.
 type Encoder struct {
 	cache  *cache
@@ -214,14 +219,16 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	var errs MultiError
 
 	fields := e.structInfo(v.Type())
-	// When dst starts empty (fresh url.Values), single values of distinct keys
-	// share one backing array instead of allocating a 1-element slice each;
-	// the three-index slice caps entries so later appends cannot overwrite a
-	// neighbor. A non-empty dst keeps the single-map-op append pattern.
+	// When dst starts empty (fresh url.Values), single short values of
+	// distinct keys share one backing array instead of allocating a 1-element
+	// slice each; the three-index slice caps entries so later appends cannot
+	// overwrite a neighbor. Long values get their own slice so a surviving
+	// entry cannot pin a deleted neighbor's large string, and a non-empty dst
+	// keeps the single-map-op append pattern.
 	useScratch := len(dst) == 0
 	var scratch []string
 	appendValue := func(name, s string) {
-		if !useScratch {
+		if !useScratch || len(s) > maxScratchValueLen {
 			dst[name] = append(dst[name], s)
 			return
 		}
