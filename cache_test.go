@@ -119,9 +119,8 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 // Decode callers (e.g. Fiber binders) pass map keys aliasing reused request
 // buffers; pathCache must clone the key so later buffer reuse cannot poison it.
 func TestParsePathDetachesCacheKey(t *testing.T) {
-	// Use a slice-index path: statically resolvable keys are served from the
-	// precomputed direct map and never stored in the sync.Map path cache, so
-	// only index-carrying paths exercise the clone-on-store behavior.
+	// Use a slice-index path: statically-resolvable keys are served from the
+	// direct map and never stored in the sync.Map path cache.
 	type Item struct {
 		Value string `schema:"value"`
 	}

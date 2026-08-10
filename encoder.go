@@ -214,6 +214,27 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	var errs MultiError
 
 	fields := e.structInfo(v.Type())
+	// When dst starts empty (fresh url.Values), single values of distinct keys
+	// share one backing array instead of allocating a 1-element slice each;
+	// the three-index slice caps entries so later appends cannot overwrite a
+	// neighbor. A non-empty dst keeps the single-map-op append pattern.
+	useScratch := len(dst) == 0
+	var scratch []string
+	appendValue := func(name, s string) {
+		if !useScratch {
+			dst[name] = append(dst[name], s)
+			return
+		}
+		if old := dst[name]; old != nil {
+			dst[name] = append(old, s)
+			return
+		}
+		if scratch == nil {
+			scratch = make([]string, 0, len(fields))
+		}
+		scratch = append(scratch, s)
+		dst[name] = scratch[len(scratch)-1 : len(scratch) : len(scratch)]
+	}
 	for i := range fields {
 		f := &fields[i]
 		fieldValue := v.Field(f.idx)
@@ -231,7 +252,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			if f.omitEmpty && isZero(fieldValue) {
 				continue
 			}
-			dst[f.name] = append(dst[f.name], f.enc(fieldValue))
+			appendValue(f.name, f.enc(fieldValue))
 			continue
 		}
 
@@ -239,7 +260,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			if f.omitEmpty {
 				continue
 			}
-			dst[f.name] = append(dst[f.name], "null")
+			appendValue(f.name, "null")
 			continue
 		}
 

@@ -170,8 +170,7 @@ func convertUint64(value string) reflect.Value {
 }
 
 // parseNative* adapt the builtin parsers to the (T, bool) shape used by the
-// native slice decode path. They mirror setBuiltinKind's per-kind behavior,
-// including the native-fit guards for int/uint.
+// native slice decode path, mirroring setBuiltinKind's per-kind behavior.
 
 func parseNativeString(s string) (string, bool) { return s, true }
 

@@ -6,9 +6,8 @@ import (
 	"testing"
 )
 
-// Keys served by the precomputed direct-path map must behave exactly like the
-// generic parser: case-insensitive, covering flat aliases and dotted chains
-// through non-pointer nested structs.
+// Keys served by the direct-path map must behave exactly like the generic
+// parser: case-insensitive, covering flat aliases and nested dotted chains.
 func TestDirectPathLookup(t *testing.T) {
 	type Inner struct {
 		Value string `schema:"value"`
@@ -91,9 +90,8 @@ func TestDirectPathLookupFallbacks(t *testing.T) {
 	}
 }
 
-// The native slice decode path must keep the generic path's semantics:
-// comma splitting, zeroEmpty handling, all-or-nothing assignment, and
-// ConversionError details.
+// The native slice decode path must keep the generic path's semantics: comma
+// splitting, zeroEmpty, all-or-nothing assignment, ConversionError details.
 func TestNativeSliceDecode(t *testing.T) {
 	type S struct {
 		Tags   []string  `schema:"tags"`
@@ -180,6 +178,28 @@ func BenchmarkSliceHeavyDecode(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		if err := decoder.Decode(s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Unlike the other encode benchmarks, this one encodes into a fresh map each
+// iteration, matching how callers build url.Values per request.
+func BenchmarkEncodeFreshDst(b *testing.B) {
+	type S struct {
+		A string  `schema:"a"`
+		B int     `schema:"b"`
+		C bool    `schema:"c"`
+		D float64 `schema:"d"`
+		E []int   `schema:"e"`
+		F string  `schema:"f,omitempty"`
+	}
+	s := S{A: "abc", B: 123, C: true, D: 3.14, E: []int{1, 2, 3}}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 8)
+		if err := enc.Encode(&s, vals); err != nil {
 			b.Fatal(err)
 		}
 	}

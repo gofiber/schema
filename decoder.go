@@ -488,6 +488,29 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		return nil
 	}
 
+	// Fast path: plain builtin scalar fields skip the converter/unmarshaler
+	// dispatch below; fastKind was validated at cache-build time.
+	if k := parts[0].field.fastKind; k != reflect.Invalid && len(parts) == 1 && !parts[0].elem {
+		val := ""
+		if len(values) > 0 {
+			val = values[len(values)-1]
+		}
+		if val == "" {
+			if d.zeroEmpty {
+				v.SetZero()
+			}
+			return nil
+		}
+		if _, ok := setBuiltinKind(v, k, val); !ok {
+			return ConversionError{
+				Key:   path,
+				Type:  parts[0].field.typ,
+				Index: -1,
+			}
+		}
+		return nil
+	}
+
 	// Check multipart files
 	if parts[0].field.isMultipart && handleMultipartField(v, files) {
 		return nil
@@ -733,9 +756,8 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 		n++
 	}
 
-	// Exact builtin slice types fill a native Go slice and assign it in one
-	// Set, skipping reflect.MakeSlice and the per-element Index/Set calls.
-	// Named slice or element types fall through to the generic path.
+	// Exact builtin slice types decode without per-element reflect calls;
+	// named slice or element types fall through to the generic path.
 	switch t {
 	case typSliceString:
 		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeString)
@@ -807,11 +829,9 @@ var (
 	typSliceBool    = reflect.TypeOf([]bool(nil))
 )
 
-// decodeNativeSlice mirrors the generic decodeBuiltinSlice loop for a slice
-// field whose type is exactly []T: elements are parsed into a native Go slice
-// and assigned with a single Set, so no reflect calls happen per element. The
-// slice is built detached and only assigned when every value parsed, keeping
-// the all-or-nothing behavior. n is the precomputed element upper bound.
+// decodeNativeSlice mirrors the generic decodeBuiltinSlice loop for a field
+// typed exactly []T, parsing into a native slice assigned only if every value
+// parsed (all-or-nothing). n is the precomputed element upper bound.
 func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, values []string, elemT reflect.Type, n int, split bool, parse func(string) (T, bool)) error {
 	out := make([]T, 0, n)
 	var zero T
@@ -851,9 +871,8 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 			out = append(out, ev)
 		}
 	}
-	// v's type is exactly []T here, so assign through the typed pointer;
-	// this skips reflect.ValueOf's escape of the slice header and Set's
-	// assignability checks.
+	// v's type is exactly []T here; assigning through the typed pointer skips
+	// reflect.ValueOf's slice-header escape and Set's assignability checks.
 	if p, ok := v.Addr().Interface().(*[]T); ok {
 		*p = out
 	} else {
