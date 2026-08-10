@@ -160,6 +160,91 @@ func TestNativeSliceDecode(t *testing.T) {
 	}
 }
 
+// Named slice types take the generic reflect loop, not the native path; its
+// semantics must match the native path's exactly.
+func TestGenericSliceNamedTypes(t *testing.T) {
+	type IDs []int
+	type Tags []string
+	type S struct {
+		IDs  IDs  `schema:"ids"`
+		Tags Tags `schema:"tags"`
+	}
+
+	var s S
+	data := map[string][]string{
+		"ids":  {"1,2", "3"},
+		"tags": {"a", "b,c"},
+	}
+	if err := NewDecoder().Decode(&s, data); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(s.IDs, IDs{1, 2, 3}) || !reflect.DeepEqual(s.Tags, Tags{"a", "b,c"}) {
+		t.Fatalf("got %+v", s)
+	}
+
+	// zeroEmpty fills zero slots; empties are dropped without it.
+	var z S
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	if err := d.Decode(&z, map[string][]string{"ids": {"1,,2", ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(z.IDs, IDs{1, 0, 2, 0}) {
+		t.Fatalf("zeroEmpty got %v", z.IDs)
+	}
+	var trunc S
+	if err := NewDecoder().Decode(&trunc, map[string][]string{"ids": {"1,,2", ""}}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(trunc.IDs, IDs{1, 2}) {
+		t.Fatalf("truncation got %v", trunc.IDs)
+	}
+
+	// Parse failures, both inside a comma list and as a plain value.
+	for _, bad := range []string{"1,x", "x"} {
+		var b S
+		err := NewDecoder().Decode(&b, map[string][]string{"ids": {bad}})
+		if _, ok := err.(MultiError)["ids"].(ConversionError); !ok {
+			t.Fatalf("value %q: want ConversionError, got %v", bad, err)
+		}
+	}
+}
+
+// Fields the fast scalar path skips (pointers) keep their generic behavior.
+func TestGenericScalarFallbacks(t *testing.T) {
+	type S struct {
+		N *int `schema:"n"`
+	}
+
+	// Empty value + ZeroEmpty on a pointer field takes the generic zeroing.
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	var s S
+	if err := d.Decode(&s, map[string][]string{"n": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.N == nil || *s.N != 0 {
+		t.Fatalf("want zeroed *int, got %+v", s.N)
+	}
+}
+
+// Two fields sharing an alias must both land under the key when encoding into
+// a fresh dst (the scratch path's append branch).
+func TestEncodeDuplicateAliasFreshDst(t *testing.T) {
+	type S struct {
+		A string `schema:"k"`
+		B string `schema:"k"`
+		C string `schema:"c"`
+	}
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(S{A: "1", B: "2", C: "3"}, dst); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(dst["k"], []string{"1", "2"}) || !reflect.DeepEqual(dst["c"], []string{"3"}) {
+		t.Fatalf("got %v", dst)
+	}
+}
+
 type sliceHeavyStruct struct {
 	Tags   []string  `schema:"tags"`
 	IDs    []int     `schema:"ids"`

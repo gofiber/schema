@@ -871,13 +871,10 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 			out = append(out, ev)
 		}
 	}
-	// v's type is exactly []T here; assigning through the typed pointer skips
-	// reflect.ValueOf's slice-header escape and Set's assignability checks.
-	if p, ok := v.Addr().Interface().(*[]T); ok {
-		*p = out
-	} else {
-		v.Set(reflect.ValueOf(out))
-	}
+	// v's type is exactly []T here (the dispatch switch guarantees it), so
+	// assign through the typed pointer: no reflect.ValueOf escape, no Set
+	// assignability checks, and a loud panic if the invariant is ever broken.
+	*v.Addr().Interface().(*[]T) = out
 	return nil
 }
 
