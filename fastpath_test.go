@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Keys served by the direct-path map must behave exactly like the generic
@@ -180,6 +181,112 @@ func BenchmarkSliceHeavyDecode(b *testing.B) {
 		if err := decoder.Decode(s, data); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+type fan0 struct {
+	V string `schema:"v"`
+}
+type fan1 struct {
+	A fan0 `schema:"a"`
+	B fan0 `schema:"b"`
+}
+type fan2 struct {
+	A fan1 `schema:"a"`
+	B fan1 `schema:"b"`
+}
+type fan3 struct {
+	A fan2 `schema:"a"`
+	B fan2 `schema:"b"`
+}
+type fan4 struct {
+	A fan3 `schema:"a"`
+	B fan3 `schema:"b"`
+}
+type fan5 struct {
+	A fan4 `schema:"a"`
+	B fan4 `schema:"b"`
+}
+type fan6 struct {
+	A fan5 `schema:"a"`
+	B fan5 `schema:"b"`
+}
+type fan7 struct {
+	A fan6 `schema:"a"`
+	B fan6 `schema:"b"`
+}
+type fan8 struct {
+	A fan7 `schema:"a"`
+	B fan7 `schema:"b"`
+}
+type fan9 struct {
+	A fan8 `schema:"a"`
+	B fan8 `schema:"b"`
+}
+type fan10 struct {
+	A fan9 `schema:"a"`
+	B fan9 `schema:"b"`
+}
+type fan11 struct {
+	A fan10 `schema:"a"`
+	B fan10 `schema:"b"`
+}
+type fan12 struct {
+	A fan11 `schema:"a"`
+	B fan11 `schema:"b"`
+}
+type fan13 struct {
+	A fan12 `schema:"a"`
+	B fan12 `schema:"b"`
+}
+type fan14 struct {
+	A fan13 `schema:"a"`
+	B fan13 `schema:"b"`
+}
+type fan15 struct {
+	A fan14 `schema:"a"`
+	B fan14 `schema:"b"`
+}
+type fan16 struct {
+	A fan15 `schema:"a"`
+	B fan15 `schema:"b"`
+}
+type fan17 struct {
+	A fan16 `schema:"a"`
+	B fan16 `schema:"b"`
+}
+type fan18 struct {
+	A fan17 `schema:"a"`
+	B fan17 `schema:"b"`
+}
+type fan19 struct {
+	A fan18 `schema:"a"`
+	B fan18 `schema:"b"`
+}
+
+// Deep fan-out nesting has exponentially many dotted paths; the direct map
+// must stay capped so the first Decode neither stalls nor retains huge maps.
+func TestDirectPathsCappedForDeepFanout(t *testing.T) {
+	d := NewDecoder()
+	var s fan19
+	deepKey := strings.Repeat("a.", 10) + strings.Repeat("b.", 9) + "v"
+	data := map[string][]string{deepKey: {"deep"}}
+	done := make(chan error, 1)
+	go func() { done <- d.Decode(&s, data) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Decode stalled: direct-path precomputation not capped")
+	}
+	if s.A.A.A.A.A.A.A.A.A.A.B.B.B.B.B.B.B.B.B.V != "deep" {
+		t.Fatal("deep key not decoded")
+	}
+	info := d.cache.get(reflect.TypeOf(s))
+	if len(info.direct) > maxDirectPaths+2 {
+		t.Fatalf("direct map has %d entries, want <= %d", len(info.direct), maxDirectPaths+2)
 	}
 }
 

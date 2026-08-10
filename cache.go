@@ -23,6 +23,11 @@ const maxParserIndex = 1000
 // against the direct-path map; longer keys take the generic path.
 const maxDirectKeyLen = 64
 
+// maxDirectPaths caps the nested entries precomputed per struct type: deep
+// fan-out nesting multiplies dotted chains, and without a cap build time and
+// retained memory grow exponentially. Excess keys use the generic parser.
+const maxDirectPaths = 512
+
 var (
 	errInvalidPath   = errors.New("schema: invalid path")
 	errIndexTooLarge = errors.New("schema: index exceeds parser limit")
@@ -348,31 +353,38 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 // through non-pointer nested struct fields.
 func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 	direct := make(map[string][]pathPart, len(info.fieldsByName))
-	for aliasKey, f := range info.fieldsByName {
-		if strings.IndexByte(aliasKey, '.') >= 0 {
+	// Flat aliases first (linear in field count) so the cap below can never
+	// crowd them out; iterate fields in declaration order, honoring
+	// fieldsByName's first-wins rule.
+	for _, f := range info.fields {
+		if !directEligible(info, f) {
 			continue
 		}
-		if f.isSliceOfStructs && !f.isMultipart && (!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement) {
-			// The path must continue with a slice index; a bare alias is invalid.
-			continue
-		}
-		hop := pathHop{index: f.index, ensure: info.anonymousPtrFields}
-		direct[aliasKey] = []pathPart{{
-			hops:  []pathHop{hop},
+		direct[f.aliasLower] = []pathPart{{
+			hops:  []pathHop{{index: f.index, ensure: info.anonymousPtrFields}},
 			field: f,
 			index: -1,
 		}}
-		if f.typ.Kind() != reflect.Struct {
+	}
+	for _, f := range info.fields {
+		if len(direct) >= maxDirectPaths {
+			break
+		}
+		if !directEligible(info, f) || f.typ.Kind() != reflect.Struct {
 			continue
 		}
 		// Non-pointer struct nesting cannot recurse (the type would be
 		// illegal), so the child's info is always buildable here.
+		hop := pathHop{index: f.index, ensure: info.anonymousPtrFields}
 		for childKey, childParts := range c.get(f.typ).direct {
+			if len(direct) >= maxDirectPaths {
+				break
+			}
 			cp := childParts[0]
 			hops := make([]pathHop, 0, len(cp.hops)+1)
 			hops = append(hops, hop)
 			hops = append(hops, cp.hops...)
-			direct[aliasKey+"."+childKey] = []pathPart{{
+			direct[f.aliasLower+"."+childKey] = []pathPart{{
 				hops:  hops,
 				field: cp.field,
 				index: -1,
@@ -380,6 +392,17 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 		}
 	}
 	return direct
+}
+
+// directEligible reports whether f can serve as a direct-path terminal: it is
+// its alias's first-wins winner, the alias has no dot, and a bare alias is a
+// valid path (slice-of-structs fields require a following slice index).
+func directEligible(info *structInfo, f *fieldInfo) bool {
+	if info.fieldsByName[f.aliasLower] != f || strings.IndexByte(f.aliasLower, '.') >= 0 {
+		return false
+	}
+	needsIndex := f.isSliceOfStructs && !f.isMultipart && (!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement)
+	return !needsIndex
 }
 
 // needsDefaultsWalk reports whether the setDefaults walk can have any effect
