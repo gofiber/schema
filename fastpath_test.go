@@ -323,45 +323,15 @@ type fan11 struct {
 	A fan10 `schema:"a"`
 	B fan10 `schema:"b"`
 }
-type fan12 struct {
-	A fan11 `schema:"a"`
-	B fan11 `schema:"b"`
-}
-type fan13 struct {
-	A fan12 `schema:"a"`
-	B fan12 `schema:"b"`
-}
-type fan14 struct {
-	A fan13 `schema:"a"`
-	B fan13 `schema:"b"`
-}
-type fan15 struct {
-	A fan14 `schema:"a"`
-	B fan14 `schema:"b"`
-}
-type fan16 struct {
-	A fan15 `schema:"a"`
-	B fan15 `schema:"b"`
-}
-type fan17 struct {
-	A fan16 `schema:"a"`
-	B fan16 `schema:"b"`
-}
-type fan18 struct {
-	A fan17 `schema:"a"`
-	B fan17 `schema:"b"`
-}
-type fan19 struct {
-	A fan18 `schema:"a"`
-	B fan18 `schema:"b"`
-}
 
 // Deep fan-out nesting has exponentially many dotted paths; the direct map
 // must stay capped so the first Decode neither stalls nor retains huge maps.
+// Depth stays at 11 (2048 paths, 4x the cap): deeper trees blow up the Go 1.27
+// compiler, which flattens every leaf into a single generated equality func.
 func TestDirectPathsCappedForDeepFanout(t *testing.T) {
 	d := NewDecoder()
-	var s fan19
-	deepKey := strings.Repeat("a.", 10) + strings.Repeat("b.", 9) + "v"
+	var s fan11
+	deepKey := strings.Repeat("a.", 6) + strings.Repeat("b.", 5) + "v"
 	data := map[string][]string{deepKey: {"deep"}}
 	done := make(chan error, 1)
 	go func() { done <- d.Decode(&s, data) }()
@@ -373,7 +343,7 @@ func TestDirectPathsCappedForDeepFanout(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Decode stalled: direct-path precomputation not capped")
 	}
-	if s.A.A.A.A.A.A.A.A.A.A.B.B.B.B.B.B.B.B.B.V != "deep" {
+	if s.A.A.A.A.A.A.B.B.B.B.B.V != "deep" {
 		t.Fatal("deep key not decoded")
 	}
 	info := d.cache.get(reflect.TypeOf(s))
