@@ -3,6 +3,7 @@ package schema
 import (
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	utils "github.com/gofiber/utils/v2"
@@ -168,6 +169,65 @@ func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
 		info.paths.clear()
 		if _, err := d.cache.parsePath("Items.0.Value", typ); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// parsePathInfo rejects a dotless key that misses the direct map without
+// parsing it, which is only sound if every field a bare alias can reach is in
+// that map. Pin the invariant: across a range of struct shapes, a single-
+// segment path must parse exactly when the direct map holds its folded form.
+func TestDirectMapCoversEveryBareAlias(t *testing.T) {
+	t.Parallel()
+
+	type Leaf struct {
+		Value string `schema:"value"`
+	}
+	type Embedded struct {
+		Promoted string `schema:"promoted"`
+	}
+	type Dup struct {
+		A string `schema:"same"`
+		B string `schema:"same"`
+	}
+	type Shapes struct {
+		Embedded
+		Dup
+		Plain      string     `schema:"plain"`
+		MixedCase  string     `schema:"MixedCase"`
+		Nested     Leaf       `schema:"nested"`
+		NestedPtr  *Leaf      `schema:"nestedptr"`
+		Items      []Leaf     `schema:"items"`
+		Scalars    []int      `schema:"scalars"`
+		Skipped    string     `schema:"-"`
+		Unexported string     `schema:"unexported"`
+		Dotted     string     `schema:"dot.ted"`
+		Deep       [][]string `schema:"deep"`
+	}
+
+	types := []reflect.Type{
+		reflect.TypeOf(Leaf{}), reflect.TypeOf(Dup{}),
+		reflect.TypeOf(Embedded{}), reflect.TypeOf(Shapes{}),
+	}
+	// Every alias above, some case variants, and keys that resemble one.
+	keys := []string{
+		"value", "same", "promoted", "plain", "mixedcase", "MixedCase", "MIXEDCASE",
+		"nested", "nestedptr", "items", "scalars", "skipped", "-", "unexported",
+		"dot.ted", "dotted", "deep", "embedded", "dup", "missing", "", "plainx", "Plain",
+	}
+
+	d := NewDecoder()
+	for _, typ := range types {
+		info := d.cache.get(typ)
+		for _, key := range keys {
+			if strings.IndexByte(key, '.') >= 0 {
+				continue // the shortcut only claims anything about dotless keys
+			}
+			_, err := d.cache.parsePath(key, typ)
+			_, inDirect := info.direct[utilstrings.ToLower(key)]
+			if (err == nil) != inDirect {
+				t.Fatalf("%s: parsePath(%q) err=%v but direct map entry=%v", typ, key, err, inDirect)
+			}
 		}
 	}
 }

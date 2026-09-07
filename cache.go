@@ -111,6 +111,17 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 					return parts, nil
 				}
 			}
+			// Both probes have now seen the key in canonical form, and every
+			// field a bare alias can reach is in the direct map (see
+			// buildDirectPaths, which adds the flat aliases before the cap
+			// can truncate anything). A dotless key that missed therefore
+			// names no field, so reject it without consulting the
+			// parsed-path cache or running the parser — unrecognized keys
+			// are a normal part of any query string, and this is the shape
+			// almost all of them have.
+			if strings.IndexByte(p, '.') < 0 {
+				return nil, errInvalidPath
+			}
 		}
 	}
 
