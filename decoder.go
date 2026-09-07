@@ -158,6 +158,13 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 		var requiredBits [requiredBitWords]uint64
 		satisfied, pending = markProvidedDirectly(rootInfo.requiredGroups, src, requiredBits[:])
 	}
+	// Only a struct with a slice of structs can grow anything, and only then
+	// is the tracker worth its zeroing.
+	var grow *growTracker
+	if rootInfo.hasIndexedSlice {
+		var tracker growTracker
+		grow = &tracker
+	}
 	var multiErrors MultiError
 	for path, values := range src {
 		if pending > 0 {
@@ -170,7 +177,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 			if multipartFiles != nil {
 				filesSlice = multipartFiles[path]
 			}
-			if err = d.decode(v, path, parts, values, filesSlice); err != nil {
+			if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
 				multiErrors = appendError(multiErrors, path, err)
 			}
 		} else if err == errInvalidPath { //nolint:errorlint // the sentinel is returned unwrapped; see below
@@ -297,6 +304,24 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 	}
 
 	return errs
+}
+
+// growCap is the capacity to give a slice being grown to n elements. A
+// tracked slice gets room for another doubling, so the indices still to come
+// mostly land inside it; an untracked one gets exactly n, since the extra
+// would never be reused.
+func (d *Decoder) growCap(n int, tracked bool) int {
+	if !tracked {
+		return n
+	}
+	c := 2 * n
+	if c < n || c > d.maxSize+1 { // overflow, or past what maxSize admits
+		c = d.maxSize + 1
+	}
+	if c < n {
+		c = n
+	}
+	return c
 }
 
 func isPointerToStruct(v reflect.Value) bool {
@@ -599,8 +624,49 @@ func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 	return v
 }
 
-// decode fills a struct field using a parsed path.
-func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
+// growTracker remembers which of the destination struct's slice fields a
+// Decode call has already reallocated, and how much room it reserved in each.
+// Fields are keyed by their index in that struct, which is what pathPart's
+// soleIndex carries: only a slice reached by one hop from the root can be
+// tracked, because a deeper path reaches a slice inside some element and the
+// field alone cannot tell that apart from the same field in another element.
+// Four entries cover any realistic struct; further fields simply keep growing
+// exactly, which only costs time.
+type growTracker struct {
+	fields [4]int
+	caps   [4]int
+	n      int
+}
+
+// reserved returns the capacity this call gave the slice at struct field
+// index i, or 0 if it has not reallocated that one.
+func (g *growTracker) reserved(i int) int {
+	for j := 0; j < g.n; j++ {
+		if g.fields[j] == i {
+			return g.caps[j]
+		}
+	}
+	return 0
+}
+
+func (g *growTracker) record(i, c int) {
+	for j := 0; j < g.n; j++ {
+		if g.fields[j] == i {
+			g.caps[j] = c
+			return
+		}
+	}
+	if g.n < len(g.fields) {
+		g.fields[g.n] = i
+		g.caps[g.n] = c
+		g.n++
+	}
+}
+
+// decode fills a struct field using a parsed path. grow is non-nil only for
+// the outermost call of a path, which is where slice-of-structs growth can be
+// tracked.
+func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader, grow *growTracker) error {
 	// Get the field walking the struct fields by index. Almost every path is
 	// a single hop into a field of v, which needs none of the loop's
 	// bookkeeping.
@@ -661,18 +727,34 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		if idx > d.maxSize {
 			return fmt.Errorf("%v index %d is larger than the configured maxSize %d", v.Kind(), idx, d.maxSize)
 		}
-		if v.IsNil() || v.Len() < idx+1 {
-			// Grow into a fresh backing array: extending within existing
-			// capacity would write into memory the caller may still share
-			// through other slices aliasing the original array.
-			value := reflect.MakeSlice(t, idx+1, idx+1)
-			if v.Len() > 0 {
-				// Resize it.
-				reflect.Copy(value, v)
+		if n := idx + 1; v.IsNil() || v.Len() < n {
+			// Indices arrive in map order, so a slice is typically grown
+			// several times per call. Extending one this call allocated is
+			// free — the room past its length is ours, freshly zeroed, and
+			// nothing else can see it. Only a slice reached by one hop from
+			// the destination struct qualifies; see growTracker.
+			owner := -1
+			if grow != nil {
+				owner = parts[0].soleIndex
 			}
-			v.Set(value)
+			if owner >= 0 && n <= v.Cap() && grow.reserved(owner) >= n {
+				v.SetLen(n)
+			} else {
+				// Otherwise grow into a fresh backing array: extending within
+				// the existing capacity would write into memory the caller
+				// may still share through other slices aliasing it.
+				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
+				if v.Len() > 0 {
+					// Resize it.
+					reflect.Copy(value, v)
+				}
+				v.Set(value)
+				if owner >= 0 {
+					grow.record(owner, value.Cap())
+				}
+			}
 		}
-		return d.decode(v.Index(idx), path, parts[1:], values, files)
+		return d.decode(v.Index(idx), path, parts[1:], values, files, nil)
 	}
 
 	// Get the converter early in case there is one for a slice type.

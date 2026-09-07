@@ -153,7 +153,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		// when the structInfo was built, so the decoder walks plain indices
 		// instead of repeating FieldByName lookups on every Decode call.
 		hopBuf = append(hopBuf, pathHop{index: field.index, ensure: struc.anonymousPtrFields})
-		if field.isSliceOfStructs && !field.isMultipart && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
+		if field.takesIndex() {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
 			//
@@ -449,6 +449,12 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			info.fieldsByName[field.aliasLower] = field
 		}
 	}
+	for _, f := range info.fields {
+		if f.takesIndex() {
+			info.hasIndexedSlice = true
+			break
+		}
+	}
 	info.requiredGroups = c.buildRequiredFields(info)
 	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
 	info.direct = c.buildDirectPaths(info)
@@ -515,8 +521,15 @@ func directEligible(info *structInfo, f *fieldInfo) bool {
 	if info.fieldsByName[f.aliasLower] != f || strings.IndexByte(f.aliasLower, '.') >= 0 {
 		return false
 	}
-	needsIndex := f.isSliceOfStructs && !f.isMultipart && (!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement)
-	return !needsIndex
+	return !f.takesIndex()
+}
+
+// takesIndex reports whether a path through f must carry a slice element
+// index: f is a slice of structs the decoder walks into element by element,
+// rather than one it hands to a multipart binder or a TextUnmarshaler whole.
+func (f *fieldInfo) takesIndex() bool {
+	return f.isSliceOfStructs && !f.isMultipart &&
+		(!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement)
 }
 
 // needsDefaultsWalk reports whether the setDefaults walk can have any effect
@@ -658,6 +671,9 @@ type structInfo struct {
 	// paths caches parsed paths rooted at this struct type; keys are cloned
 	// so they never alias reused request buffers.
 	paths pathCache
+	// hasIndexedSlice reports whether any field's paths carry a slice element
+	// index, and so may grow that slice as keys arrive.
+	hasIndexedSlice bool
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
 	// anonymous embedded pointer field (which the walk allocates) exists

@@ -2501,6 +2501,128 @@ func TestDecodeSliceIndexGrowth(t *testing.T) {
 	}
 }
 
+// Growing a slice of structs reuses capacity this call reserved, but must
+// never extend one the caller supplied: memory past its length may still be
+// aliased by another of their slices.
+func TestSliceGrowthDoesNotExtendCallerCapacity(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		V string `schema:"v"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	backing := make([]item, 1, 8)
+	backing[0] = item{V: "keep"}
+	tail := backing[1:8:8] // the caller keeps an alias into the spare capacity
+	for i := range tail {
+		tail[i] = item{V: "alias"}
+	}
+
+	c := cart{Items: backing}
+	d := NewDecoder()
+	if err := d.Decode(&c, map[string][]string{"items.3.v": {"new"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range tail {
+		if got.V != "alias" {
+			t.Fatalf("caller's aliased element %d overwritten: %q", i, got.V)
+		}
+	}
+	if len(c.Items) != 4 || c.Items[0].V != "keep" || c.Items[3].V != "new" {
+		t.Fatalf("unexpected decode result: %+v", c.Items)
+	}
+	if c.Items[1].V != "" || c.Items[2].V != "" {
+		t.Fatalf("gap elements should be zero: %+v", c.Items)
+	}
+}
+
+// The same struct type can sit at two places in a tree, so its slice field is
+// two different slices. Growing one must never be mistaken for growing the
+// other, whatever order the keys arrive in.
+func TestSliceGrowthKeepsSiblingSlicesApart(t *testing.T) {
+	t.Parallel()
+
+	type inner struct {
+		V string `schema:"v"`
+	}
+	type mid struct {
+		Items []inner `schema:"items"`
+	}
+	type outer struct {
+		X mid `schema:"x"`
+		Y mid `schema:"y"`
+	}
+
+	d := NewDecoder()
+	for i := 0; i < 200; i++ { // map order varies, so repeat
+		var o outer
+		if err := d.Decode(&o, map[string][]string{
+			"x.items.0.v": {"x0"},
+			"x.items.4.v": {"x4"},
+			"y.items.1.v": {"y1"},
+			"y.items.2.v": {"y2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(o.X.Items) != 5 || o.X.Items[0].V != "x0" || o.X.Items[4].V != "x4" {
+			t.Fatalf("X: %+v", o.X.Items)
+		}
+		if len(o.Y.Items) != 3 || o.Y.Items[1].V != "y1" || o.Y.Items[2].V != "y2" {
+			t.Fatalf("Y: %+v", o.Y.Items)
+		}
+		for _, e := range []string{o.X.Items[1].V, o.X.Items[2].V, o.X.Items[3].V, o.Y.Items[0].V} {
+			if e != "" {
+				t.Fatalf("gap element not zero: %+v %+v", o.X.Items, o.Y.Items)
+			}
+		}
+	}
+}
+
+// Every index must land in the right element no matter what order the source
+// map hands them over, and the gaps between them must stay zero.
+func TestSliceGrowthFillsEveryIndex(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	const n = 60
+	src := map[string][]string{}
+	for i := 0; i < n; i += 2 { // leave every other index empty
+		idx := strconv.Itoa(i)
+		src["items."+idx+".name"] = []string{"n" + idx}
+		src["items."+idx+".price"] = []string{idx}
+	}
+
+	d := NewDecoder()
+	for round := 0; round < 50; round++ {
+		var c cart
+		if err := d.Decode(&c, src); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.Items) != n-1 {
+			t.Fatalf("len = %d, want %d", len(c.Items), n-1)
+		}
+		for i, got := range c.Items {
+			want := item{}
+			if i%2 == 0 {
+				want = item{Name: "n" + strconv.Itoa(i), Price: i}
+			}
+			if got != want {
+				t.Fatalf("element %d = %+v, want %+v", i, got, want)
+			}
+		}
+	}
+}
+
 func BenchmarkSliceManyIndicesDecode(b *testing.B) {
 	type item struct {
 		Name  string `schema:"name"`
