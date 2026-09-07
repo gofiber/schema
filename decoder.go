@@ -272,7 +272,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 		}
 	}
 
-	for _, f := range struc.fields {
+	for _, f := range struc.defaultFields {
 		vCurrent := walkIndexChain(v, f.index)
 		if !vCurrent.IsValid() {
 			// Unreachable behind an unsettable nil embedded pointer.

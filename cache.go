@@ -441,7 +441,10 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	for _, f := range info.fields {
 		if f.takesIndex() {
 			info.hasIndexedSlice = true
-			break
+		}
+		if k := f.typ.Kind(); f.def != nil || k == reflect.Struct ||
+			(k == reflect.Ptr && f.typ.Elem().Kind() == reflect.Struct) {
+			info.defaultFields = append(info.defaultFields, f)
 		}
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
@@ -665,6 +668,10 @@ type structInfo struct {
 	// hasIndexedSlice reports whether any field's paths carry a slice element
 	// index, and so may grow that slice while decoding.
 	hasIndexedSlice bool
+	// defaultFields are the fields the setDefaults walk has to visit: those
+	// with a default, and the structs and pointers to structs it descends
+	// into. The rest of the fields can never be affected by it.
+	defaultFields []*fieldInfo
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
 	// anonymous embedded pointer field (which the walk allocates) exists

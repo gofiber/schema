@@ -4116,6 +4116,28 @@ func TestDefaultsAreFreshPerDecode(t *testing.T) {
 	}
 }
 
+// A wide request struct in which only two fields carry defaults: the walk
+// must not pay for the twenty-odd plain fields around them.
+type defaultsWide struct {
+	F01, F02, F03, F04, F05, F06, F07, F08 string `schema:"f01"`
+	F09, F10, F11, F12, F13, F14, F15, F16 string `schema:"f09"`
+	F17, F18, F19, F20, F21, F22, F23, F24 int    `schema:"f17"`
+	Size                                   int    `schema:"size,default:20"`
+	Sort                                   string `schema:"sort,default:created"`
+}
+
+func BenchmarkDecodeWithDefaultsWide(b *testing.B) {
+	src := map[string][]string{"f01": {"a"}, "f09": {"b"}, "f17": {"3"}}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r defaultsWide
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkDecodeWithDefaults(b *testing.B) {
 	src := map[string][]string{
 		"q":         {"shoes"},
