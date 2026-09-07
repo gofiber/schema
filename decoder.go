@@ -505,6 +505,36 @@ func isMultipartField(typ reflect.Type) bool {
 	return false
 }
 
+// walkHops follows a path to the target field, dereferencing pointers and
+// allocating the embedded pointers promoted fields on the way need. It
+// returns the zero Value when an unsettable nil embedded pointer blocks the
+// walk, which the caller treats as an unreachable field.
+func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
+	for _, hop := range hops {
+		// A previous hop may have been blocked by an unsettable nil
+		// embedded pointer; the field is unreachable then.
+		if !v.IsValid() {
+			return v
+		}
+		if v.Kind() == reflect.Ptr {
+			if v.IsNil() {
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			v = v.Elem()
+		}
+
+		// Allocate embedded anonymous pointers required for promoted fields.
+		for _, idx := range hop.ensure {
+			if f := v.Field(idx); f.IsNil() {
+				f.Set(reflect.New(f.Type().Elem()))
+			}
+		}
+
+		v = walkIndexChain(v, hop.index)
+	}
+	return v
+}
+
 // walkIndexChain walks v along a struct field index chain. Chains longer
 // than one element traverse embedded structs; intermediate nil pointers are
 // allocated so promoted fields stay reachable. It returns the zero Value
@@ -529,28 +559,14 @@ func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 
 // decode fills a struct field using a parsed path.
 func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader) error {
-	// Get the field walking the struct fields by index.
-	for _, hop := range parts[0].hops {
-		// A previous hop may have been blocked by an unsettable nil
-		// embedded pointer; the field is unreachable then.
-		if !v.IsValid() {
-			return nil
-		}
-		if v.Kind() == reflect.Ptr {
-			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
-			}
-			v = v.Elem()
-		}
-
-		// Allocate embedded anonymous pointers required for promoted fields.
-		for _, idx := range hop.ensure {
-			if f := v.Field(idx); f.IsNil() {
-				f.Set(reflect.New(f.Type().Elem()))
-			}
-		}
-
-		v = walkIndexChain(v, hop.index)
+	// Get the field walking the struct fields by index. Almost every path is
+	// a single hop into a field of v, which needs none of the loop's
+	// bookkeeping.
+	if idx := parts[0].soleIndex; idx >= 0 && v.Kind() == reflect.Struct {
+		v = v.Field(idx)
+	} else if v = walkHops(v, parts[0].hops); !v.IsValid() {
+		// Unreachable behind an unsettable nil embedded pointer.
+		return nil
 	}
 
 	// Don't even bother for unexported fields.

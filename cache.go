@@ -170,9 +170,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 				return nil, errIndexTooLarge
 			}
 			parts = append(parts, pathPart{
-				hops:  hops,
-				field: field,
-				index: int(index64),
+				hops:      hops,
+				field:     field,
+				index:     int(index64),
+				soleIndex: soleHopIndex(hops),
 			})
 			hops = nil
 
@@ -209,10 +210,11 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	// Add the remaining. A part without hops means the path terminated at a
 	// slice index ("a.0"), so the decoder receives a slice element there.
 	parts = append(parts, pathPart{
-		hops:  hops,
-		field: field,
-		index: -1,
-		elem:  len(hops) == 0,
+		hops:      hops,
+		field:     field,
+		index:     -1,
+		soleIndex: soleHopIndex(hops),
+		elem:      len(hops) == 0,
 	})
 
 	// Detach the key: callers may pass strings aliasing reused request buffers.
@@ -458,10 +460,12 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 		if !directEligible(info, f) {
 			continue
 		}
+		hops := []pathHop{{index: f.index, ensure: info.anonymousPtrFields}}
 		direct[f.aliasLower] = []pathPart{{
-			hops:  []pathHop{{index: f.index, ensure: info.anonymousPtrFields}},
-			field: f,
-			index: -1,
+			hops:      hops,
+			field:     f,
+			index:     -1,
+			soleIndex: soleHopIndex(hops),
 		}}
 	}
 	for _, f := range info.fields {
@@ -483,9 +487,10 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 			hops = append(hops, hop)
 			hops = append(hops, cp.hops...)
 			direct[f.aliasLower+"."+childKey] = []pathPart{{
-				hops:  hops,
-				field: cp.field,
-				index: -1,
+				hops:      hops,
+				field:     cp.field,
+				index:     -1,
+				soleIndex: soleHopIndex(hops),
 			}}
 		}
 	}
@@ -800,10 +805,24 @@ type pathPart struct {
 	field *fieldInfo
 	hops  []pathHop // path to the field: walks structs using field indices.
 	index int       // struct index in slices of structs.
+	// soleIndex is the single struct field index hops walks, or -1 when the
+	// walk needs the general loop; see soleHopIndex.
+	soleIndex int
 	// elem marks a terminal part whose path ended at a slice index ("a.0"):
 	// the decoder's value is then an element of the slice field rather than
 	// the field itself.
 	elem bool
+}
+
+// soleHopIndex returns the single struct field index hops walks, or -1 when
+// the walk needs decode's general loop: several hops, a promoted field's
+// index chain, or embedded pointers to allocate on the way. Nearly every path
+// is the simple case, which decode can then follow with one Value.Field.
+func soleHopIndex(hops []pathHop) int {
+	if len(hops) != 1 || len(hops[0].ensure) != 0 || len(hops[0].index) != 1 {
+		return -1
+	}
+	return hops[0].index[0]
 }
 
 // pathHop describes one named-field lookup along a path. index is the field
