@@ -2,7 +2,9 @@ package schema
 
 import (
 	"fmt"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +132,286 @@ func TestCompat(t *testing.T) {
 
 	if *src != *dst {
 		t.Errorf("Decoder-Encoder compatibility: expected %v, got %v\n", src, dst)
+	}
+}
+
+// Integer fields are routed to width-specific utils formatters; check each
+// against strconv over its full, or boundary, range.
+func TestEncodeIntegerWidths(t *testing.T) {
+	t.Parallel()
+
+	type sized struct {
+		I8  int8   `schema:"i8"`
+		I16 int16  `schema:"i16"`
+		I32 int32  `schema:"i32"`
+		I64 int64  `schema:"i64"`
+		I   int    `schema:"i"`
+		U8  uint8  `schema:"u8"`
+		U16 uint16 `schema:"u16"`
+		U32 uint32 `schema:"u32"`
+		U64 uint64 `schema:"u64"`
+		U   uint   `schema:"u"`
+	}
+
+	enc := NewEncoder()
+	check := func(s sized) {
+		t.Helper()
+		vals := make(map[string][]string)
+		if err := enc.Encode(&s, vals); err != nil {
+			t.Fatalf("Encode(%+v): %v", s, err)
+		}
+		for key, want := range map[string]string{
+			"i8":  strconv.FormatInt(int64(s.I8), 10),
+			"i16": strconv.FormatInt(int64(s.I16), 10),
+			"i32": strconv.FormatInt(int64(s.I32), 10),
+			"i64": strconv.FormatInt(s.I64, 10),
+			"i":   strconv.FormatInt(int64(s.I), 10),
+			"u8":  strconv.FormatUint(uint64(s.U8), 10),
+			"u16": strconv.FormatUint(uint64(s.U16), 10),
+			"u32": strconv.FormatUint(uint64(s.U32), 10),
+			"u64": strconv.FormatUint(s.U64, 10),
+			"u":   strconv.FormatUint(uint64(s.U), 10),
+		} {
+			if got := vals[key]; len(got) != 1 || got[0] != want {
+				t.Fatalf("%s of %+v = %v, want %q", key, s, got, want)
+			}
+		}
+	}
+
+	// The 8- and 16-bit widths are small enough to cover exhaustively.
+	for n := 0; n < 1<<16; n++ {
+		check(sized{
+			I8: int8(n), I16: int16(n), U8: uint8(n), U16: uint16(n),
+			I32: int32(n), I64: int64(n), I: n,
+			U32: uint32(n), U64: uint64(n), U: uint(n),
+		})
+	}
+	for _, n := range []int64{
+		math.MinInt32, math.MinInt32 + 1, -100, -99, -1, 0, 1, 99, 100,
+		math.MaxInt32 - 1, math.MaxInt32, math.MaxInt64, math.MinInt64,
+	} {
+		check(sized{
+			I32: int32(n), I64: n, I: int(n),
+			U32: uint32(n), U64: uint64(n), U: uint(n),
+		})
+	}
+	for _, n := range []uint64{
+		0, 1, 99, 100, math.MaxUint32 - 1, math.MaxUint32, math.MaxUint64,
+	} {
+		check(sized{U32: uint32(n), U64: n, U: uint(n)})
+	}
+}
+
+// encode skips reading a key back before writing it when the plan writes
+// every key once. The shapes that break that — duplicate aliases, and nested
+// structs whose keys land in the same map — must still accumulate values.
+func TestEncodeRepeatedKeys(t *testing.T) {
+	t.Parallel()
+
+	type dup struct {
+		A string `schema:"same"`
+		B string `schema:"same"`
+		C int    `schema:"same"`
+	}
+	vals := make(map[string][]string)
+	if err := NewEncoder().Encode(&dup{A: "a", B: "b", C: 7}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["same"]; len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "7" {
+		t.Fatalf("duplicate aliases lost values: %v", got)
+	}
+
+	// A nested struct is encoded into the same map without a prefix, so its
+	// key collides with the outer one.
+	type inner struct {
+		V string `schema:"shared"`
+	}
+	type outerVal struct {
+		Inner inner  `schema:"inner"`
+		V     string `schema:"shared"`
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerVal{Inner: inner{V: "in"}, V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("nested struct key collision lost values: %v", got)
+	}
+
+	// Same through a pointer to a struct, which recurses when non-nil and
+	// writes its own key when nil.
+	type outerPtr struct {
+		Inner *inner `schema:"shared"`
+		V     string `schema:"shared"`
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerPtr{Inner: &inner{V: "in"}, V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("pointer struct key collision lost values: %v", got)
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerPtr{V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("nil pointer struct key collision lost values: %v", got)
+	}
+
+	// The flag itself: a flat struct with distinct names is the only shape
+	// the fast path may claim.
+	type flat struct {
+		A string `schema:"a"`
+		B int    `schema:"b"`
+	}
+	enc := NewEncoder()
+	for _, tc := range []struct {
+		typ  reflect.Type
+		want bool
+	}{
+		{reflect.TypeOf(flat{}), true},
+		{reflect.TypeOf(dup{}), false},
+		{reflect.TypeOf(outerVal{}), false},
+		{reflect.TypeOf(outerPtr{}), false},
+	} {
+		if _, got := enc.structInfo(tc.typ); got != tc.want {
+			t.Fatalf("%s: freshKeys=%v, want %v", tc.typ, got, tc.want)
+		}
+	}
+}
+
+// Now that the plan settles which applies, omitempty on a struct field must
+// still honour an IsZero method, and still fall back to comparing fields.
+func TestOmitEmptyStructFields(t *testing.T) {
+	t.Parallel()
+
+	type plain struct {
+		A int
+		B string
+	}
+	type S struct {
+		T     time.Time `schema:"t,omitempty"`
+		P     plain     `schema:"p,omitempty"`
+		Keep  time.Time `schema:"keep"`
+		After string    `schema:"after"`
+	}
+
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tv, _ := reflect.TypeAssert[time.Time](v)
+		return tv.Format(time.RFC3339)
+	})
+	enc.RegisterEncoder(plain{}, func(v reflect.Value) string {
+		pv, _ := reflect.TypeAssert[plain](v)
+		return fmt.Sprintf("%d/%s", pv.A, pv.B)
+	})
+
+	// Zero values of both shapes are dropped; the field without omitempty and
+	// the one after them are not.
+	vals := make(map[string][]string)
+	if err := enc.Encode(&S{After: "x"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vals["t"]; ok {
+		t.Errorf("zero time.Time should be omitted: %v", vals["t"])
+	}
+	if _, ok := vals["p"]; ok {
+		t.Errorf("zero struct should be omitted: %v", vals["p"])
+	}
+	if got := vals["after"]; len(got) != 1 || got[0] != "x" {
+		t.Errorf("after = %v", got)
+	}
+	if len(vals["keep"]) != 1 {
+		t.Errorf("field without omitempty should be encoded: %v", vals["keep"])
+	}
+
+	// Non-zero values of both shapes are kept.
+	vals = make(map[string][]string)
+	src := S{T: time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC), P: plain{A: 1, B: "b"}}
+	if err := enc.Encode(&src, vals); err != nil {
+		t.Fatal(err)
+	}
+	if len(vals["t"]) != 1 {
+		t.Errorf("non-zero time.Time should be encoded: %v", vals["t"])
+	}
+	if got := vals["p"]; len(got) != 1 || got[0] != "1/b" {
+		t.Errorf("non-zero struct should be encoded: %v", got)
+	}
+
+	// A non-addressable source takes the same decisions.
+	vals = make(map[string][]string)
+	if err := enc.Encode(src, vals); err != nil {
+		t.Fatal(err)
+	}
+	if len(vals["t"]) != 1 || len(vals["p"]) != 1 {
+		t.Errorf("non-addressable source dropped values: %v", vals)
+	}
+	vals = make(map[string][]string)
+	if err := enc.Encode(S{After: "x"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vals["t"]; ok {
+		t.Errorf("non-addressable zero time.Time should be omitted: %v", vals["t"])
+	}
+	if _, ok := vals["p"]; ok {
+		t.Errorf("non-addressable zero struct should be omitted: %v", vals["p"])
+	}
+}
+
+func BenchmarkOmitEmptyStructEncode(b *testing.B) {
+	type S struct {
+		T time.Time `schema:"t,omitempty"`
+		A string    `schema:"a"`
+	}
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tv, _ := reflect.TypeAssert[time.Time](v)
+		return tv.Format(time.RFC3339)
+	})
+	s := S{A: "x"}
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 4)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkSizedIntegerEncode(b *testing.B) {
+	type sized struct {
+		I8  int8   `schema:"i8"`
+		I16 int16  `schema:"i16"`
+		I32 int32  `schema:"i32"`
+		U8  uint8  `schema:"u8"`
+		U16 uint16 `schema:"u16"`
+		U32 uint32 `schema:"u32"`
+	}
+	s := sized{I8: -12, I16: -1234, I32: -123456, U8: 12, U16: 1234, U32: 123456}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 8)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFloatFieldEncode(b *testing.B) {
+	type floats struct {
+		A float64 `schema:"a"`
+		B float32 `schema:"b"`
+	}
+	s := floats{A: 3.14159, B: 2.71828}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 4)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

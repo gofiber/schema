@@ -1,10 +1,16 @@
 package schema
 
 import (
+	"fmt"
 	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 
 	utils "github.com/gofiber/utils/v2"
+	utilstrings "github.com/gofiber/utils/v2/strings"
 )
 
 func TestNextPathSegment(t *testing.T) {
@@ -109,10 +115,166 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 	b.ReportAllocs()
 	info := d.cache.get(typ)
 	for b.Loop() {
-		info.paths.Clear()
+		info.paths.clear()
 		if _, err := d.cache.parsePath("items.0.value", typ); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// foldASCIILower backs the allocation-free case-insensitive probes, so it has
+// to agree with the utils folder it stands in for at every length, and leave
+// non-ASCII bytes untouched.
+func TestFoldASCIILower(t *testing.T) {
+	t.Parallel()
+
+	alphabet := make([]byte, 0, 256)
+	for c := 0; c < 256; c++ {
+		alphabet = append(alphabet, byte(c))
+	}
+
+	for n := 0; n <= maxDirectKeyLen; n++ {
+		for off := 0; off < 256; off++ {
+			in := make([]byte, n)
+			for i := range in {
+				in[i] = alphabet[(off+i*7)%256]
+			}
+			src := string(in)
+			var buf [maxDirectKeyLen]byte
+			changed := foldASCIILower(buf[:], src)
+			got := string(buf[:n])
+			want := utilstrings.ToLower(src)
+			if got != want {
+				t.Fatalf("foldASCIILower(%q) = %q, want %q", src, got, want)
+			}
+			if changed != (got != src) {
+				t.Fatalf("foldASCIILower(%q) reported changed=%v, want %v", src, changed, got != src)
+			}
+		}
+	}
+}
+
+// A mixed-case path the direct map cannot answer walks the generic parser,
+// which folds every segment before its field lookup; that must not allocate.
+func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
+	type Nested struct {
+		Value string `schema:"value"`
+	}
+	type Outer struct {
+		Items []Nested `schema:"items"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(Outer{})
+	b.ReportAllocs()
+	info := d.cache.get(typ)
+	for b.Loop() {
+		info.paths.clear()
+		if _, err := d.cache.parsePath("Items.0.Value", typ); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// parsePathInfo rejects a dotless key that misses the direct map without
+// parsing it, which is only sound if every field a bare alias can reach is in
+// that map: a single-segment path must parse exactly when the map holds its
+// folded form.
+func TestDirectMapCoversEveryBareAlias(t *testing.T) {
+	t.Parallel()
+
+	type Leaf struct {
+		Value string `schema:"value"`
+	}
+	type Embedded struct {
+		Promoted string `schema:"promoted"`
+	}
+	type Dup struct {
+		A string `schema:"same"`
+		B string `schema:"same"`
+	}
+	type Shapes struct {
+		Embedded
+		Dup
+		Plain      string     `schema:"plain"`
+		MixedCase  string     `schema:"MixedCase"`
+		Nested     Leaf       `schema:"nested"`
+		NestedPtr  *Leaf      `schema:"nestedptr"`
+		Items      []Leaf     `schema:"items"`
+		Scalars    []int      `schema:"scalars"`
+		Skipped    string     `schema:"-"`
+		Unexported string     `schema:"unexported"`
+		Dotted     string     `schema:"dot.ted"`
+		Deep       [][]string `schema:"deep"`
+	}
+
+	types := []reflect.Type{
+		reflect.TypeOf(Leaf{}), reflect.TypeOf(Dup{}),
+		reflect.TypeOf(Embedded{}), reflect.TypeOf(Shapes{}),
+	}
+	// Every alias above, some case variants, and keys that only resemble one.
+	keys := []string{
+		"value", "same", "promoted", "plain", "mixedcase", "MixedCase", "MIXEDCASE",
+		"nested", "nestedptr", "items", "scalars", "skipped", "-", "unexported",
+		"dot.ted", "dotted", "deep", "embedded", "dup", "missing", "", "plainx", "Plain",
+	}
+
+	d := NewDecoder()
+	for _, typ := range types {
+		info := d.cache.get(typ)
+		for _, key := range keys {
+			if strings.IndexByte(key, '.') >= 0 {
+				continue // the shortcut only claims anything about dotless keys
+			}
+			_, err := d.cache.parsePath(key, typ)
+			_, inDirect := info.direct[utilstrings.ToLower(key)]
+			if (err == nil) != inDirect {
+				t.Fatalf("%s: parsePath(%q) err=%v but direct map entry=%v", typ, key, err, inDirect)
+			}
+		}
+	}
+}
+
+// The path cache seals and spills under concurrent writers; every path must
+// still resolve to its own index whichever side of the seal it landed on.
+func TestPathCacheConcurrentSpill(t *testing.T) {
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	const goroutines, per = 8, maxFastPaths/2 + 64 // together well past the seal
+
+	d := NewDecoder()
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				idx := (g*per + i) % (maxFastPaths + 128) // overlap between goroutines
+				key := "items." + strconv.Itoa(idx) + ".value"
+				var s S
+				if err := d.Decode(&s, map[string][]string{key: {key}}); err != nil {
+					errs <- err
+					return
+				}
+				if len(s.Items) != idx+1 || s.Items[idx].Value != key {
+					errs <- fmt.Errorf("%s decoded into %d items, [%d]=%q", key, len(s.Items), idx, s.Items[idx].Value)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	info := d.cache.get(reflect.TypeOf(S{}))
+	if !info.paths.sealed.Load() {
+		t.Fatal("expected the cache to have sealed")
 	}
 }
 
@@ -135,15 +297,112 @@ func TestParsePathDetachesCacheKey(t *testing.T) {
 	}
 	copy(buf, "xtems.9.qalue") // simulate fasthttp buffer reuse mutating the key bytes
 
-	count := 0
-	d.cache.get(reflect.TypeOf(s)).paths.Range(func(key, _ any) bool {
-		count++
-		if k := key.(string); k != "items.0.value" {
-			t.Fatalf("path cache key mutated to %q; key must be cloned before caching", k)
+	keys := cachedPathKeys(&d.cache.get(reflect.TypeOf(s)).paths)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 cached path, got %d (%v)", len(keys), keys)
+	}
+	if keys[0] != "items.0.value" {
+		t.Fatalf("path cache key mutated to %q; key must be cloned before caching", keys[0])
+	}
+}
+
+// cachedPathKeys lists everything the cache holds, published map and spill.
+func cachedPathKeys(c *pathCache) []string {
+	var keys []string
+	if m := c.fast.Load(); m != nil {
+		for k := range *m {
+			keys = append(keys, k)
 		}
+	}
+	c.spill.Range(func(k, _ any) bool {
+		keys = append(keys, k.(string))
 		return true
 	})
-	if count != 1 {
-		t.Fatalf("expected 1 cached path, got %d", count)
+	return keys
+}
+
+// Past maxFastPaths the cache spills instead of growing the map it copies on
+// every write, but every path must still be cached and served.
+func TestPathCacheSpill(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(S{})
+	info := d.cache.get(typ)
+
+	const n = maxFastPaths + 64
+	want := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		want = append(want, "items."+strconv.Itoa(i)+".value")
+	}
+	for _, p := range want {
+		if _, err := d.cache.parsePath(p, typ); err != nil {
+			t.Fatalf("parsePath(%q): %v", p, err)
+		}
+	}
+	if !info.paths.sealed.Load() {
+		t.Fatal("cache should be sealed past maxFastPaths")
+	}
+	if got := len(*info.paths.fast.Load()); got != maxFastPaths {
+		t.Fatalf("published map holds %d paths, want %d", got, maxFastPaths)
+	}
+	// Every path, spilled or not, still resolves to the right index.
+	for i, p := range want {
+		parts, ok := info.paths.load(p)
+		if !ok {
+			t.Fatalf("path %q not cached", p)
+		}
+		if parts[0].index != i {
+			t.Fatalf("path %q cached as index %d, want %d", p, parts[0].index, i)
+		}
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != n {
+		t.Fatalf("cache holds %d paths, want %d", got, n)
+	}
+
+	info.paths.clear()
+	if info.paths.sealed.Load() || info.paths.fast.Load() != nil {
+		t.Fatal("clear must reset the cache")
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != 0 {
+		t.Fatalf("cache holds %d paths after clear, want 0", got)
+	}
+}
+
+// The parser sizes its hop and part slices from a key's separator count, and
+// that count arrives unvalidated: a key that is mostly separators is rejected
+// at its first segment, so it must not reserve in proportion to its length
+// first.
+func TestParserReservationDoesNotScaleWithSeparators(t *testing.T) {
+	c := newCache()
+	typ := reflect.TypeOf(struct{ A string }{})
+
+	const iters = 100
+	allocated := func(dots int) uint64 {
+		key := "a" + strings.Repeat(".", dots)
+		if _, err := c.parsePath(key, typ); err == nil {
+			t.Fatalf("parsePath(%d separators) succeeded, want rejection", dots)
+		}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for i := 0; i < iters; i++ {
+			_, _ = c.parsePath(key, typ)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	short := allocated(maxPathReserve)
+	long := allocated(maxPathReserve * 512)
+	if long > short*4 {
+		t.Fatalf("%d separators allocate %d bytes over %d rejections against %d for %d separators: the reservation follows the key length",
+			maxPathReserve*512, long, iters, short, maxPathReserve)
 	}
 }

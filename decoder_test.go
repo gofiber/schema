@@ -8,6 +8,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
+	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
 	"strconv"
@@ -2500,6 +2502,127 @@ func TestDecodeSliceIndexGrowth(t *testing.T) {
 	}
 }
 
+// Growing a slice of structs reuses capacity this call reserved, but must
+// never extend one the caller supplied: memory past its length may still be
+// aliased by another of their slices.
+func TestSliceGrowthDoesNotExtendCallerCapacity(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		V string `schema:"v"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	backing := make([]item, 1, 8)
+	backing[0] = item{V: "keep"}
+	tail := backing[1:8:8] // the caller keeps an alias into the spare capacity
+	for i := range tail {
+		tail[i] = item{V: "alias"}
+	}
+
+	c := cart{Items: backing}
+	d := NewDecoder()
+	if err := d.Decode(&c, map[string][]string{"items.3.v": {"new"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range tail {
+		if got.V != "alias" {
+			t.Fatalf("caller's aliased element %d overwritten: %q", i, got.V)
+		}
+	}
+	if len(c.Items) != 4 || c.Items[0].V != "keep" || c.Items[3].V != "new" {
+		t.Fatalf("unexpected decode result: %+v", c.Items)
+	}
+	if c.Items[1].V != "" || c.Items[2].V != "" {
+		t.Fatalf("gap elements should be zero: %+v", c.Items)
+	}
+}
+
+// The same struct type at two places in a tree means two different slices;
+// growing one must never be mistaken for growing the other.
+func TestSliceGrowthKeepsSiblingSlicesApart(t *testing.T) {
+	t.Parallel()
+
+	type inner struct {
+		V string `schema:"v"`
+	}
+	type mid struct {
+		Items []inner `schema:"items"`
+	}
+	type outer struct {
+		X mid `schema:"x"`
+		Y mid `schema:"y"`
+	}
+
+	d := NewDecoder()
+	for i := 0; i < 200; i++ { // map order varies, so repeat
+		var o outer
+		if err := d.Decode(&o, map[string][]string{
+			"x.items.0.v": {"x0"},
+			"x.items.4.v": {"x4"},
+			"y.items.1.v": {"y1"},
+			"y.items.2.v": {"y2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if len(o.X.Items) != 5 || o.X.Items[0].V != "x0" || o.X.Items[4].V != "x4" {
+			t.Fatalf("X: %+v", o.X.Items)
+		}
+		if len(o.Y.Items) != 3 || o.Y.Items[1].V != "y1" || o.Y.Items[2].V != "y2" {
+			t.Fatalf("Y: %+v", o.Y.Items)
+		}
+		for _, e := range []string{o.X.Items[1].V, o.X.Items[2].V, o.X.Items[3].V, o.Y.Items[0].V} {
+			if e != "" {
+				t.Fatalf("gap element not zero: %+v %+v", o.X.Items, o.Y.Items)
+			}
+		}
+	}
+}
+
+// Every index lands in the right element whatever order the map hands them
+// over, with the gaps between them left zero.
+func TestSliceGrowthFillsEveryIndex(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		Name  string `schema:"name"`
+		Price int    `schema:"price"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+
+	const n = 60
+	src := map[string][]string{}
+	for i := 0; i < n; i += 2 { // leave every other index empty
+		idx := strconv.Itoa(i)
+		src["items."+idx+".name"] = []string{"n" + idx}
+		src["items."+idx+".price"] = []string{idx}
+	}
+
+	d := NewDecoder()
+	for round := 0; round < 50; round++ {
+		var c cart
+		if err := d.Decode(&c, src); err != nil {
+			t.Fatal(err)
+		}
+		if len(c.Items) != n-1 {
+			t.Fatalf("len = %d, want %d", len(c.Items), n-1)
+		}
+		for i, got := range c.Items {
+			want := item{}
+			if i%2 == 0 {
+				want = item{Name: "n" + strconv.Itoa(i), Price: i}
+			}
+			if got != want {
+				t.Fatalf("element %d = %+v, want %+v", i, got, want)
+			}
+		}
+	}
+}
+
 func BenchmarkSliceManyIndicesDecode(b *testing.B) {
 	type item struct {
 		Name  string `schema:"name"`
@@ -3735,6 +3858,487 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 	}
 }
 
+// referenceCheckRequired is the pre-rewrite required-field check: a linear
+// scan of the whole source map per group and field path. The bitset and
+// prefix index that replaced it must agree with it on every input.
+func referenceCheckRequired(info *structInfo, src map[string][]string) map[string]bool {
+	missing := map[string]bool{}
+	for _, group := range info.requiredGroups {
+		empty := true
+	scan:
+		for _, f := range group.fields {
+			for i, path := range f.searchPaths {
+				if v, ok := src[path]; ok && !isEmpty(f.typ, v) {
+					empty = false
+					break scan
+				}
+				pathDot := f.searchPathDots[i]
+				for key, val := range src {
+					if len(val) == 0 {
+						continue
+					}
+					if strings.HasPrefix(key, pathDot) && !isEmpty(f.typ, val) {
+						empty = false
+						break scan
+					}
+				}
+			}
+		}
+		if empty {
+			missing[group.key] = true
+		}
+	}
+	return missing
+}
+
+func TestCheckRequiredMatchesReference(t *testing.T) {
+	t.Parallel()
+
+	type leaf struct {
+		X string `schema:"x,required"`
+		Y int    `schema:"y"`
+	}
+	type mid struct {
+		L leaf   `schema:"l,required"`
+		M string `schema:"m,required"`
+	}
+	type embedded struct {
+		E string `schema:"e,required"`
+	}
+	type outer struct {
+		embedded
+		A    string   `schema:"a,required"`
+		B    []string `schema:"b,required"`
+		Mid  mid      `schema:"mid,required"`
+		Free string   `schema:"free"`
+	}
+	type deep struct {
+		One mid `schema:"one,required"`
+		Two mid `schema:"two"`
+	}
+
+	types := []reflect.Type{
+		reflect.TypeOf(leaf{}), reflect.TypeOf(mid{}),
+		reflect.TypeOf(outer{}), reflect.TypeOf(deep{}),
+	}
+
+	// Every key the shapes above can be addressed by, plus lookalikes.
+	keys := []string{
+		"a", "b", "e", "free", "x", "y", "m", "l", "l.x", "l.y",
+		"mid", "mid.m", "mid.l", "mid.l.x", "mid.l.y",
+		"one", "one.m", "one.l.x", "two.m", "two.l.x",
+		"ab", "midx", "l.", "one.l", "unrelated", "a.b.c",
+	}
+	values := [][]string{nil, {}, {""}, {"v"}, {"", "v"}}
+
+	d := NewDecoder()
+	r := rand.New(rand.NewPCG(11, 13))
+	for _, typ := range types {
+		info := d.cache.get(typ)
+		for iter := 0; iter < 4000; iter++ {
+			src := make(map[string][]string)
+			for _, k := range keys {
+				switch r.IntN(4) {
+				case 0:
+					src[k] = values[r.IntN(len(values))]
+				case 1:
+					src[k] = values[len(values)-1]
+				}
+			}
+			want := referenceCheckRequired(info, src)
+			got := map[string]bool{}
+			for key := range d.checkRequired(info, src) {
+				got[key] = true
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s with %v: got missing %v, want %v", typ, src, got, want)
+			}
+			for key := range want {
+				if !got[key] {
+					t.Fatalf("%s with %v: got missing %v, want %v", typ, src, got, want)
+				}
+			}
+		}
+	}
+}
+
+// requiredFormStruct mirrors a typical form payload: a few required scalars
+// plus a required nested struct, which no direct lookup can settle.
+type requiredAddress struct {
+	Street string `schema:"street,required"`
+	City   string `schema:"city,required"`
+	Zip    string `schema:"zip"`
+}
+
+type requiredFormStruct struct {
+	Name    string          `schema:"name,required"`
+	Email   string          `schema:"email,required"`
+	Age     int             `schema:"age,required"`
+	Address requiredAddress `schema:"address,required"`
+	Note    string          `schema:"note"`
+}
+
+// wideRequiredSrc carries the required fields plus the unrelated parameters a
+// real query string comes with.
+func wideRequiredSrc() map[string][]string {
+	src := map[string][]string{
+		"name":           {"Grace"},
+		"email":          {"grace@example.com"},
+		"age":            {"85"},
+		"address.street": {"1 Navy Yard"},
+		"address.city":   {"Arlington"},
+		"address.zip":    {"22202"},
+	}
+	for i := 0; i < 20; i++ {
+		src["filter"+strconv.Itoa(i)] = []string{"v" + strconv.Itoa(i)}
+	}
+	return src
+}
+
+func BenchmarkCheckRequiredFieldsWideSrc(b *testing.B) {
+	src := wideRequiredSrc()
+	decoder := NewDecoder()
+	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	b.ReportAllocs()
+	for b.Loop() {
+		if errs := decoder.checkRequired(info, src); errs != nil {
+			b.Fatal(errs)
+		}
+	}
+}
+
+// The same shape with a required key missing, so nothing short-circuits and
+// every group has to be resolved.
+func BenchmarkCheckRequiredFieldsWideSrcMissing(b *testing.B) {
+	src := wideRequiredSrc()
+	delete(src, "address.street")
+	delete(src, "address.city")
+	delete(src, "address.zip")
+	decoder := NewDecoder()
+	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	b.ReportAllocs()
+	for b.Loop() {
+		if errs := decoder.checkRequired(info, src); errs == nil {
+			b.Fatal("expected missing required fields")
+		}
+	}
+}
+
+func BenchmarkDecodeRequiredForm(b *testing.B) {
+	src := wideRequiredSrc()
+	decoder := NewDecoder()
+	decoder.IgnoreUnknownKeys(true)
+	s := &requiredFormStruct{}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decoder.Decode(s, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The fallbacks for keys too long for the stack buffers, the guards that only
+// an extreme MaxSize can reach, and the walk that gives up behind an
+// unsettable embedded pointer are all live paths; cover them here.
+
+// An alias longer than maxDirectKeyLen skips the fold, so a mixed-case key
+// reaches the generic parser and resolves through the allocating lookup.
+func TestLongAliasResolvesCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	const long = "averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure"
+	if len(long) <= maxDirectKeyLen {
+		t.Fatalf("alias is %d bytes, must exceed %d for this test", len(long), maxDirectKeyLen)
+	}
+	type S struct {
+		V string `schema:"averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{strings.ToUpper(long): {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.V != "x" {
+		t.Fatalf("V = %q, want x", s.V)
+	}
+}
+
+// A prefixed key longer than the stack buffer falls back to concatenating,
+// and the default must still see that the request provided the field.
+func TestLongPrefixedKeySuppressesDefault(t *testing.T) {
+	t.Parallel()
+
+	type inner struct {
+		AVeryLongFieldNameThatHelpsPushUsPastTheBuffer string `schema:"averylongfieldnamethathelpsuspastthebuffer,default:fallback"`
+	}
+	type outer struct {
+		AnEquallyLongNestedStructAlias inner `schema:"anequallylongnestedstructalias"`
+	}
+	const key = "anequallylongnestedstructalias.averylongfieldnamethathelpsuspastthebuffer"
+	if len(key) <= maxDirectKeyLen {
+		t.Fatalf("key is %d bytes, must exceed %d for this test", len(key), maxDirectKeyLen)
+	}
+
+	d := NewDecoder()
+	var provided outer
+	if err := d.Decode(&provided, map[string][]string{key: {"given"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := provided.AnEquallyLongNestedStructAlias.AVeryLongFieldNameThatHelpsPushUsPastTheBuffer; got != "given" {
+		t.Fatalf("provided value = %q, want given", got)
+	}
+
+	var absent outer
+	if err := d.Decode(&absent, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := absent.AnEquallyLongNestedStructAlias.AVeryLongFieldNameThatHelpsPushUsPastTheBuffer; got != "fallback" {
+		t.Fatalf("absent value = %q, want fallback", got)
+	}
+}
+
+// growCap doubles the reservation, but maxSize+1 overflows at the extreme;
+// the slice must still come out the length the indices call for.
+func TestSliceGrowthWithExtremeMaxSize(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		V string `schema:"v"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+	d := NewDecoder()
+	d.MaxSize(math.MaxInt)
+
+	var c cart
+	if err := d.Decode(&c, map[string][]string{
+		"items.0.v": {"a"},
+		"items.5.v": {"f"},
+		"items.2.v": {"c"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 6 {
+		t.Fatalf("len = %d, want 6", len(c.Items))
+	}
+	if c.Items[0].V != "a" || c.Items[2].V != "c" || c.Items[5].V != "f" {
+		t.Fatalf("unexpected result: %+v", c.Items)
+	}
+	if d.growCap(4, true) != 4 {
+		t.Fatalf("growCap must not return less than the length asked for")
+	}
+}
+
+// checkRequired is also called for struct types that require nothing.
+func TestCheckRequiredWithoutRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		A string `schema:"a"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeOf(S{}))
+	if errs := d.checkRequired(info, map[string][]string{"a": {"x"}}); errs != nil {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
+// Past 256 required keys the satisfied-group bitset is allocated rather than
+// taken from the inline array; every key must still be reported.
+func TestCheckRequiredBeyondInlineBitset(t *testing.T) {
+	t.Parallel()
+
+	const n = requiredBitWords*64 + 8
+	fields := make([]reflect.StructField, 0, n)
+	for i := 0; i < n; i++ {
+		name := "F" + strconv.Itoa(i)
+		fields = append(fields, reflect.StructField{
+			Name: name,
+			Type: reflect.TypeOf(""),
+			Tag:  reflect.StructTag(`schema:"f` + strconv.Itoa(i) + `,required"`),
+		})
+	}
+	typ := reflect.StructOf(fields)
+
+	d := NewDecoder()
+	// Nothing provided: every required key is reported missing.
+	dst := reflect.New(typ)
+	err := d.Decode(dst.Interface(), map[string][]string{})
+	multi, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("expected MultiError, got %#v", err)
+	}
+	if len(multi) != n {
+		t.Fatalf("got %d missing keys, want %d", len(multi), n)
+	}
+
+	// All provided: nothing is reported.
+	src := make(map[string][]string, n)
+	for i := 0; i < n; i++ {
+		src["f"+strconv.Itoa(i)] = []string{"v"}
+	}
+	dst = reflect.New(typ)
+	if err := d.Decode(dst.Interface(), src); err != nil {
+		t.Fatalf("expected no errors, got %v", err)
+	}
+	if got := dst.Elem().Field(n - 1).String(); got != "v" {
+		t.Fatalf("last field = %q, want v", got)
+	}
+}
+
+// A field promoted through an unexported embedded pointer cannot be reached:
+// the pointer is nil and unsettable, so the walk stops and the key is a no-op.
+func TestWalkStopsAtUnsettableEmbeddedPointer(t *testing.T) {
+	t.Parallel()
+
+	var s unreachableOuter
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	if err := d.Decode(&s, map[string][]string{
+		"nested.v": {"x"},
+		"visible":  {"seen"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s.hiddenReach != nil {
+		t.Fatal("unexported embedded pointer must stay nil")
+	}
+	if s.Visible != "seen" {
+		t.Fatalf("Visible = %q, want seen", s.Visible)
+	}
+}
+
+type reachInner struct {
+	V string `schema:"v"`
+}
+
+type hiddenReach struct {
+	Nested reachInner `schema:"nested"`
+}
+
+type unreachableOuter struct {
+	*hiddenReach
+	Visible string `schema:"visible"`
+}
+
+// A typical listing request: pagination and sorting fields carry defaults, a
+// nested filter struct carries its own, and the request supplies only some.
+type defaultsPage struct {
+	Size  int    `schema:"size,default:20"`
+	Sort  string `schema:"sort,default:created"`
+	Order string `schema:"order,default:desc"`
+}
+
+type defaultsRequest struct {
+	Query   string       `schema:"q"`
+	Page    defaultsPage `schema:"page"`
+	Verbose bool         `schema:"verbose,default:false"`
+	Limit   int          `schema:"limit,default:100"`
+	Tags    []string     `schema:"tags,default:a|b"`
+}
+
+// Defaults are resolved once per struct type, so what each Decode hands out
+// must still be its own: a slice default mutated by one caller must not turn
+// up in the next result, a pointer default must be a fresh pointee, and a
+// nested struct's defaults must respect the keys provided under its prefix.
+func TestDefaultsAreFreshPerDecode(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder()
+	src := map[string][]string{"q": {"shoes"}, "page.size": {"50"}, "limit": {"10"}}
+
+	var first defaultsRequest
+	if err := d.Decode(&first, src); err != nil {
+		t.Fatal(err)
+	}
+	want := defaultsRequest{
+		Query: "shoes", Page: defaultsPage{Size: 50, Sort: "created", Order: "desc"},
+		Limit: 10, Tags: []string{"a", "b"},
+	}
+	if first.Query != want.Query || first.Page != want.Page || first.Limit != want.Limit ||
+		first.Verbose || len(first.Tags) != 2 || first.Tags[0] != "a" || first.Tags[1] != "b" {
+		t.Fatalf("first decode = %+v, want %+v", first, want)
+	}
+
+	// Scribble over everything the first decode handed out.
+	first.Tags[0], first.Tags[1] = "x", "y"
+	first.Tags = append(first.Tags, "z")
+
+	var second defaultsRequest
+	if err := d.Decode(&second, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Tags) != 2 || second.Tags[0] != "a" || second.Tags[1] != "b" {
+		t.Fatalf("second decode saw the first caller's edits: %v", second.Tags)
+	}
+	if &second.Tags[0] == &first.Tags[0] {
+		t.Fatal("decoded slices share a backing array")
+	}
+	if second.Page != (defaultsPage{Size: 20, Sort: "created", Order: "desc"}) || second.Limit != 100 {
+		t.Fatalf("second decode = %+v", second)
+	}
+
+	type ptrs struct {
+		N *int    `schema:"n,default:7"`
+		S *string `schema:"s,default:hi"`
+	}
+	var p1, p2 ptrs
+	for _, p := range []*ptrs{&p1, &p2} {
+		if err := d.Decode(p, map[string][]string{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p1.N == p2.N || p1.S == p2.S {
+		t.Fatal("pointer defaults share a pointee")
+	}
+	*p1.N, *p1.S = 99, "changed"
+	var p3 ptrs
+	if err := d.Decode(&p3, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if *p3.N != 7 || *p3.S != "hi" {
+		t.Fatalf("pointer default saw the first caller's edits: %d %q", *p3.N, *p3.S)
+	}
+}
+
+// A wide request struct in which only two fields carry defaults: the walk
+// must not pay for the twenty-odd plain fields around them.
+type defaultsWide struct {
+	F01, F02, F03, F04, F05, F06, F07, F08 string `schema:"f01"`
+	F09, F10, F11, F12, F13, F14, F15, F16 string `schema:"f09"`
+	F17, F18, F19, F20, F21, F22, F23, F24 int    `schema:"f17"`
+	Size                                   int    `schema:"size,default:20"`
+	Sort                                   string `schema:"sort,default:created"`
+}
+
+func BenchmarkDecodeWithDefaultsWide(b *testing.B) {
+	src := map[string][]string{"f01": {"a"}, "f09": {"b"}, "f17": {"3"}}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r defaultsWide
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkDecodeWithDefaults(b *testing.B) {
+	src := map[string][]string{
+		"q":         {"shoes"},
+		"page.size": {"50"},
+		"limit":     {"10"},
+	}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r defaultsRequest
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTimeDurationDecoding(b *testing.B) {
 	type DurationStruct struct {
 		Timeout time.Duration `schema:"timeout"`
@@ -3767,6 +4371,65 @@ func TestConversionErrorError(t *testing.T) {
 	msg := e.Error()
 	if !strings.Contains(msg, "index 2 of \"f\"") || !strings.Contains(msg, "boom") {
 		t.Errorf("unexpected message %q", msg)
+	}
+}
+
+// The error messages are assembled by concatenation rather than fmt.Sprintf:
+// quoting, index rendering and the wrapped-error suffix all have to stay
+// byte-identical to the formatter they replaced.
+func TestErrorMessagesMatchSprintf(t *testing.T) {
+	t.Parallel()
+	keys := []string{"", "f", "a.b.0.c", `we"ird`, "tab\there", "ünïcøde", "a\x00b"}
+	indices := []int{-1, 0, 1, 9, 99, 100, 1234567}
+	errs := []error{nil, errors.New("boom"), errors.New("")}
+
+	for _, key := range keys {
+		for _, idx := range indices {
+			for _, inner := range errs {
+				want := ""
+				if idx < 0 {
+					want = fmt.Sprintf("schema: error converting value for %q", key)
+				} else {
+					want = fmt.Sprintf("schema: error converting value for index %d of %q", idx, key)
+				}
+				if inner != nil {
+					want = fmt.Sprintf("%s. Details: %s", want, inner)
+				}
+				if got := (ConversionError{Key: key, Index: idx, Err: inner}).Error(); got != want {
+					t.Fatalf("ConversionError(%q, %d, %v) = %q, want %q", key, idx, inner, got, want)
+				}
+			}
+		}
+		if got, want := (UnknownKeyError{Key: key}).Error(), fmt.Sprintf("schema: invalid path %q", key); got != want {
+			t.Fatalf("UnknownKeyError(%q) = %q, want %q", key, got, want)
+		}
+		if got, want := (EmptyFieldError{Key: key}).Error(), fmt.Sprintf("%v is empty", key); got != want {
+			t.Fatalf("EmptyFieldError(%q) = %q, want %q", key, got, want)
+		}
+	}
+
+	// MultiError reports the count of the errors it does not render.
+	me := MultiError{}
+	for i := 0; i < 130; i++ {
+		me[strconv.Itoa(i)] = errors.New("only")
+		got := me.Error()
+		switch n := len(me); n {
+		case 1:
+			if got != "only" {
+				t.Fatalf("MultiError(1) = %q, want %q", got, "only")
+			}
+		case 2:
+			if got != "only (and 1 other error)" {
+				t.Fatalf("MultiError(2) = %q", got)
+			}
+		default:
+			if want := fmt.Sprintf("%s (and %d other errors)", "only", n-1); got != want {
+				t.Fatalf("MultiError(%d) = %q, want %q", n, got, want)
+			}
+		}
+	}
+	if got := (MultiError{}).Error(); got != "(0 errors)" {
+		t.Fatalf("MultiError(0) = %q", got)
 	}
 }
 
