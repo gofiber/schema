@@ -177,14 +177,10 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 			if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
 				multiErrors = appendError(multiErrors, path, err)
 			}
-		} else if err == errInvalidPath { //nolint:errorlint // the sentinel is returned unwrapped; see below
-			// By far the most common failure: a key that names no field.
-			// parsePathInfo never wraps the sentinel, so comparing it
-			// directly keeps errors.Is off the per-key path.
-			if !d.ignoreUnknownKeys {
-				multiErrors = appendError(multiErrors, path, UnknownKeyError{Key: path})
-			}
-		} else if errors.Is(err, errIndexTooLarge) {
+			// A key that names no field is by far the most common failure,
+			// and parsePathInfo returns that sentinel unwrapped, so the
+			// pointer compare keeps errors.Is off the per-key path.
+		} else if err != errInvalidPath && errors.Is(err, errIndexTooLarge) { //nolint:errorlint // see above
 			multiErrors = appendError(multiErrors, path, err)
 		} else if !d.ignoreUnknownKeys {
 			multiErrors = appendError(multiErrors, path, UnknownKeyError{Key: path})

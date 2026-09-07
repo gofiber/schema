@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
@@ -4034,6 +4035,190 @@ func BenchmarkDecodeRequiredForm(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// The fallbacks for keys too long for the stack buffers, the guards that only
+// an extreme MaxSize can reach, and the walk that gives up behind an
+// unsettable embedded pointer are all live paths; cover them here.
+
+// An alias longer than maxDirectKeyLen skips the fold, so a mixed-case key
+// reaches the generic parser and resolves through the allocating lookup.
+func TestLongAliasResolvesCaseInsensitively(t *testing.T) {
+	t.Parallel()
+
+	const long = "averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure"
+	if len(long) <= maxDirectKeyLen {
+		t.Fatalf("alias is %d bytes, must exceed %d for this test", len(long), maxDirectKeyLen)
+	}
+	type S struct {
+		V string `schema:"averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{strings.ToUpper(long): {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.V != "x" {
+		t.Fatalf("V = %q, want x", s.V)
+	}
+}
+
+// A prefixed key longer than the stack buffer falls back to concatenating,
+// and the default must still see that the request provided the field.
+func TestLongPrefixedKeySuppressesDefault(t *testing.T) {
+	t.Parallel()
+
+	type inner struct {
+		AVeryLongFieldNameThatHelpsPushUsPastTheBuffer string `schema:"averylongfieldnamethathelpsuspastthebuffer,default:fallback"`
+	}
+	type outer struct {
+		AnEquallyLongNestedStructAlias inner `schema:"anequallylongnestedstructalias"`
+	}
+	const key = "anequallylongnestedstructalias.averylongfieldnamethathelpsuspastthebuffer"
+	if len(key) <= maxDirectKeyLen {
+		t.Fatalf("key is %d bytes, must exceed %d for this test", len(key), maxDirectKeyLen)
+	}
+
+	d := NewDecoder()
+	var provided outer
+	if err := d.Decode(&provided, map[string][]string{key: {"given"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := provided.AnEquallyLongNestedStructAlias.AVeryLongFieldNameThatHelpsPushUsPastTheBuffer; got != "given" {
+		t.Fatalf("provided value = %q, want given", got)
+	}
+
+	var absent outer
+	if err := d.Decode(&absent, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := absent.AnEquallyLongNestedStructAlias.AVeryLongFieldNameThatHelpsPushUsPastTheBuffer; got != "fallback" {
+		t.Fatalf("absent value = %q, want fallback", got)
+	}
+}
+
+// growCap doubles the reservation, but maxSize+1 overflows at the extreme;
+// the slice must still come out the length the indices call for.
+func TestSliceGrowthWithExtremeMaxSize(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		V string `schema:"v"`
+	}
+	type cart struct {
+		Items []item `schema:"items"`
+	}
+	d := NewDecoder()
+	d.MaxSize(math.MaxInt)
+
+	var c cart
+	if err := d.Decode(&c, map[string][]string{
+		"items.0.v": {"a"},
+		"items.5.v": {"f"},
+		"items.2.v": {"c"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Items) != 6 {
+		t.Fatalf("len = %d, want 6", len(c.Items))
+	}
+	if c.Items[0].V != "a" || c.Items[2].V != "c" || c.Items[5].V != "f" {
+		t.Fatalf("unexpected result: %+v", c.Items)
+	}
+	if d.growCap(4, true) != 4 {
+		t.Fatalf("growCap must not return less than the length asked for")
+	}
+}
+
+// checkRequired is also called for struct types that require nothing.
+func TestCheckRequiredWithoutRequiredFields(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		A string `schema:"a"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeOf(S{}))
+	if errs := d.checkRequired(info, map[string][]string{"a": {"x"}}); errs != nil {
+		t.Fatalf("expected no errors, got %v", errs)
+	}
+}
+
+// Past 256 required keys the satisfied-group bitset is allocated rather than
+// taken from the inline array; every key must still be reported.
+func TestCheckRequiredBeyondInlineBitset(t *testing.T) {
+	t.Parallel()
+
+	const n = requiredBitWords*64 + 8
+	fields := make([]reflect.StructField, 0, n)
+	for i := 0; i < n; i++ {
+		name := "F" + strconv.Itoa(i)
+		fields = append(fields, reflect.StructField{
+			Name: name,
+			Type: reflect.TypeOf(""),
+			Tag:  reflect.StructTag(`schema:"f` + strconv.Itoa(i) + `,required"`),
+		})
+	}
+	typ := reflect.StructOf(fields)
+
+	d := NewDecoder()
+	// Nothing provided: every required key is reported missing.
+	dst := reflect.New(typ)
+	err := d.Decode(dst.Interface(), map[string][]string{})
+	multi, ok := err.(MultiError)
+	if !ok {
+		t.Fatalf("expected MultiError, got %#v", err)
+	}
+	if len(multi) != n {
+		t.Fatalf("got %d missing keys, want %d", len(multi), n)
+	}
+
+	// All provided: nothing is reported.
+	src := make(map[string][]string, n)
+	for i := 0; i < n; i++ {
+		src["f"+strconv.Itoa(i)] = []string{"v"}
+	}
+	dst = reflect.New(typ)
+	if err := d.Decode(dst.Interface(), src); err != nil {
+		t.Fatalf("expected no errors, got %v", err)
+	}
+	if got := dst.Elem().Field(n - 1).String(); got != "v" {
+		t.Fatalf("last field = %q, want v", got)
+	}
+}
+
+// A field promoted through an unexported embedded pointer cannot be reached:
+// the pointer is nil and unsettable, so the walk stops and the key is a no-op.
+func TestWalkStopsAtUnsettableEmbeddedPointer(t *testing.T) {
+	t.Parallel()
+
+	var s unreachableOuter
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	if err := d.Decode(&s, map[string][]string{
+		"nested.v": {"x"},
+		"visible":  {"seen"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if s.hiddenReach != nil {
+		t.Fatal("unexported embedded pointer must stay nil")
+	}
+	if s.Visible != "seen" {
+		t.Fatalf("Visible = %q, want seen", s.Visible)
+	}
+}
+
+type reachInner struct {
+	V string `schema:"v"`
+}
+
+type hiddenReach struct {
+	Nested reachInner `schema:"nested"`
+}
+
+type unreachableOuter struct {
+	*hiddenReach
+	Visible string `schema:"visible"`
 }
 
 // A typical listing request: pagination and sorting fields carry defaults, a
