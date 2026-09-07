@@ -11,8 +11,11 @@ import (
 	"maps"
 	"mime/multipart"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
+
+	utils "github.com/gofiber/utils/v2"
 )
 
 const (
@@ -943,18 +946,22 @@ type ConversionError struct {
 	Err   error        // low-level error (when it exists)
 }
 
+// The error strings below are assembled by concatenation instead of
+// fmt.Sprintf: %q is strconv.Quote and %d is utils.FormatInt (which answers
+// small indices from a table), so the messages are byte-identical while
+// skipping the reflection-based formatter.
 func (e ConversionError) Error() string {
 	var output string
 
 	if e.Index < 0 {
-		output = fmt.Sprintf("schema: error converting value for %q", e.Key)
+		output = "schema: error converting value for " + strconv.Quote(e.Key)
 	} else {
-		output = fmt.Sprintf("schema: error converting value for index %d of %q",
-			e.Index, e.Key)
+		output = "schema: error converting value for index " +
+			utils.FormatInt(int64(e.Index)) + " of " + strconv.Quote(e.Key)
 	}
 
 	if e.Err != nil {
-		output = fmt.Sprintf("%s. Details: %s", output, e.Err)
+		output += ". Details: " + e.Err.Error()
 	}
 
 	return output
@@ -966,7 +973,7 @@ type UnknownKeyError struct {
 }
 
 func (e UnknownKeyError) Error() string {
-	return fmt.Sprintf("schema: invalid path %q", e.Key)
+	return "schema: invalid path " + strconv.Quote(e.Key)
 }
 
 // EmptyFieldError stores information about an empty required field.
@@ -975,7 +982,7 @@ type EmptyFieldError struct {
 }
 
 func (e EmptyFieldError) Error() string {
-	return fmt.Sprintf("%v is empty", e.Key)
+	return e.Key + " is empty"
 }
 
 // MultiError stores multiple decoding errors.
@@ -997,7 +1004,7 @@ func (e MultiError) Error() string {
 	case 2:
 		return s + " (and 1 other error)"
 	}
-	return fmt.Sprintf("%s (and %d other errors)", s, len(e)-1)
+	return s + " (and " + utils.FormatInt(int64(len(e)-1)) + " other errors)"
 }
 
 func appendRequiredField(m map[string][]fieldWithPrefix, key string, field fieldWithPrefix) map[string][]fieldWithPrefix {

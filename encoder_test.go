@@ -2,7 +2,9 @@ package schema
 
 import (
 	"fmt"
+	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -130,6 +132,109 @@ func TestCompat(t *testing.T) {
 
 	if *src != *dst {
 		t.Errorf("Decoder-Encoder compatibility: expected %v, got %v\n", src, dst)
+	}
+}
+
+// Integer fields are routed to width-specific utils formatters, so check
+// every one against strconv over its full (or boundary) range.
+func TestEncodeIntegerWidths(t *testing.T) {
+	t.Parallel()
+
+	type sized struct {
+		I8  int8   `schema:"i8"`
+		I16 int16  `schema:"i16"`
+		I32 int32  `schema:"i32"`
+		I64 int64  `schema:"i64"`
+		I   int    `schema:"i"`
+		U8  uint8  `schema:"u8"`
+		U16 uint16 `schema:"u16"`
+		U32 uint32 `schema:"u32"`
+		U64 uint64 `schema:"u64"`
+		U   uint   `schema:"u"`
+	}
+
+	enc := NewEncoder()
+	check := func(s sized) {
+		t.Helper()
+		vals := make(map[string][]string)
+		if err := enc.Encode(&s, vals); err != nil {
+			t.Fatalf("Encode(%+v): %v", s, err)
+		}
+		for key, want := range map[string]string{
+			"i8":  strconv.FormatInt(int64(s.I8), 10),
+			"i16": strconv.FormatInt(int64(s.I16), 10),
+			"i32": strconv.FormatInt(int64(s.I32), 10),
+			"i64": strconv.FormatInt(s.I64, 10),
+			"i":   strconv.FormatInt(int64(s.I), 10),
+			"u8":  strconv.FormatUint(uint64(s.U8), 10),
+			"u16": strconv.FormatUint(uint64(s.U16), 10),
+			"u32": strconv.FormatUint(uint64(s.U32), 10),
+			"u64": strconv.FormatUint(s.U64, 10),
+			"u":   strconv.FormatUint(uint64(s.U), 10),
+		} {
+			if got := vals[key]; len(got) != 1 || got[0] != want {
+				t.Fatalf("%s of %+v = %v, want %q", key, s, got, want)
+			}
+		}
+	}
+
+	// The 8- and 16-bit widths are small enough to cover exhaustively.
+	for n := 0; n < 1<<16; n++ {
+		check(sized{
+			I8: int8(n), I16: int16(n), U8: uint8(n), U16: uint16(n),
+			I32: int32(n), I64: int64(n), I: n,
+			U32: uint32(n), U64: uint64(n), U: uint(n),
+		})
+	}
+	for _, n := range []int64{
+		math.MinInt32, math.MinInt32 + 1, -100, -99, -1, 0, 1, 99, 100,
+		math.MaxInt32 - 1, math.MaxInt32, math.MaxInt64, math.MinInt64,
+	} {
+		check(sized{
+			I32: int32(n), I64: n, I: int(n),
+			U32: uint32(n), U64: uint64(n), U: uint(n),
+		})
+	}
+	for _, n := range []uint64{
+		0, 1, 99, 100, math.MaxUint32 - 1, math.MaxUint32, math.MaxUint64,
+	} {
+		check(sized{U32: uint32(n), U64: n, U: uint(n)})
+	}
+}
+
+func BenchmarkSizedIntegerEncode(b *testing.B) {
+	type sized struct {
+		I8  int8   `schema:"i8"`
+		I16 int16  `schema:"i16"`
+		I32 int32  `schema:"i32"`
+		U8  uint8  `schema:"u8"`
+		U16 uint16 `schema:"u16"`
+		U32 uint32 `schema:"u32"`
+	}
+	s := sized{I8: -12, I16: -1234, I32: -123456, U8: 12, U16: 1234, U32: 123456}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 8)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFloatFieldEncode(b *testing.B) {
+	type floats struct {
+		A float64 `schema:"a"`
+		B float32 `schema:"b"`
+	}
+	s := floats{A: 3.14159, B: 2.71828}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 4)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

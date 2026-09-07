@@ -106,23 +106,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		}
 		if n := len(p); n <= maxDirectKeyLen {
 			var buf [maxDirectKeyLen]byte
-			changed := false
-			i := 0
-			for ; i+swar.WordLen <= n; i += swar.WordLen {
-				w := swar.Load8(p, i)
-				lw := swar.ToLowerWord(w)
-				changed = changed || lw != w
-				swar.Store8(buf[:], i, lw)
-			}
-			for ; i < n; i++ {
-				ch := p[i]
-				if ch >= 'A' && ch <= 'Z' {
-					ch += 'a' - 'A'
-					changed = true
-				}
-				buf[i] = ch
-			}
-			if changed {
+			if foldASCIILower(buf[:], p) {
 				if parts, ok := rootInfo.direct[string(buf[:n])]; ok {
 					return parts, nil
 				}
@@ -226,6 +210,32 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	}
 
 	return parts, nil
+}
+
+// foldASCIILower writes the ASCII-lowercased form of s into buf and reports
+// whether any byte changed. Folding word-at-a-time (SWAR) into a caller-owned
+// stack buffer lets the case-insensitive map probes below run without the
+// allocation utilstrings.ToLower makes for a mixed-case key. The caller
+// guarantees len(buf) >= len(s).
+func foldASCIILower(buf []byte, s string) bool {
+	n := len(s)
+	changed := false
+	i := 0
+	for ; i+swar.WordLen <= n; i += swar.WordLen {
+		w := swar.Load8(s, i)
+		lw := swar.ToLowerWord(w)
+		changed = changed || lw != w
+		swar.Store8(buf, i, lw)
+	}
+	for ; i < n; i++ {
+		ch := s[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 'a' - 'A'
+			changed = true
+		}
+		buf[i] = ch
+	}
+	return changed
 }
 
 // dotBroadcast is the SWAR needle for '.'; hoisted so the word loop in
@@ -548,11 +558,23 @@ type structInfo struct {
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
-	aliasKey := utilstrings.ToLower(alias)
-	if field, ok := i.fieldsByName[aliasKey]; ok {
+	// fieldsByName is keyed by lowercase alias, so probing the raw alias
+	// first settles the common already-lowercase case without folding it at
+	// all. On a miss the alias is folded into a stack buffer and probed from
+	// there; the compiler elides the string conversion in a map index, so
+	// the mixed-case case allocates nothing either. Aliases too long for the
+	// buffer are rare enough to keep taking the allocating path.
+	if field, ok := i.fieldsByName[alias]; ok {
 		return field
 	}
-	return nil
+	if n := len(alias); n <= maxDirectKeyLen {
+		var buf [maxDirectKeyLen]byte
+		if !foldASCIILower(buf[:], alias) {
+			return nil // already lowercase: the probe above was conclusive
+		}
+		return i.fieldsByName[string(buf[:n])]
+	}
+	return i.fieldsByName[utilstrings.ToLower(alias)]
 }
 
 func (c *cache) buildRequiredFields(info *structInfo) map[string][]fieldWithPrefix {

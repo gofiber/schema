@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	utils "github.com/gofiber/utils/v2"
+	utilstrings "github.com/gofiber/utils/v2/strings"
 )
 
 func TestNextPathSegment(t *testing.T) {
@@ -111,6 +112,60 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 	for b.Loop() {
 		info.paths.Clear()
 		if _, err := d.cache.parsePath("items.0.value", typ); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// foldASCIILower backs the allocation-free case-insensitive probes, so it has
+// to agree with the utils folder it stands in for at every length and leave
+// non-ASCII bytes untouched.
+func TestFoldASCIILower(t *testing.T) {
+	t.Parallel()
+
+	alphabet := make([]byte, 0, 256)
+	for c := 0; c < 256; c++ {
+		alphabet = append(alphabet, byte(c))
+	}
+
+	for n := 0; n <= maxDirectKeyLen; n++ {
+		for off := 0; off < 256; off++ {
+			in := make([]byte, n)
+			for i := range in {
+				in[i] = alphabet[(off+i*7)%256]
+			}
+			src := string(in)
+			var buf [maxDirectKeyLen]byte
+			changed := foldASCIILower(buf[:], src)
+			got := string(buf[:n])
+			want := utilstrings.ToLower(src)
+			if got != want {
+				t.Fatalf("foldASCIILower(%q) = %q, want %q", src, got, want)
+			}
+			if changed != (got != src) {
+				t.Fatalf("foldASCIILower(%q) reported changed=%v, want %v", src, changed, got != src)
+			}
+		}
+	}
+}
+
+// A mixed-case path that the precomputed direct map cannot answer walks the
+// generic parser, where every segment is case-folded before its field lookup;
+// that fold must not allocate.
+func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
+	type Nested struct {
+		Value string `schema:"value"`
+	}
+	type Outer struct {
+		Items []Nested `schema:"items"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(Outer{})
+	b.ReportAllocs()
+	info := d.cache.get(typ)
+	for b.Loop() {
+		info.paths.Clear()
+		if _, err := d.cache.parsePath("Items.0.Value", typ); err != nil {
 			b.Fatal(err)
 		}
 	}

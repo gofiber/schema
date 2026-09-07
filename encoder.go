@@ -66,7 +66,7 @@ type encField struct {
 	// package (numeric/bool/float formatters), so it can never alias a large
 	// caller-owned buffer and may be batched in encode's shared scratch.
 	scratchSafe bool
-	isStruct         bool
+	isStruct    bool
 	// nilAsNull marks pointer fields whose element has no immediate
 	// encoder (structs recursed via recurseStructPtr, or unsupported
 	// types): nil values encode as "null", matching the closure behavior
@@ -378,9 +378,21 @@ func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 	switch t.Kind() {
 	case reflect.Bool:
 		return encodeBool
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+	case reflect.Int8:
+		return encodeInt8
+	case reflect.Int16:
+		return encodeInt16
+	case reflect.Int32:
+		return encodeInt32
+	case reflect.Int, reflect.Int64:
 		return encodeInt
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+	case reflect.Uint8:
+		return encodeUint8
+	case reflect.Uint16:
+		return encodeUint16
+	case reflect.Uint32:
+		return encodeUint32
+	case reflect.Uint, reflect.Uint64:
 		return encodeUint
 	case reflect.Float32:
 		return encodeFloat32
@@ -411,16 +423,45 @@ func encodeBool(v reflect.Value) string {
 	return strconv.FormatBool(v.Bool())
 }
 
+// Integers are formatted through the width-specific utils helpers: the 8-bit
+// ones are table lookups (no allocation at all) and the 32-bit ones skip a
+// digit group the 64-bit formatter has to consider, so dispatching on the
+// field's kind at plan-build time is free at encode time.
+
 func encodeInt(v reflect.Value) string {
 	return utils.FormatInt(v.Int())
+}
+
+func encodeInt8(v reflect.Value) string {
+	return utils.FormatInt8(int8(v.Int()))
+}
+
+func encodeInt16(v reflect.Value) string {
+	return utils.FormatInt16(int16(v.Int()))
+}
+
+func encodeInt32(v reflect.Value) string {
+	return utils.FormatInt32(int32(v.Int()))
 }
 
 func encodeUint(v reflect.Value) string {
 	return utils.FormatUint(v.Uint())
 }
 
+func encodeUint8(v reflect.Value) string {
+	return utils.FormatUint8(uint8(v.Uint()))
+}
+
+func encodeUint16(v reflect.Value) string {
+	return utils.FormatUint16(uint16(v.Uint()))
+}
+
+func encodeUint32(v reflect.Value) string {
+	return utils.FormatUint32(uint32(v.Uint()))
+}
+
 func encodeFloat(v reflect.Value, bits int) string {
-	return strconv.FormatFloat(v.Float(), 'f', 6, bits)
+	return formatFloatFixed(v.Float(), bits)
 }
 
 func encodeFloat32(v reflect.Value) string {

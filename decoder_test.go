@@ -3770,6 +3770,65 @@ func TestConversionErrorError(t *testing.T) {
 	}
 }
 
+// The error messages are assembled by concatenation rather than fmt.Sprintf,
+// so pin them against the formatter they replaced — quoting, index rendering
+// and the wrapped-error suffix all have to stay byte-identical.
+func TestErrorMessagesMatchSprintf(t *testing.T) {
+	t.Parallel()
+	keys := []string{"", "f", "a.b.0.c", `we"ird`, "tab\there", "ünïcøde", "a\x00b"}
+	indices := []int{-1, 0, 1, 9, 99, 100, 1234567}
+	errs := []error{nil, errors.New("boom"), errors.New("")}
+
+	for _, key := range keys {
+		for _, idx := range indices {
+			for _, inner := range errs {
+				want := ""
+				if idx < 0 {
+					want = fmt.Sprintf("schema: error converting value for %q", key)
+				} else {
+					want = fmt.Sprintf("schema: error converting value for index %d of %q", idx, key)
+				}
+				if inner != nil {
+					want = fmt.Sprintf("%s. Details: %s", want, inner)
+				}
+				if got := (ConversionError{Key: key, Index: idx, Err: inner}).Error(); got != want {
+					t.Fatalf("ConversionError(%q, %d, %v) = %q, want %q", key, idx, inner, got, want)
+				}
+			}
+		}
+		if got, want := (UnknownKeyError{Key: key}).Error(), fmt.Sprintf("schema: invalid path %q", key); got != want {
+			t.Fatalf("UnknownKeyError(%q) = %q, want %q", key, got, want)
+		}
+		if got, want := (EmptyFieldError{Key: key}).Error(), fmt.Sprintf("%v is empty", key); got != want {
+			t.Fatalf("EmptyFieldError(%q) = %q, want %q", key, got, want)
+		}
+	}
+
+	// MultiError reports the count of the errors it does not render.
+	me := MultiError{}
+	for i := 0; i < 130; i++ {
+		me[strconv.Itoa(i)] = errors.New("only")
+		got := me.Error()
+		switch n := len(me); n {
+		case 1:
+			if got != "only" {
+				t.Fatalf("MultiError(1) = %q, want %q", got, "only")
+			}
+		case 2:
+			if got != "only (and 1 other error)" {
+				t.Fatalf("MultiError(2) = %q", got)
+			}
+		default:
+			if want := fmt.Sprintf("%s (and %d other errors)", "only", n-1); got != want {
+				t.Fatalf("MultiError(%d) = %q, want %q", n, got, want)
+			}
+		}
+	}
+	if got := (MultiError{}).Error(); got != "(0 errors)" {
+		t.Fatalf("MultiError(0) = %q", got)
+	}
+}
+
 type sliceValue []byte
 
 func (sliceValue) UnmarshalText([]byte) error { return nil }
