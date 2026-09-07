@@ -653,73 +653,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return d.decodeBuiltinSlice(v, t, path, values)
 		}
 
-		itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
-		items := (*itemsBuf)[:0]
-		defer func() {
-			clear(items)
-			*itemsBuf = items[:0]
-			decodeValueBufferPool.Put(itemsBuf)
-		}()
-
-		for key, value := range values {
-			if value == "" {
-				if d.zeroEmpty {
-					items = append(items, reflect.Zero(t.Elem()))
-				}
-			} else if m.IsValid {
-				u := reflect.New(elemT)
-				if m.IsSliceElementPtr {
-					u = reflect.New(reflect.PointerTo(elemT).Elem())
-				}
-				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
-				if err := um.UnmarshalText([]byte(value)); err != nil {
-					return ConversionError{
-						Key:   path,
-						Type:  t,
-						Index: key,
-						Err:   err,
-					}
-				}
-				if m.IsSliceElementPtr {
-					items = append(items, u.Elem().Addr())
-				} else {
-					// u is always a pointer from reflect.New; store the
-					// pointed-to value.
-					items = append(items, u.Elem())
-				}
-			} else if item := conv(value); item.IsValid() {
-				items = appendConvertedItem(items, item, elemT, isPtrElem)
-			} else {
-				if strings.IndexByte(value, ',') != -1 {
-					for value := range strings.SplitSeq(value, ",") {
-						if value == "" {
-							if d.zeroEmpty {
-								items = append(items, reflect.Zero(t.Elem()))
-							}
-						} else if item := conv(value); item.IsValid() {
-							items = appendConvertedItem(items, item, elemT, isPtrElem)
-						} else {
-							return ConversionError{
-								Key:   path,
-								Type:  elemT,
-								Index: key,
-							}
-						}
-					}
-				} else {
-					return ConversionError{
-						Key:   path,
-						Type:  elemT,
-						Index: key,
-					}
-				}
-			}
-		}
-		value := reflect.MakeSlice(t, len(items), len(items))
-		for i, item := range items {
-			value.Index(i).Set(item)
-		}
-		v.Set(value)
+		return d.decodeBoxedSlice(v, t, elemT, path, values, conv, m, isPtrElem)
 	} else {
 		val := ""
 		// Use the last value provided if any values were provided
@@ -780,6 +714,83 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return fmt.Errorf("schema: converter not found for %v", t)
 		}
 	}
+	return nil
+}
+
+// decodeBoxedSlice decodes values into the slice field v whose elements have
+// to make a round trip through a reflect.Value: a custom converter, a
+// TextUnmarshaler, or pointer elements. It is split out of decode so that
+// decode — which runs once per source key — carries no defer of its own,
+// while the pooled item buffer here still returns to the pool on every exit,
+// error paths included.
+func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
+	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
+	items := (*itemsBuf)[:0]
+	defer func() {
+		clear(items)
+		*itemsBuf = items[:0]
+		decodeValueBufferPool.Put(itemsBuf)
+	}()
+
+	for key, value := range values {
+		if value == "" {
+			if d.zeroEmpty {
+				items = append(items, reflect.Zero(t.Elem()))
+			}
+		} else if m.IsValid {
+			u := reflect.New(elemT)
+			if m.IsSliceElementPtr {
+				u = reflect.New(reflect.PointerTo(elemT).Elem())
+			}
+			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
+			if err := um.UnmarshalText([]byte(value)); err != nil {
+				return ConversionError{
+					Key:   path,
+					Type:  t,
+					Index: key,
+					Err:   err,
+				}
+			}
+			if m.IsSliceElementPtr {
+				items = append(items, u.Elem().Addr())
+			} else {
+				// u is always a pointer from reflect.New; store the
+				// pointed-to value.
+				items = append(items, u.Elem())
+			}
+		} else if item := conv(value); item.IsValid() {
+			items = appendConvertedItem(items, item, elemT, isPtrElem)
+		} else {
+			if strings.IndexByte(value, ',') != -1 {
+				for value := range strings.SplitSeq(value, ",") {
+					if value == "" {
+						if d.zeroEmpty {
+							items = append(items, reflect.Zero(t.Elem()))
+						}
+					} else if item := conv(value); item.IsValid() {
+						items = appendConvertedItem(items, item, elemT, isPtrElem)
+					} else {
+						return ConversionError{
+							Key:   path,
+							Type:  elemT,
+							Index: key,
+						}
+					}
+				}
+			} else {
+				return ConversionError{
+					Key:   path,
+					Type:  elemT,
+					Index: key,
+				}
+			}
+		}
+	}
+	value := reflect.MakeSlice(t, len(items), len(items))
+	for i, item := range items {
+		value.Index(i).Set(item)
+	}
+	v.Set(value)
 	return nil
 }
 
