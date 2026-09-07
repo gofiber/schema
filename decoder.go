@@ -845,12 +845,14 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 	k := elemT.Kind()
 	split := k != reflect.String
 
-	n := 0
-	for _, value := range values {
-		if split {
+	n := len(values)
+	if split {
+		for _, value := range values {
 			n += strings.Count(value, ",")
 		}
-		n++
+		// The counts already say whether any value holds a separator, so
+		// when none does the per-value scans below have nothing to find.
+		split = n > len(values)
 	}
 
 	// Exact builtin slice types decode without per-element reflect calls;
