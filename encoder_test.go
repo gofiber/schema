@@ -202,6 +202,86 @@ func TestEncodeIntegerWidths(t *testing.T) {
 	}
 }
 
+// encode skips reading a key back before writing it when the plan is known to
+// write every key exactly once. The shapes that break that assumption —
+// duplicate aliases, and nested structs whose keys land in the same map —
+// must still accumulate every value.
+func TestEncodeRepeatedKeys(t *testing.T) {
+	t.Parallel()
+
+	type dup struct {
+		A string `schema:"same"`
+		B string `schema:"same"`
+		C int    `schema:"same"`
+	}
+	vals := make(map[string][]string)
+	if err := NewEncoder().Encode(&dup{A: "a", B: "b", C: 7}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["same"]; len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "7" {
+		t.Fatalf("duplicate aliases lost values: %v", got)
+	}
+
+	// A nested struct is encoded into the same map without a prefix, so its
+	// key collides with the outer one.
+	type inner struct {
+		V string `schema:"shared"`
+	}
+	type outerVal struct {
+		Inner inner  `schema:"inner"`
+		V     string `schema:"shared"`
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerVal{Inner: inner{V: "in"}, V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("nested struct key collision lost values: %v", got)
+	}
+
+	// Same through a pointer to a struct, which recurses when non-nil and
+	// writes its own key when nil.
+	type outerPtr struct {
+		Inner *inner `schema:"shared"`
+		V     string `schema:"shared"`
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerPtr{Inner: &inner{V: "in"}, V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("pointer struct key collision lost values: %v", got)
+	}
+	vals = make(map[string][]string)
+	if err := NewEncoder().Encode(&outerPtr{V: "out"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if got := vals["shared"]; len(got) != 2 {
+		t.Fatalf("nil pointer struct key collision lost values: %v", got)
+	}
+
+	// And the plan flag itself: a flat struct with distinct names is the only
+	// shape the fast path may claim.
+	type flat struct {
+		A string `schema:"a"`
+		B int    `schema:"b"`
+	}
+	enc := NewEncoder()
+	for _, tc := range []struct {
+		typ  reflect.Type
+		want bool
+	}{
+		{reflect.TypeOf(flat{}), true},
+		{reflect.TypeOf(dup{}), false},
+		{reflect.TypeOf(outerVal{}), false},
+		{reflect.TypeOf(outerPtr{}), false},
+	} {
+		if _, got := enc.structInfo(tc.typ); got != tc.want {
+			t.Fatalf("%s: freshKeys=%v, want %v", tc.typ, got, tc.want)
+		}
+	}
+}
+
 func BenchmarkSizedIntegerEncode(b *testing.B) {
 	type sized struct {
 		I8  int8   `schema:"i8"`

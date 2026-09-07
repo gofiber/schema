@@ -50,6 +50,12 @@ type Encoder struct {
 type encPlan struct {
 	fields []encField
 	gen    uint64
+	// freshKeys reports that encoding a value of this type into an empty map
+	// writes every key exactly once: no two fields share a name, and no field
+	// is recursed into (nested structs are encoded into the same map, without
+	// a prefix, so their keys could collide with these). encode can then
+	// assign each key outright instead of reading it back to append to it.
+	freshKeys bool
 }
 
 // encField is the precomputed encoding plan for one struct field.
@@ -131,18 +137,18 @@ func (e *Encoder) SetAliasTag(tag string) {
 // on first use. The build reads the tag and registered encoders under the
 // configuration lock; the generation re-checks around the cache store keep a
 // build racing a reconfiguration from inserting a stale plan.
-func (e *Encoder) structInfo(t reflect.Type) []encField {
+func (e *Encoder) structInfo(t reflect.Type) (fields []encField, freshKeys bool) { //nolint:nonamedreturns // the bool is only readable named
 	gen := e.encGen.Load()
 	if cached, ok := e.encCache.Load(t); ok {
 		// Ignore plans built under an older configuration; fall through and
 		// rebuild (the fresh plan overwrites the stale entry).
 		if p := cached.(*encPlan); p.gen == gen {
-			return p.fields
+			return p.fields, p.freshKeys
 		}
 	}
 	e.cache.l.RLock()
 	tag := e.cache.tag
-	fields := make([]encField, 0, t.NumField())
+	fields = make([]encField, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		name, opts := fieldAlias(sf, tag)
@@ -176,14 +182,33 @@ func (e *Encoder) structInfo(t reflect.Type) []encField {
 		fields = append(fields, f)
 	}
 	e.cache.l.RUnlock()
+	freshKeys = writesEachKeyOnce(fields)
 	// Don't cache a plan whose inputs (tag, registered encoders) changed
 	// while it was being built; the next call rebuilds it fresh. Even if a
 	// stale plan slips in after the clear, its generation tag keeps it from
 	// ever being served.
 	if e.encGen.Load() == gen {
-		e.encCache.Store(t, &encPlan{fields: fields, gen: gen})
+		e.encCache.Store(t, &encPlan{fields: fields, gen: gen, freshKeys: freshKeys})
 	}
-	return fields
+	return fields, freshKeys
+}
+
+// writesEachKeyOnce reports whether the plan's fields write distinct
+// destination keys and none of them recurses into a nested struct, whose keys
+// would land in the same map and could repeat one of these.
+func writesEachKeyOnce(fields []encField) bool {
+	names := make(map[string]struct{}, len(fields))
+	for i := range fields {
+		f := &fields[i]
+		if f.isStruct || f.recurseStructPtr {
+			return false
+		}
+		if _, dup := names[f.name]; dup {
+			return false
+		}
+		names[f.name] = struct{}{}
+	}
+	return true
 }
 
 func isZero(v reflect.Value) bool {
@@ -225,7 +250,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 
 	var errs MultiError
 
-	fields := e.structInfo(v.Type())
+	fields, freshKeys := e.structInfo(v.Type())
 	// When dst starts empty (fresh url.Values), single short package-allocated
 	// values of distinct keys share one backing array instead of allocating a
 	// 1-element slice each; the three-index slice caps entries so later
@@ -234,15 +259,25 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	// collectible slice so a surviving entry cannot keep a deleted neighbor's
 	// allocation alive; a non-empty dst keeps the single-map-op append pattern.
 	useScratch := len(dst) == 0
+	// An empty dst plus a plan that writes every key exactly once means each
+	// key is new, so the read that append needs — a second hash of the same
+	// key — can be skipped.
+	fresh := useScratch && freshKeys
 	var scratch []string
 	appendValue := func(name, s string, scratchSafe bool) {
 		if !useScratch || !scratchSafe || len(s) > maxScratchValueLen {
+			if fresh {
+				dst[name] = []string{s}
+				return
+			}
 			dst[name] = append(dst[name], s)
 			return
 		}
-		if old := dst[name]; old != nil {
-			dst[name] = append(old, s)
-			return
+		if !fresh {
+			if old := dst[name]; old != nil {
+				dst[name] = append(old, s)
+				return
+			}
 		}
 		if scratch == nil {
 			scratch = make([]string, 0, len(fields))
