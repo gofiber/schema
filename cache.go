@@ -133,8 +133,14 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	var t reflect.Type
 	var field *fieldInfo
 	var index64 int64
-	var parts []pathPart
-	var hops []pathHop
+	// A path yields at most one hop and one part per segment, so sizing both
+	// from the segment count keeps the parse to one allocation each instead
+	// of growing them. The hops of every part share one backing array, cut
+	// into capped slices as the parts are emitted.
+	segments := strings.Count(p, ".") + 1
+	parts := make([]pathPart, 0, segments)
+	hopBuf := make([]pathHop, 0, segments)
+	hopStart := 0
 	for keyStart := 0; ; {
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
 		if err != nil {
@@ -146,7 +152,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		// Valid field. Append the hop; the field's index chain was resolved
 		// when the structInfo was built, so the decoder walks plain indices
 		// instead of repeating FieldByName lookups on every Decode call.
-		hops = append(hops, pathHop{index: field.index, ensure: struc.anonymousPtrFields})
+		hopBuf = append(hopBuf, pathHop{index: field.index, ensure: struc.anonymousPtrFields})
 		if field.isSliceOfStructs && !field.isMultipart && (!field.unmarshalerInfo.IsValid || (field.unmarshalerInfo.IsValid && field.unmarshalerInfo.IsSliceElement)) {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
@@ -169,13 +175,14 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			if index64 > maxParserIndex {
 				return nil, errIndexTooLarge
 			}
+			hops := hopBuf[hopStart:len(hopBuf):len(hopBuf)]
+			hopStart = len(hopBuf)
 			parts = append(parts, pathPart{
 				hops:      hops,
 				field:     field,
 				index:     int(index64),
 				soleIndex: soleHopIndex(hops),
 			})
-			hops = nil
 
 			// Get the next struct type, dropping ptrs.
 			if field.typ.Kind() == reflect.Ptr {
@@ -209,6 +216,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	}
 	// Add the remaining. A part without hops means the path terminated at a
 	// slice index ("a.0"), so the decoder receives a slice element there.
+	hops := hopBuf[hopStart:len(hopBuf):len(hopBuf)]
 	parts = append(parts, pathPart{
 		hops:      hops,
 		field:     field,
