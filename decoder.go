@@ -27,9 +27,8 @@ const (
 var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
 
 // fileKeyValues stands in for the value of a multipart file's key in the
-// decode view. Nothing ever writes through a source map's values, and the map
-// it goes into is this package's own copy, so one shared slice serves every
-// file key instead of one allocation each.
+// decode view. Nothing writes through a source map's values and the map it
+// goes into is this package's own copy, so one slice serves every file key.
 var fileKeyValues = []string{""}
 
 var decodeValueBufferPool = sync.Pool{
@@ -147,19 +146,17 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	t := v.Type()
 	rootInfo := d.cache.get(t)
 	// Required-key bookkeeping rides along with the loop below so src is
-	// walked once: the direct lookups settle almost every group here, and a
-	// group still pending is answered by the nested keys the loop visits
-	// anyway.
+	// walked once: the direct lookups settle almost every group here, and
+	// the rest are answered by the nested keys the loop visits anyway.
 	var satisfied []uint64
 	pending := 0
 	if len(rootInfo.requiredGroups) > 0 {
-		// Declared here so a struct with no required keys never pays for
-		// zeroing the bitset.
+		// Declared here so a struct with no required keys never pays to
+		// zero it.
 		var requiredBits [requiredBitWords]uint64
 		satisfied, pending = markProvidedDirectly(rootInfo.requiredGroups, src, requiredBits[:])
 	}
-	// Only a struct with a slice of structs can grow anything, and only then
-	// is the tracker worth its zeroing.
+	// Only a struct whose paths carry an index can grow anything.
 	var grow *growTracker
 	if rootInfo.hasIndexedSlice {
 		var tracker growTracker
@@ -182,9 +179,8 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 			}
 		} else if err == errInvalidPath { //nolint:errorlint // the sentinel is returned unwrapped; see below
 			// By far the most common failure: a key that names no field.
-			// Query strings routinely carry those, and comparing the
-			// sentinel directly (parsePathInfo never wraps it) keeps
-			// errors.Is's unwrap loop off the per-key path.
+			// parsePathInfo never wraps the sentinel, so comparing it
+			// directly keeps errors.Is off the per-key path.
 			if !d.ignoreUnknownKeys {
 				multiErrors = appendError(multiErrors, path, UnknownKeyError{Key: path})
 			}
@@ -306,10 +302,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 	return errs
 }
 
-// growCap is the capacity to give a slice being grown to n elements. A
-// tracked slice gets room for another doubling, so the indices still to come
-// mostly land inside it; an untracked one gets exactly n, since the extra
-// would never be reused.
+// growCap is the capacity to give a slice being grown to n elements: room for
+// another doubling when the slice is tracked, so later indices mostly land
+// inside it, and exactly n when it is not, since the extra would go unused.
 func (d *Decoder) growCap(n int, tracked bool) int {
 	if !tracked {
 		return n
@@ -343,19 +338,18 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 //
 // A group is satisfied by a value under one of its own paths, or by any
 // nested key below one of them ("d.e" satisfies required "d"). Direct paths
-// are looked up first because they settle almost every group; whatever is
-// left is answered by the nested keys of src, each key's dotted prefixes
-// walked once, rather than rescanning the whole map per unsatisfied group.
-// Decode runs those three steps around its own loop over src so the map is
-// only walked once; checkRequired composes them for a standalone check.
+// are looked up first, since they settle almost every group; what is left is
+// answered by walking the dotted prefixes of each source key. Decode runs
+// those three steps around its own loop over src; checkRequired composes them
+// for a standalone check.
 
 // requiredBitWords sizes the inline satisfied-group bitset: 256 required
-// keys, past which the bitset is allocated instead.
+// keys, past which it is allocated.
 const requiredBitWords = 4
 
 // markProvidedDirectly marks every required group src answers through one of
-// its own paths. It returns the bitset — backed by inline when the groups fit
-// — and how many groups are still pending.
+// its own paths, returning the bitset — backed by inline when the groups fit
+// — and how many are still pending.
 func markProvidedDirectly(groups []requiredGroup, src map[string][]string, inline []uint64) ([]uint64, int) {
 	if len(groups) == 0 {
 		return nil, 0
@@ -378,9 +372,8 @@ func markProvidedDirectly(groups []requiredGroup, src map[string][]string, inlin
 
 // markProvidedByNestedKey walks the dotted prefixes of key from off, marking
 // every required group they name that val is non-empty for, and returns the
-// new pending count. Only a dotted, non-empty key can answer anything, and
-// callers test that themselves so the keys that cannot — most of them — do
-// not pay for a call.
+// new pending count. Callers test for a dotted, non-empty key themselves, so
+// the keys that can answer nothing do not pay for a call.
 func markProvidedByNestedKey(info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
 	for {
 		for _, p := range info.requiredPrefixes[key[:off]] {
@@ -414,8 +407,8 @@ func missingRequired(groups []requiredGroup, satisfied []uint64, pending int) Mu
 	return errs
 }
 
-// checkRequired reports which of info's required keys src leaves empty. It is
-// the standalone form of what Decode folds into its own loop.
+// checkRequired reports which of info's required keys src leaves empty: the
+// standalone form of what Decode folds into its own loop.
 func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
 	var inline [requiredBitWords]uint64
 	satisfied, pending := markProvidedDirectly(info.requiredGroups, src, inline[:])
@@ -440,8 +433,8 @@ type requiredGroup struct {
 	fields []fieldWithPrefix
 }
 
-// requiredPrefix names a group a nested source key can satisfy, paired with
-// the field type that judges whether the key's value counts as non-empty.
+// requiredPrefix names a group a nested source key can satisfy, with the
+// field type that judges whether the key's value counts as non-empty.
 type requiredPrefix struct {
 	typ   reflect.Type
 	group int
@@ -573,9 +566,9 @@ func isMultipartField(typ reflect.Type) bool {
 }
 
 // walkHops follows a path to the target field, dereferencing pointers and
-// allocating the embedded pointers promoted fields on the way need. It
+// allocating the embedded pointers promoted fields need on the way. It
 // returns the zero Value when an unsettable nil embedded pointer blocks the
-// walk, which the caller treats as an unreachable field.
+// walk.
 func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
 	for _, hop := range hops {
 		// A previous hop may have been blocked by an unsettable nil
@@ -627,11 +620,10 @@ func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 // growTracker remembers which of the destination struct's slice fields a
 // Decode call has already reallocated, and how much room it reserved in each.
 // Fields are keyed by their index in that struct, which is what pathPart's
-// soleIndex carries: only a slice reached by one hop from the root can be
-// tracked, because a deeper path reaches a slice inside some element and the
-// field alone cannot tell that apart from the same field in another element.
-// Four entries cover any realistic struct; further fields simply keep growing
-// exactly, which only costs time.
+// soleIndex carries: only a slice reached by one hop can be tracked, since a
+// deeper path reaches a slice inside some element, which the field alone
+// cannot tell apart from the same field in another. Fields past the four
+// entries keep growing exactly.
 type growTracker struct {
 	fields [4]int
 	caps   [4]int
@@ -639,7 +631,7 @@ type growTracker struct {
 }
 
 // reserved returns the capacity this call gave the slice at struct field
-// index i, or 0 if it has not reallocated that one.
+// index i, or 0 if it has not reallocated it.
 func (g *growTracker) reserved(i int) int {
 	for j := 0; j < g.n; j++ {
 		if g.fields[j] == i {
@@ -664,12 +656,10 @@ func (g *growTracker) record(i, c int) {
 }
 
 // decode fills a struct field using a parsed path. grow is non-nil only for
-// the outermost call of a path, which is where slice-of-structs growth can be
-// tracked.
+// the outermost call, the one place slice growth can be tracked.
 func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader, grow *growTracker) error {
 	// Get the field walking the struct fields by index. Almost every path is
-	// a single hop into a field of v, which needs none of the loop's
-	// bookkeeping.
+	// one hop into a field of v, which needs none of the loop's bookkeeping.
 	if idx := parts[0].soleIndex; idx >= 0 && v.Kind() == reflect.Struct {
 		v = v.Field(idx)
 	} else if v = walkHops(v, parts[0].hops); !v.IsValid() {
@@ -730,9 +720,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		if n := idx + 1; v.IsNil() || v.Len() < n {
 			// Indices arrive in map order, so a slice is typically grown
 			// several times per call. Extending one this call allocated is
-			// free — the room past its length is ours, freshly zeroed, and
-			// nothing else can see it. Only a slice reached by one hop from
-			// the destination struct qualifies; see growTracker.
+			// free: the room past its length is ours and freshly zeroed.
 			owner := -1
 			if grow != nil {
 				owner = parts[0].soleIndex
@@ -742,7 +730,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			} else {
 				// Otherwise grow into a fresh backing array: extending within
 				// the existing capacity would write into memory the caller
-				// may still share through other slices aliasing it.
+				// may still share through another slice aliasing it.
 				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
 				if v.Len() > 0 {
 					// Resize it.
@@ -858,11 +846,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 }
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
-// to make a round trip through a reflect.Value: a custom converter, a
-// TextUnmarshaler, or pointer elements. It is split out of decode so that
-// decode — which runs once per source key — carries no defer of its own,
-// while the pooled item buffer here still returns to the pool on every exit,
-// error paths included.
+// to round-trip through a reflect.Value: a custom converter, a
+// TextUnmarshaler, or pointer elements. It is split out so that decode, which
+// runs once per source key, carries no defer of its own.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
 	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
 	items := (*itemsBuf)[:0]
@@ -1167,9 +1153,8 @@ type ConversionError struct {
 }
 
 // The error strings below are assembled by concatenation instead of
-// fmt.Sprintf: %q is strconv.Quote and %d is utils.FormatInt (which answers
-// small indices from a table), so the messages are byte-identical while
-// skipping the reflection-based formatter.
+// fmt.Sprintf: %q is strconv.Quote and %d is utils.FormatInt, so the messages
+// are byte-identical without the reflection-based formatter.
 func (e ConversionError) Error() string {
 	var output string
 

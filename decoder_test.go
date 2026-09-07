@@ -2539,9 +2539,8 @@ func TestSliceGrowthDoesNotExtendCallerCapacity(t *testing.T) {
 	}
 }
 
-// The same struct type can sit at two places in a tree, so its slice field is
-// two different slices. Growing one must never be mistaken for growing the
-// other, whatever order the keys arrive in.
+// The same struct type at two places in a tree means two different slices;
+// growing one must never be mistaken for growing the other.
 func TestSliceGrowthKeepsSiblingSlicesApart(t *testing.T) {
 	t.Parallel()
 
@@ -2581,8 +2580,8 @@ func TestSliceGrowthKeepsSiblingSlicesApart(t *testing.T) {
 	}
 }
 
-// Every index must land in the right element no matter what order the source
-// map hands them over, and the gaps between them must stay zero.
+// Every index lands in the right element whatever order the map hands them
+// over, with the gaps between them left zero.
 func TestSliceGrowthFillsEveryIndex(t *testing.T) {
 	t.Parallel()
 
@@ -3858,10 +3857,9 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 	}
 }
 
-// referenceCheckRequired is the pre-rewrite required-field check: for every
-// group, a linear scan of the whole source map per field path. checkRequired
-// replaced it with a bitset plus a single prefix-indexed pass, so the two must
-// agree on every input.
+// referenceCheckRequired is the pre-rewrite required-field check: a linear
+// scan of the whole source map per group and field path. The bitset and
+// prefix index that replaced it must agree with it on every input.
 func referenceCheckRequired(info *structInfo, src map[string][]string) map[string]bool {
 	missing := map[string]bool{}
 	for _, group := range info.requiredGroups {
@@ -3923,8 +3921,7 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 		reflect.TypeOf(outer{}), reflect.TypeOf(deep{}),
 	}
 
-	// Every key any of the shapes above can be addressed by, plus a few that
-	// only look like they belong to one.
+	// Every key the shapes above can be addressed by, plus lookalikes.
 	keys := []string{
 		"a", "b", "e", "free", "x", "y", "m", "l", "l.x", "l.y",
 		"mid", "mid.m", "mid.l", "mid.l.x", "mid.l.y",
@@ -3965,8 +3962,7 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 }
 
 // requiredFormStruct mirrors a typical form payload: a few required scalars
-// plus a required nested struct, which is the shape that used to force a full
-// scan of the source map per required key.
+// plus a required nested struct, which no direct lookup can settle.
 type requiredAddress struct {
 	Street string `schema:"street,required"`
 	City   string `schema:"city,required"`
@@ -3981,8 +3977,8 @@ type requiredFormStruct struct {
 	Note    string          `schema:"note"`
 }
 
-// wideRequiredSrc is a request carrying the required fields plus the sort of
-// unrelated parameters a real query string comes with.
+// wideRequiredSrc carries the required fields plus the unrelated parameters a
+// real query string comes with.
 func wideRequiredSrc() map[string][]string {
 	src := map[string][]string{
 		"name":           {"Grace"},
@@ -4010,8 +4006,8 @@ func BenchmarkCheckRequiredFieldsWideSrc(b *testing.B) {
 	}
 }
 
-// The same shape with a required key missing, so the nested-key pass cannot
-// short-circuit and every group has to be resolved.
+// The same shape with a required key missing, so nothing short-circuits and
+// every group has to be resolved.
 func BenchmarkCheckRequiredFieldsWideSrcMissing(b *testing.B) {
 	src := wideRequiredSrc()
 	delete(src, "address.street")
@@ -4075,9 +4071,9 @@ func TestConversionErrorError(t *testing.T) {
 	}
 }
 
-// The error messages are assembled by concatenation rather than fmt.Sprintf,
-// so pin them against the formatter they replaced — quoting, index rendering
-// and the wrapped-error suffix all have to stay byte-identical.
+// The error messages are assembled by concatenation rather than fmt.Sprintf:
+// quoting, index rendering and the wrapped-error suffix all have to stay
+// byte-identical to the formatter they replaced.
 func TestErrorMessagesMatchSprintf(t *testing.T) {
 	t.Parallel()
 	keys := []string{"", "f", "a.b.0.c", `we"ird`, "tab\there", "ünïcøde", "a\x00b"}

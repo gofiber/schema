@@ -8,7 +8,7 @@ import (
 )
 
 // formatFloatFixed must be indistinguishable from the strconv call it
-// replaces, so every case here is a differential check against it.
+// replaces, so every case here checks against it.
 func checkFloatFixed(t *testing.T, f float64, bitSize int) {
 	t.Helper()
 	got := formatFloatFixed(f, bitSize)
@@ -18,8 +18,8 @@ func checkFloatFixed(t *testing.T, f float64, bitSize int) {
 	}
 }
 
-// The formatter hard-codes the scale and the buffer sizes that go with the
-// precision, so pin them to encFloatPrec.
+// The formatter hard-codes the scale and buffer sizes that go with the
+// precision; pin them to encFloatPrec.
 func TestFormatFloatFixedConstants(t *testing.T) {
 	t.Parallel()
 
@@ -63,8 +63,8 @@ func TestFormatFloatFixedEdgeCases(t *testing.T) {
 }
 
 // A float's exact expansion terminates at its last significand bit, so every
-// tie at six decimals is a dyadic rational m/2^k with small k. Those are the
-// only inputs where round-half-to-even can disagree with round-half-up.
+// tie at six decimals is a dyadic rational m/2^k with small k — the only
+// inputs where round-half-to-even can disagree with round-half-up.
 func TestFormatFloatFixedTies(t *testing.T) {
 	for k := 1; k <= 12; k++ {
 		unit := math.Ldexp(1, -k)
@@ -74,8 +74,8 @@ func TestFormatFloatFixedTies(t *testing.T) {
 	}
 }
 
-// Values one ULP either side of a x.xxxxxx5 boundary are where a rounding
-// bug would show up without being an exact tie.
+// One ULP either side of a x.xxxxxx5 boundary is where a rounding bug shows
+// up without being an exact tie.
 func TestFormatFloatFixedBoundaries(t *testing.T) {
 	for m := int64(0); m < 200_000; m++ {
 		f := float64(m)/1e6 + 5e-7
@@ -115,7 +115,7 @@ func TestFormatFloatFixedRandom(t *testing.T) {
 }
 
 // Sweeping float32 bit patterns covers subnormals and the whole exponent
-// range that the 32-bit encoder path can see.
+// range the 32-bit encoder path can see.
 func TestFormatFloatFixedFloat32Sweep(t *testing.T) {
 	for u := uint64(0); u < 1<<32; u += 4127 {
 		f := float64(math.Float32frombits(uint32(u)))

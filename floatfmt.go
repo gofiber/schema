@@ -16,25 +16,24 @@ const encFloatPrec = 6
 // integer the formatter prints.
 const scaleFixed = 1_000_000
 
-// fastFixedLimit bounds the magnitude the exact-integer path accepts. Below
-// it, |value|*10^6 stays under 10^18, so the scaled result and the +1 a
-// round-up may add both fit a uint64 with room to spare.
+// fastFixedLimit bounds the magnitude the exact-integer path accepts: below
+// it |value|*10^6 stays under 10^18, so the scaled result and a round-up's +1
+// both fit a uint64.
 const fastFixedLimit = 1e12
 
 // formatFloatFixed is strconv.FormatFloat(f, 'f', encFloatPrec, bitSize).
 //
 // strconv has no Ryū fast path for the 'f' verb with a fixed precision (see
 // the `fmt != 'f'` guard in its ftoa), so every such call runs the
-// multi-precision decimal path — by far the most expensive step in encoding
-// a struct with float fields. A float's exact value is mant*2^exp, so for
+// multi-precision decimal path. A float's exact value is mant*2^exp, so for
 // exponents in range the printed digits are exactly
-// round-half-to-even(mant*10^6 * 2^exp), which a 128-bit multiply and a
-// shift compute directly; utils.AppendUint then lays down the digits. Inf,
-// NaN and magnitudes outside the fast range fall back to strconv.
+// round-half-to-even(mant*10^6 * 2^exp), which a 128-bit multiply and a shift
+// compute directly; utils.AppendUint then lays down the digits. Inf, NaN and
+// magnitudes outside the fast range fall back to strconv.
 func formatFloatFixed(f float64, bitSize int) string {
 	if bitSize == 32 {
-		// strconv formats the float32 value, whose exact binary value is
-		// what the decomposition below must see.
+		// strconv formats the float32 value, which is what the decomposition
+		// below must see.
 		f = float64(float32(f))
 	}
 
@@ -54,7 +53,7 @@ func formatFloatFixed(f float64, bitSize int) string {
 	// f == mant * 2^exp exactly.
 	exp := biasedExp - 1023 - 52
 	// exp >= 0 means |f| >= 2^52, where f*10^6 overflows a uint64; the
-	// magnitude check then bounds the scaled value for everything else.
+	// magnitude check bounds the scaled value for everything else.
 	if exp >= 0 || f > fastFixedLimit || f < -fastFixedLimit {
 		return strconv.FormatFloat(f, 'f', encFloatPrec, bitSize)
 	}

@@ -135,8 +135,8 @@ func TestCompat(t *testing.T) {
 	}
 }
 
-// Integer fields are routed to width-specific utils formatters, so check
-// every one against strconv over its full (or boundary) range.
+// Integer fields are routed to width-specific utils formatters; check each
+// against strconv over its full, or boundary, range.
 func TestEncodeIntegerWidths(t *testing.T) {
 	t.Parallel()
 
@@ -202,10 +202,9 @@ func TestEncodeIntegerWidths(t *testing.T) {
 	}
 }
 
-// encode skips reading a key back before writing it when the plan is known to
-// write every key exactly once. The shapes that break that assumption —
-// duplicate aliases, and nested structs whose keys land in the same map —
-// must still accumulate every value.
+// encode skips reading a key back before writing it when the plan writes
+// every key once. The shapes that break that — duplicate aliases, and nested
+// structs whose keys land in the same map — must still accumulate values.
 func TestEncodeRepeatedKeys(t *testing.T) {
 	t.Parallel()
 
@@ -260,8 +259,8 @@ func TestEncodeRepeatedKeys(t *testing.T) {
 		t.Fatalf("nil pointer struct key collision lost values: %v", got)
 	}
 
-	// And the plan flag itself: a flat struct with distinct names is the only
-	// shape the fast path may claim.
+	// The flag itself: a flat struct with distinct names is the only shape
+	// the fast path may claim.
 	type flat struct {
 		A string `schema:"a"`
 		B int    `schema:"b"`
@@ -282,9 +281,8 @@ func TestEncodeRepeatedKeys(t *testing.T) {
 	}
 }
 
-// omitempty on a struct field must keep honouring an IsZero method, and must
-// keep falling back to a field-by-field comparison without one — now that the
-// plan settles which of the two applies.
+// Now that the plan settles which applies, omitempty on a struct field must
+// still honour an IsZero method, and still fall back to comparing fields.
 func TestOmitEmptyStructFields(t *testing.T) {
 	t.Parallel()
 

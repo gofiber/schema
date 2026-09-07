@@ -52,9 +52,9 @@ type encPlan struct {
 	gen    uint64
 	// freshKeys reports that encoding a value of this type into an empty map
 	// writes every key exactly once: no two fields share a name, and no field
-	// is recursed into (nested structs are encoded into the same map, without
-	// a prefix, so their keys could collide with these). encode can then
-	// assign each key outright instead of reading it back to append to it.
+	// is recursed into — a nested struct's keys land in the same map, without
+	// a prefix, so they could collide with these. encode can then assign each
+	// key outright instead of reading it back to append.
 	freshKeys bool
 }
 
@@ -73,10 +73,9 @@ type encField struct {
 	// caller-owned buffer and may be batched in encode's shared scratch.
 	scratchSafe bool
 	// hasIsZero marks a struct-typed field whose type decides omitempty for
-	// itself through an IsZero method. Settling that at plan-build time keeps
-	// the check off reflect.Value.Interface, which copies the struct to the
-	// heap every time it is asked — for the types that have no such method
-	// as much as for the ones that do.
+	// itself through an IsZero method. Settling that here keeps the check off
+	// reflect.Value.Interface, which copies the struct to the heap every time
+	// it is asked — whether or not the method is there.
 	hasIsZero bool
 	isStruct  bool
 	// nilAsNull marks pointer fields whose element has no immediate
@@ -200,9 +199,9 @@ func (e *Encoder) structInfo(t reflect.Type) (fields []encField, freshKeys bool)
 	return fields, freshKeys
 }
 
-// writesEachKeyOnce reports whether the plan's fields write distinct
-// destination keys and none of them recurses into a nested struct, whose keys
-// would land in the same map and could repeat one of these.
+// writesEachKeyOnce reports whether the plan's fields write distinct keys and
+// none recurses into a nested struct, whose keys land in the same map and
+// could repeat one of these.
 func writesEachKeyOnce(fields []encField) bool {
 	names := make(map[string]struct{}, len(fields))
 	for i := range fields {
@@ -219,24 +218,23 @@ func writesEachKeyOnce(fields []encField) bool {
 }
 
 // zeroer is the optional method a type can provide to decide, for omitempty,
-// whether one of its values counts as empty.
+// whether a value of it counts as empty.
 type zeroer interface{ IsZero() bool }
 
 var zeroerType = reflect.TypeFor[zeroer]()
 
-// isZeroValue applies omitempty to one of this field's values. It is isZero
-// with the struct case answered from the plan, so neither outcome has to go
-// through reflect.Value.Interface: taking the address of an addressable
-// struct yields an interface without copying it, and a type known to have no
-// IsZero method skips the conversion altogether.
+// isZeroValue applies omitempty to one of this field's values: isZero with
+// the struct case answered from the plan, so neither outcome goes through
+// reflect.Value.Interface. An addressable struct becomes an interface through
+// its address, without a copy, and a type known to lack IsZero skips the
+// conversion altogether.
 func (f *encField) isZeroValue(v reflect.Value) bool {
 	if v.Kind() != reflect.Struct || !v.CanInterface() {
 		return isZero(v)
 	}
 	if f.hasIsZero {
 		if v.CanAddr() {
-			// A value receiver's IsZero is in the pointer's method set too,
-			// and a pointer becomes an interface without a copy.
+			// A value receiver's IsZero is in the pointer's method set too.
 			iz, _ := reflect.TypeAssert[zeroer](v.Addr())
 			return iz.IsZero()
 		}
@@ -299,9 +297,8 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 	// collectible slice so a surviving entry cannot keep a deleted neighbor's
 	// allocation alive; a non-empty dst keeps the single-map-op append pattern.
 	useScratch := len(dst) == 0
-	// An empty dst plus a plan that writes every key exactly once means each
-	// key is new, so the read that append needs — a second hash of the same
-	// key — can be skipped.
+	// An empty dst plus a plan that writes every key once means each key is
+	// new, so the read append needs — a second hash of the key — is skipped.
 	fresh := useScratch && freshKeys
 	var scratch []string
 	appendValue := func(name, s string, scratchSafe bool) {
@@ -498,10 +495,9 @@ func encodeBool(v reflect.Value) string {
 	return strconv.FormatBool(v.Bool())
 }
 
-// Integers are formatted through the width-specific utils helpers: the 8-bit
-// ones are table lookups (no allocation at all) and the 32-bit ones skip a
-// digit group the 64-bit formatter has to consider, so dispatching on the
-// field's kind at plan-build time is free at encode time.
+// Integers go through the width-specific utils helpers: the 8-bit ones are
+// table lookups, allocating nothing, and the 32-bit ones skip a digit group
+// the 64-bit formatter has to consider.
 
 func encodeInt(v reflect.Value) string {
 	return utils.FormatInt(v.Int())

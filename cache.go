@@ -111,14 +111,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 					return parts, nil
 				}
 			}
-			// Both probes have now seen the key in canonical form, and every
-			// field a bare alias can reach is in the direct map (see
-			// buildDirectPaths, which adds the flat aliases before the cap
-			// can truncate anything). A dotless key that missed therefore
-			// names no field, so reject it without consulting the
-			// parsed-path cache or running the parser — unrecognized keys
-			// are a normal part of any query string, and this is the shape
-			// almost all of them have.
+			// Every field a bare alias can reach is in the direct map
+			// (buildDirectPaths adds the flat aliases before the cap can
+			// truncate anything), and both probes have now seen the key
+			// folded, so a dotless miss names no field.
 			if strings.IndexByte(p, '.') < 0 {
 				return nil, errInvalidPath
 			}
@@ -133,10 +129,9 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	var t reflect.Type
 	var field *fieldInfo
 	var index64 int64
-	// A path yields at most one hop and one part per segment, so sizing both
-	// from the segment count keeps the parse to one allocation each instead
-	// of growing them. The hops of every part share one backing array, cut
-	// into capped slices as the parts are emitted.
+	// A path yields at most one hop and one part per segment. The hops of
+	// every part share one backing array, cut into capped slices as the
+	// parts are emitted.
 	segments := strings.Count(p, ".") + 1
 	parts := make([]pathPart, 0, segments)
 	hopBuf := make([]pathHop, 0, segments)
@@ -230,23 +225,20 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	return cached, nil
 }
 
-// maxFastPaths bounds the copy-on-write map behind pathCache. Publishing a
-// fresh map per newly seen path is what keeps reads lock-free, but each
-// publish copies the whole map, so past this many paths further entries go to
-// the spill map instead of making the copies grow without end. Real structs
-// stay well inside the bound.
+// maxFastPaths bounds pathCache's copy-on-write map: each publish copies the
+// whole map, so past this many paths further entries spill instead. Real
+// structs stay well inside it.
 const maxFastPaths = 512
 
 // pathCache caches parsed paths for one struct type, keyed by the raw source
-// key. Lookups run against a plain string-keyed map published atomically:
-// parsePathInfo probes the cache once per source key, hit or miss, and
-// sync.Map's interface-typed keys make every probe pay a type hash and a trie
-// walk. Writes happen once per newly seen path, under a lock and onto a copy,
-// so a reader only ever sees a complete map.
+// key. Lookups run against a plain string-keyed map published atomically —
+// sync.Map's interface keys cost a type hash and a trie walk, and
+// parsePathInfo probes once per source key. Writes copy the map under the
+// lock, so a reader only ever sees a complete one.
 type pathCache struct {
 	fast atomic.Pointer[map[string][]pathPart]
-	// spill holds paths seen after fast was sealed at maxFastPaths, so a
-	// key space larger than the bound keeps its cache rather than losing it.
+	// spill holds paths seen after fast was sealed, so a key space larger
+	// than maxFastPaths keeps its cache.
 	spill  sync.Map // map[string][]pathPart
 	mu     sync.Mutex
 	sealed atomic.Bool
@@ -267,8 +259,8 @@ func (c *pathCache) load(key string) ([]pathPart, bool) {
 	return nil, false
 }
 
-// loadOrStore caches parts under key and returns them, or returns what a
-// concurrent call cached there first.
+// loadOrStore caches parts under key, or returns what a concurrent call
+// cached there first.
 func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool) {
 	if !c.sealed.Load() {
 		c.mu.Lock()
@@ -280,7 +272,6 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 			}
 		}
 		if old == nil || len(*old) < maxFastPaths {
-			// Sized for the copy so the map is built once, not grown into.
 			var next map[string][]pathPart
 			if old == nil {
 				next = make(map[string][]pathPart, 1)
@@ -300,7 +291,6 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 	return v.([]pathPart), loaded
 }
 
-// clear drops every cached path.
 func (c *pathCache) clear() {
 	c.mu.Lock()
 	c.fast.Store(nil)
@@ -313,10 +303,9 @@ func (c *pathCache) clear() {
 }
 
 // foldASCIILower writes the ASCII-lowercased form of s into buf and reports
-// whether any byte changed. Folding word-at-a-time (SWAR) into a caller-owned
-// stack buffer lets the case-insensitive map probes below run without the
-// allocation utilstrings.ToLower makes for a mixed-case key. The caller
-// guarantees len(buf) >= len(s).
+// whether any byte changed. Folding into a caller-owned stack buffer lets the
+// case-insensitive map probes below skip the allocation utilstrings.ToLower
+// makes for a mixed-case key. The caller guarantees len(buf) >= len(s).
 func foldASCIILower(buf []byte, s string) bool {
 	n := len(s)
 	changed := false
@@ -525,8 +514,8 @@ func directEligible(info *structInfo, f *fieldInfo) bool {
 }
 
 // takesIndex reports whether a path through f must carry a slice element
-// index: f is a slice of structs the decoder walks into element by element,
-// rather than one it hands to a multipart binder or a TextUnmarshaler whole.
+// index: f is a slice of structs walked element by element, not one handed to
+// a multipart binder or a TextUnmarshaler whole.
 func (f *fieldInfo) takesIndex() bool {
 	return f.isSliceOfStructs && !f.isMultipart &&
 		(!f.unmarshalerInfo.IsValid || f.unmarshalerInfo.IsSliceElement)
@@ -659,10 +648,9 @@ type structInfo struct {
 	fields             []*fieldInfo
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
-	// requiredGroups lists the required keys in a stable order so each one
-	// has an index checkRequired can address in a bitset, and
-	// requiredPrefixes maps a nested-key prefix to the groups a source key
-	// under it can satisfy; both are built once per struct type.
+	// requiredGroups lists the required keys in a stable order, so each has
+	// an index the satisfied-group bitset can address; requiredPrefixes maps
+	// a nested-key prefix to the groups a key under it can satisfy.
 	requiredGroups   []requiredGroup
 	requiredPrefixes map[string][]requiredPrefix
 	// direct maps lowercase statically-resolvable keys to their precomputed
@@ -672,7 +660,7 @@ type structInfo struct {
 	// so they never alias reused request buffers.
 	paths pathCache
 	// hasIndexedSlice reports whether any field's paths carry a slice element
-	// index, and so may grow that slice as keys arrive.
+	// index, and so may grow that slice while decoding.
 	hasIndexedSlice bool
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
@@ -682,12 +670,10 @@ type structInfo struct {
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
-	// fieldsByName is keyed by lowercase alias, so probing the raw alias
-	// first settles the common already-lowercase case without folding it at
-	// all. On a miss the alias is folded into a stack buffer and probed from
-	// there; the compiler elides the string conversion in a map index, so
-	// the mixed-case case allocates nothing either. Aliases too long for the
-	// buffer are rare enough to keep taking the allocating path.
+	// fieldsByName is keyed by lowercase alias, so the raw probe settles an
+	// already-lowercase one without folding. A mixed-case alias is folded
+	// into a stack buffer and probed from there: the compiler elides the
+	// string conversion in a map index, so that allocates nothing either.
 	if field, ok := i.fieldsByName[alias]; ok {
 		return field
 	}
@@ -736,9 +722,8 @@ func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
 }
 
 // buildRequiredPrefixes indexes the groups by the nested-key prefix that can
-// satisfy them ("d." for required key "d"), so checkRequired can resolve every
-// nested key in one pass over the source map instead of rescanning it per
-// group.
+// satisfy them ("d." for required key "d"), so a source key can be resolved
+// against all of them at once.
 func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 	if len(groups) == 0 {
 		return nil
@@ -748,8 +733,8 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 		for _, f := range groups[gi].fields {
 			for _, dot := range f.searchPathDots {
 				owners := prefixes[dot]
-				// The same group can reach one prefix through several
-				// fields; one entry per (group, type) is enough.
+				// One entry per (group, type): several fields of a group
+				// can reach the same prefix.
 				dup := false
 				for _, o := range owners {
 					if o.group == gi && o.typ == f.typ {
@@ -832,8 +817,8 @@ type pathPart struct {
 	field *fieldInfo
 	hops  []pathHop // path to the field: walks structs using field indices.
 	index int       // struct index in slices of structs.
-	// soleIndex is the single struct field index hops walks, or -1 when the
-	// walk needs the general loop; see soleHopIndex.
+	// soleIndex is the single struct field index hops walks, or -1; see
+	// soleHopIndex.
 	soleIndex int
 	// elem marks a terminal part whose path ended at a slice index ("a.0"):
 	// the decoder's value is then an element of the slice field rather than
@@ -843,8 +828,7 @@ type pathPart struct {
 
 // soleHopIndex returns the single struct field index hops walks, or -1 when
 // the walk needs decode's general loop: several hops, a promoted field's
-// index chain, or embedded pointers to allocate on the way. Nearly every path
-// is the simple case, which decode can then follow with one Value.Field.
+// index chain, or embedded pointers to allocate on the way.
 func soleHopIndex(hops []pathHop) int {
 	if len(hops) != 1 || len(hops[0].ensure) != 0 || len(hops[0].index) != 1 {
 		return -1

@@ -120,7 +120,7 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 }
 
 // foldASCIILower backs the allocation-free case-insensitive probes, so it has
-// to agree with the utils folder it stands in for at every length and leave
+// to agree with the utils folder it stands in for at every length, and leave
 // non-ASCII bytes untouched.
 func TestFoldASCIILower(t *testing.T) {
 	t.Parallel()
@@ -151,9 +151,8 @@ func TestFoldASCIILower(t *testing.T) {
 	}
 }
 
-// A mixed-case path that the precomputed direct map cannot answer walks the
-// generic parser, where every segment is case-folded before its field lookup;
-// that fold must not allocate.
+// A mixed-case path the direct map cannot answer walks the generic parser,
+// which folds every segment before its field lookup; that must not allocate.
 func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
 	type Nested struct {
 		Value string `schema:"value"`
@@ -175,8 +174,8 @@ func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
 
 // parsePathInfo rejects a dotless key that misses the direct map without
 // parsing it, which is only sound if every field a bare alias can reach is in
-// that map. Pin the invariant: across a range of struct shapes, a single-
-// segment path must parse exactly when the direct map holds its folded form.
+// that map: a single-segment path must parse exactly when the map holds its
+// folded form.
 func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 	t.Parallel()
 
@@ -209,7 +208,7 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 		reflect.TypeOf(Leaf{}), reflect.TypeOf(Dup{}),
 		reflect.TypeOf(Embedded{}), reflect.TypeOf(Shapes{}),
 	}
-	// Every alias above, some case variants, and keys that resemble one.
+	// Every alias above, some case variants, and keys that only resemble one.
 	keys := []string{
 		"value", "same", "promoted", "plain", "mixedcase", "MixedCase", "MIXEDCASE",
 		"nested", "nestedptr", "items", "scalars", "skipped", "-", "unexported",
@@ -260,8 +259,7 @@ func TestParsePathDetachesCacheKey(t *testing.T) {
 	}
 }
 
-// cachedPathKeys lists everything the cache currently holds, across both its
-// published map and its spill.
+// cachedPathKeys lists everything the cache holds, published map and spill.
 func cachedPathKeys(c *pathCache) []string {
 	var keys []string
 	if m := c.fast.Load(); m != nil {
@@ -276,8 +274,8 @@ func cachedPathKeys(c *pathCache) []string {
 	return keys
 }
 
-// Past maxFastPaths the cache stops growing the map it copies on every write
-// and spills instead, but every path must still be cached and served.
+// Past maxFastPaths the cache spills instead of growing the map it copies on
+// every write, but every path must still be cached and served.
 func TestPathCacheSpill(t *testing.T) {
 	t.Parallel()
 
@@ -307,8 +305,7 @@ func TestPathCacheSpill(t *testing.T) {
 	if got := len(*info.paths.fast.Load()); got != maxFastPaths {
 		t.Fatalf("published map holds %d paths, want %d", got, maxFastPaths)
 	}
-	// Every path, spilled or not, is still served from the cache and still
-	// resolves to the right index.
+	// Every path, spilled or not, still resolves to the right index.
 	for i, p := range want {
 		parts, ok := info.paths.load(p)
 		if !ok {
