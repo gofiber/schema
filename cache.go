@@ -114,8 +114,8 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		}
 	}
 
-	if cached, ok := rootInfo.paths.Load(p); ok {
-		return cached.([]pathPart), nil
+	if cached, ok := rootInfo.paths.load(p); ok {
+		return cached, nil
 	}
 
 	struc := rootInfo
@@ -205,11 +205,87 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	})
 
 	// Detach the key: callers may pass strings aliasing reused request buffers.
-	if cached, loaded := rootInfo.paths.LoadOrStore(strings.Clone(p), parts); loaded {
-		return cached.([]pathPart), nil
-	}
+	cached, _ := rootInfo.paths.loadOrStore(strings.Clone(p), parts)
+	return cached, nil
+}
 
-	return parts, nil
+// maxFastPaths bounds the copy-on-write map behind pathCache. Publishing a
+// fresh map per newly seen path is what keeps reads lock-free, but each
+// publish copies the whole map, so past this many paths further entries go to
+// the spill map instead of making the copies grow without end. Real structs
+// stay well inside the bound.
+const maxFastPaths = 512
+
+// pathCache caches parsed paths for one struct type, keyed by the raw source
+// key. Lookups run against a plain string-keyed map published atomically:
+// parsePathInfo probes the cache once per source key, hit or miss, and
+// sync.Map's interface-typed keys make every probe pay a type hash and a trie
+// walk. Writes happen once per newly seen path, under a lock and onto a copy,
+// so a reader only ever sees a complete map.
+type pathCache struct {
+	fast atomic.Pointer[map[string][]pathPart]
+	// spill holds paths seen after fast was sealed at maxFastPaths, so a
+	// key space larger than the bound keeps its cache rather than losing it.
+	spill  sync.Map // map[string][]pathPart
+	mu     sync.Mutex
+	sealed atomic.Bool
+}
+
+func (c *pathCache) load(key string) ([]pathPart, bool) {
+	if m := c.fast.Load(); m != nil {
+		if parts, ok := (*m)[key]; ok {
+			return parts, true
+		}
+	}
+	// spill only ever receives entries once fast is sealed.
+	if c.sealed.Load() {
+		if v, ok := c.spill.Load(key); ok {
+			return v.([]pathPart), true
+		}
+	}
+	return nil, false
+}
+
+// loadOrStore caches parts under key and returns them, or returns what a
+// concurrent call cached there first.
+func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool) {
+	if !c.sealed.Load() {
+		c.mu.Lock()
+		old := c.fast.Load()
+		if old != nil {
+			if existing, ok := (*old)[key]; ok {
+				c.mu.Unlock()
+				return existing, true
+			}
+		}
+		if old == nil || len(*old) < maxFastPaths {
+			next := make(map[string][]pathPart, 1)
+			if old != nil {
+				next = make(map[string][]pathPart, len(*old)+1)
+				maps.Copy(next, *old)
+			}
+			next[key] = parts
+			c.fast.Store(&next)
+			c.mu.Unlock()
+			return parts, false
+		}
+		c.sealed.Store(true)
+		c.mu.Unlock()
+	}
+	v, loaded := c.spill.LoadOrStore(key, parts)
+	return v.([]pathPart), loaded
+}
+
+// clear drops every cached path.
+func (c *pathCache) clear() {
+	c.mu.Lock()
+	c.fast.Store(nil)
+	// Nothing reaches spill before the seal, so an unsealed cache has none.
+	if c.sealed.Load() {
+		c.spill.Clear()
+		c.sealed.Store(false)
+	}
+	c.mu.Unlock()
 }
 
 // foldASCIILower writes the ASCII-lowercased form of s into buf and reports
@@ -552,10 +628,9 @@ type structInfo struct {
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
-	// paths caches parsed paths rooted at this struct type
-	// (map[string][]pathPart); keys are cloned so they never alias reused
-	// request buffers.
-	paths sync.Map
+	// paths caches parsed paths rooted at this struct type; keys are cloned
+	// so they never alias reused request buffers.
+	paths pathCache
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
 	// anonymous embedded pointer field (which the walk allocates) exists

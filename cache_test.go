@@ -2,6 +2,7 @@ package schema
 
 import (
 	"reflect"
+	"strconv"
 	"testing"
 
 	utils "github.com/gofiber/utils/v2"
@@ -110,7 +111,7 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 	b.ReportAllocs()
 	info := d.cache.get(typ)
 	for b.Loop() {
-		info.paths.Clear()
+		info.paths.clear()
 		if _, err := d.cache.parsePath("items.0.value", typ); err != nil {
 			b.Fatal(err)
 		}
@@ -164,7 +165,7 @@ func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
 	b.ReportAllocs()
 	info := d.cache.get(typ)
 	for b.Loop() {
-		info.paths.Clear()
+		info.paths.clear()
 		if _, err := d.cache.parsePath("Items.0.Value", typ); err != nil {
 			b.Fatal(err)
 		}
@@ -190,15 +191,82 @@ func TestParsePathDetachesCacheKey(t *testing.T) {
 	}
 	copy(buf, "xtems.9.qalue") // simulate fasthttp buffer reuse mutating the key bytes
 
-	count := 0
-	d.cache.get(reflect.TypeOf(s)).paths.Range(func(key, _ any) bool {
-		count++
-		if k := key.(string); k != "items.0.value" {
-			t.Fatalf("path cache key mutated to %q; key must be cloned before caching", k)
+	keys := cachedPathKeys(&d.cache.get(reflect.TypeOf(s)).paths)
+	if len(keys) != 1 {
+		t.Fatalf("expected 1 cached path, got %d (%v)", len(keys), keys)
+	}
+	if keys[0] != "items.0.value" {
+		t.Fatalf("path cache key mutated to %q; key must be cloned before caching", keys[0])
+	}
+}
+
+// cachedPathKeys lists everything the cache currently holds, across both its
+// published map and its spill.
+func cachedPathKeys(c *pathCache) []string {
+	var keys []string
+	if m := c.fast.Load(); m != nil {
+		for k := range *m {
+			keys = append(keys, k)
 		}
+	}
+	c.spill.Range(func(k, _ any) bool {
+		keys = append(keys, k.(string))
 		return true
 	})
-	if count != 1 {
-		t.Fatalf("expected 1 cached path, got %d", count)
+	return keys
+}
+
+// Past maxFastPaths the cache stops growing the map it copies on every write
+// and spills instead, but every path must still be cached and served.
+func TestPathCacheSpill(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	typ := reflect.TypeOf(S{})
+	info := d.cache.get(typ)
+
+	const n = maxFastPaths + 64
+	want := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		want = append(want, "items."+strconv.Itoa(i)+".value")
+	}
+	for _, p := range want {
+		if _, err := d.cache.parsePath(p, typ); err != nil {
+			t.Fatalf("parsePath(%q): %v", p, err)
+		}
+	}
+	if !info.paths.sealed.Load() {
+		t.Fatal("cache should be sealed past maxFastPaths")
+	}
+	if got := len(*info.paths.fast.Load()); got != maxFastPaths {
+		t.Fatalf("published map holds %d paths, want %d", got, maxFastPaths)
+	}
+	// Every path, spilled or not, is still served from the cache and still
+	// resolves to the right index.
+	for i, p := range want {
+		parts, ok := info.paths.load(p)
+		if !ok {
+			t.Fatalf("path %q not cached", p)
+		}
+		if parts[0].index != i {
+			t.Fatalf("path %q cached as index %d, want %d", p, parts[0].index, i)
+		}
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != n {
+		t.Fatalf("cache holds %d paths, want %d", got, n)
+	}
+
+	info.paths.clear()
+	if info.paths.sealed.Load() || info.paths.fast.Load() != nil {
+		t.Fatal("clear must reset the cache")
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != 0 {
+		t.Fatalf("cache holds %d paths after clear, want 0", got)
 	}
 }
