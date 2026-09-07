@@ -280,8 +280,11 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 			}
 		}
 		if old == nil || len(*old) < maxFastPaths {
-			next := make(map[string][]pathPart, 1)
-			if old != nil {
+			// Sized for the copy so the map is built once, not grown into.
+			var next map[string][]pathPart
+			if old == nil {
+				next = make(map[string][]pathPart, 1)
+			} else {
 				next = make(map[string][]pathPart, len(*old)+1)
 				maps.Copy(next, *old)
 			}
