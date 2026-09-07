@@ -282,6 +282,105 @@ func TestEncodeRepeatedKeys(t *testing.T) {
 	}
 }
 
+// omitempty on a struct field must keep honouring an IsZero method, and must
+// keep falling back to a field-by-field comparison without one — now that the
+// plan settles which of the two applies.
+func TestOmitEmptyStructFields(t *testing.T) {
+	t.Parallel()
+
+	type plain struct {
+		A int
+		B string
+	}
+	type S struct {
+		T     time.Time `schema:"t,omitempty"`
+		P     plain     `schema:"p,omitempty"`
+		Keep  time.Time `schema:"keep"`
+		After string    `schema:"after"`
+	}
+
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tv, _ := reflect.TypeAssert[time.Time](v)
+		return tv.Format(time.RFC3339)
+	})
+	enc.RegisterEncoder(plain{}, func(v reflect.Value) string {
+		pv, _ := reflect.TypeAssert[plain](v)
+		return fmt.Sprintf("%d/%s", pv.A, pv.B)
+	})
+
+	// Zero values of both shapes are dropped; the field without omitempty and
+	// the one after them are not.
+	vals := make(map[string][]string)
+	if err := enc.Encode(&S{After: "x"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vals["t"]; ok {
+		t.Errorf("zero time.Time should be omitted: %v", vals["t"])
+	}
+	if _, ok := vals["p"]; ok {
+		t.Errorf("zero struct should be omitted: %v", vals["p"])
+	}
+	if got := vals["after"]; len(got) != 1 || got[0] != "x" {
+		t.Errorf("after = %v", got)
+	}
+	if len(vals["keep"]) != 1 {
+		t.Errorf("field without omitempty should be encoded: %v", vals["keep"])
+	}
+
+	// Non-zero values of both shapes are kept.
+	vals = make(map[string][]string)
+	src := S{T: time.Date(2025, 1, 1, 12, 0, 0, 0, time.UTC), P: plain{A: 1, B: "b"}}
+	if err := enc.Encode(&src, vals); err != nil {
+		t.Fatal(err)
+	}
+	if len(vals["t"]) != 1 {
+		t.Errorf("non-zero time.Time should be encoded: %v", vals["t"])
+	}
+	if got := vals["p"]; len(got) != 1 || got[0] != "1/b" {
+		t.Errorf("non-zero struct should be encoded: %v", got)
+	}
+
+	// A non-addressable source takes the same decisions.
+	vals = make(map[string][]string)
+	if err := enc.Encode(src, vals); err != nil {
+		t.Fatal(err)
+	}
+	if len(vals["t"]) != 1 || len(vals["p"]) != 1 {
+		t.Errorf("non-addressable source dropped values: %v", vals)
+	}
+	vals = make(map[string][]string)
+	if err := enc.Encode(S{After: "x"}, vals); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := vals["t"]; ok {
+		t.Errorf("non-addressable zero time.Time should be omitted: %v", vals["t"])
+	}
+	if _, ok := vals["p"]; ok {
+		t.Errorf("non-addressable zero struct should be omitted: %v", vals["p"])
+	}
+}
+
+func BenchmarkOmitEmptyStructEncode(b *testing.B) {
+	type S struct {
+		T time.Time `schema:"t,omitempty"`
+		A string    `schema:"a"`
+	}
+	enc := NewEncoder()
+	enc.RegisterEncoder(time.Time{}, func(v reflect.Value) string {
+		tv, _ := reflect.TypeAssert[time.Time](v)
+		return tv.Format(time.RFC3339)
+	})
+	s := S{A: "x"}
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 4)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSizedIntegerEncode(b *testing.B) {
 	type sized struct {
 		I8  int8   `schema:"i8"`

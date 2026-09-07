@@ -72,7 +72,13 @@ type encField struct {
 	// package (numeric/bool/float formatters), so it can never alias a large
 	// caller-owned buffer and may be batched in encode's shared scratch.
 	scratchSafe bool
-	isStruct    bool
+	// hasIsZero marks a struct-typed field whose type decides omitempty for
+	// itself through an IsZero method. Settling that at plan-build time keeps
+	// the check off reflect.Value.Interface, which copies the struct to the
+	// heap every time it is asked — for the types that have no such method
+	// as much as for the ones that do.
+	hasIsZero bool
+	isStruct  bool
 	// nilAsNull marks pointer fields whose element has no immediate
 	// encoder (structs recursed via recurseStructPtr, or unsupported
 	// types): nil values encode as "null", matching the closure behavior
@@ -165,6 +171,7 @@ func (e *Encoder) structInfo(t reflect.Type) (fields []encField, freshKeys bool)
 				!e.hasCustomEncoder(ft),
 			enc:         typeEncoder(ft, e.regenc),
 			scratchSafe: scratchSafeEncoder(ft, e.regenc),
+			hasIsZero:   ft.Kind() == reflect.Struct && ft.Implements(zeroerType),
 		}
 		if f.enc == nil {
 			switch ft.Kind() {
@@ -207,6 +214,39 @@ func writesEachKeyOnce(fields []encField) bool {
 			return false
 		}
 		names[f.name] = struct{}{}
+	}
+	return true
+}
+
+// zeroer is the optional method a type can provide to decide, for omitempty,
+// whether one of its values counts as empty.
+type zeroer interface{ IsZero() bool }
+
+var zeroerType = reflect.TypeFor[zeroer]()
+
+// isZeroValue applies omitempty to one of this field's values. It is isZero
+// with the struct case answered from the plan, so neither outcome has to go
+// through reflect.Value.Interface: taking the address of an addressable
+// struct yields an interface without copying it, and a type known to have no
+// IsZero method skips the conversion altogether.
+func (f *encField) isZeroValue(v reflect.Value) bool {
+	if v.Kind() != reflect.Struct || !v.CanInterface() {
+		return isZero(v)
+	}
+	if f.hasIsZero {
+		if v.CanAddr() {
+			// A value receiver's IsZero is in the pointer's method set too,
+			// and a pointer becomes an interface without a copy.
+			iz, _ := reflect.TypeAssert[zeroer](v.Addr())
+			return iz.IsZero()
+		}
+		iz, _ := reflect.TypeAssert[zeroer](v)
+		return iz.IsZero()
+	}
+	for i := 0; i < v.NumField(); i++ {
+		if !isZero(v.Field(i)) {
+			return false
+		}
 	}
 	return true
 }
@@ -299,7 +339,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 
 		// Encode non-slice types and custom implementations immediately.
 		if f.enc != nil {
-			if f.omitEmpty && isZero(fieldValue) {
+			if f.omitEmpty && f.isZeroValue(fieldValue) {
 				continue
 			}
 			appendValue(f.name, f.enc(fieldValue), f.scratchSafe)
