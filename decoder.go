@@ -26,6 +26,12 @@ const (
 // hoisted so the check does not allocate on every call.
 var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
 
+// fileKeyValues stands in for the value of a multipart file's key in the
+// decode view. Nothing ever writes through a source map's values, and the map
+// it goes into is this package's own copy, so one shared slice serves every
+// file key instead of one allocation each.
+var fileKeyValues = []string{""}
+
 var decodeValueBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]reflect.Value, 0, 8)
@@ -132,7 +138,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 		merged := make(map[string][]string, len(src)+len(multipartFiles))
 		maps.Copy(merged, src)
 		for path := range multipartFiles {
-			merged[path] = []string{""}
+			merged[path] = fileKeyValues
 		}
 		src = merged
 	}
@@ -140,8 +146,25 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	v = v.Elem()
 	t := v.Type()
 	rootInfo := d.cache.get(t)
+	// Required-key bookkeeping rides along with the loop below so src is
+	// walked once: the direct lookups settle almost every group here, and a
+	// group still pending is answered by the nested keys the loop visits
+	// anyway.
+	var satisfied []uint64
+	pending := 0
+	if len(rootInfo.requiredGroups) > 0 {
+		// Declared here so a struct with no required keys never pays for
+		// zeroing the bitset.
+		var requiredBits [requiredBitWords]uint64
+		satisfied, pending = markProvidedDirectly(rootInfo.requiredGroups, src, requiredBits[:])
+	}
 	var multiErrors MultiError
 	for path, values := range src {
+		if pending > 0 {
+			if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
+				pending = markProvidedByNestedKey(rootInfo, path, i+1, values, satisfied, pending)
+			}
+		}
 		if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
 			var filesSlice []*multipart.FileHeader
 			if multipartFiles != nil {
@@ -167,7 +190,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 	if rootInfo.needsDefaultsWalk {
 		multiErrors = mergeErrors(multiErrors, d.setDefaults(t, v, src, ""))
 	}
-	multiErrors = mergeErrors(multiErrors, d.checkRequired(rootInfo, src))
+	multiErrors = mergeErrors(multiErrors, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(multiErrors) > 0 {
 		return multiErrors
 	}
@@ -289,36 +312,35 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 	return false
 }
 
-// checkRequired checks whether required fields are empty
-//
 // The set of required fields (including those of nested structs) is
-// precomputed once per struct type in structInfo.requiredGroups, so this
-// only performs the per-request emptiness checks against src.
+// precomputed once per struct type in structInfo.requiredGroups, so what
+// follows only performs the per-request emptiness checks against src.
 //
 // A group is satisfied by a value under one of its own paths, or by any
 // nested key below one of them ("d.e" satisfies required "d"). Direct paths
-// are looked up first because they settle almost every group; the nested
-// keys of whatever is left are then resolved in a single pass over src,
-// walking each key's dotted prefixes, rather than rescanning the whole map
-// once per unsatisfied group.
-//
-// src is the source map for decoding, we use it here to see if those required fields are included in src
-func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
-	groups := info.requiredGroups
-	if len(groups) == 0 {
-		return nil
-	}
+// are looked up first because they settle almost every group; whatever is
+// left is answered by the nested keys of src, each key's dotted prefixes
+// walked once, rather than rescanning the whole map per unsatisfied group.
+// Decode runs those three steps around its own loop over src so the map is
+// only walked once; checkRequired composes them for a standalone check.
 
-	// One bit per group; the inline array covers every realistic struct, so
-	// the common case allocates nothing.
-	var inline [4]uint64
-	var satisfied []uint64
+// requiredBitWords sizes the inline satisfied-group bitset: 256 required
+// keys, past which the bitset is allocated instead.
+const requiredBitWords = 4
+
+// markProvidedDirectly marks every required group src answers through one of
+// its own paths. It returns the bitset — backed by inline when the groups fit
+// — and how many groups are still pending.
+func markProvidedDirectly(groups []requiredGroup, src map[string][]string, inline []uint64) ([]uint64, int) {
+	if len(groups) == 0 {
+		return nil, 0
+	}
+	satisfied := inline
 	if w := (len(groups) + 63) >> 6; w <= len(inline) {
 		satisfied = inline[:w]
 	} else {
 		satisfied = make([]uint64, w)
 	}
-
 	pending := len(groups)
 	for gi := range groups {
 		if directlyProvided(groups[gi].fields, src) {
@@ -326,34 +348,35 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 			pending--
 		}
 	}
+	return satisfied, pending
+}
 
-	if pending > 0 {
-		for key, val := range src {
-			if len(val) == 0 {
+// markProvidedByNestedKey walks the dotted prefixes of key from off, marking
+// every required group they name that val is non-empty for, and returns the
+// new pending count. Only a dotted, non-empty key can answer anything, and
+// callers test that themselves so the keys that cannot — most of them — do
+// not pay for a call.
+func markProvidedByNestedKey(info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
+	for {
+		for _, p := range info.requiredPrefixes[key[:off]] {
+			if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
 				continue
 			}
-			for off := 0; ; {
-				i := strings.IndexByte(key[off:], '.')
-				if i < 0 {
-					break
-				}
-				off += i + 1
-				for _, p := range info.requiredPrefixes[key[:off]] {
-					if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
-						continue
-					}
-					if !isEmpty(p.typ, val) {
-						satisfied[p.group>>6] |= 1 << uint(p.group&63)
-						pending--
-					}
-				}
-			}
-			if pending == 0 {
-				break
+			if !isEmpty(p.typ, val) {
+				satisfied[p.group>>6] |= 1 << uint(p.group&63)
+				pending--
 			}
 		}
+		i := strings.IndexByte(key[off:], '.')
+		if i < 0 {
+			return pending
+		}
+		off += i + 1
 	}
+}
 
+// missingRequired reports the required keys nothing in src answered.
+func missingRequired(groups []requiredGroup, satisfied []uint64, pending int) MultiError {
 	if pending == 0 {
 		return nil
 	}
@@ -364,6 +387,25 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 		}
 	}
 	return errs
+}
+
+// checkRequired reports which of info's required keys src leaves empty. It is
+// the standalone form of what Decode folds into its own loop.
+func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
+	var inline [requiredBitWords]uint64
+	satisfied, pending := markProvidedDirectly(info.requiredGroups, src, inline[:])
+	if pending > 0 {
+		for key, val := range src {
+			i := strings.IndexByte(key, '.')
+			if i < 0 || len(val) == 0 {
+				continue
+			}
+			if pending = markProvidedByNestedKey(info, key, i+1, val, satisfied, pending); pending == 0 {
+				break
+			}
+		}
+	}
+	return missingRequired(info.requiredGroups, satisfied, pending)
 }
 
 // requiredGroup is one required key together with the fields that can
