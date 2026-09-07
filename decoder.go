@@ -354,7 +354,7 @@ func markProvidedDirectly(groups []requiredGroup, src map[string][]string, inlin
 	if len(groups) == 0 {
 		return nil, 0
 	}
-	satisfied := inline
+	var satisfied []uint64
 	if w := (len(groups) + 63) >> 6; w <= len(inline) {
 		satisfied = inline[:w]
 	} else {

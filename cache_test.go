@@ -1,9 +1,11 @@
 package schema
 
 import (
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	utils "github.com/gofiber/utils/v2"
@@ -228,6 +230,50 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 				t.Fatalf("%s: parsePath(%q) err=%v but direct map entry=%v", typ, key, err, inDirect)
 			}
 		}
+	}
+}
+
+// The path cache seals and spills under concurrent writers; every path must
+// still resolve to its own index whichever side of the seal it landed on.
+func TestPathCacheConcurrentSpill(t *testing.T) {
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	const goroutines, per = 8, maxFastPaths/2 + 64 // together well past the seal
+
+	d := NewDecoder()
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				idx := (g*per + i) % (maxFastPaths + 128) // overlap between goroutines
+				key := "items." + strconv.Itoa(idx) + ".value"
+				var s S
+				if err := d.Decode(&s, map[string][]string{key: {key}}); err != nil {
+					errs <- err
+					return
+				}
+				if len(s.Items) != idx+1 || s.Items[idx].Value != key {
+					errs <- fmt.Errorf("%s decoded into %d items, [%d]=%q", key, len(s.Items), idx, s.Items[idx].Value)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	info := d.cache.get(reflect.TypeOf(S{}))
+	if !info.paths.sealed.Load() {
+		t.Fatal("expected the cache to have sealed")
 	}
 }
 
