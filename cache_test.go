@@ -3,6 +3,7 @@ package schema
 import (
 	"fmt"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -371,5 +372,37 @@ func TestPathCacheSpill(t *testing.T) {
 	}
 	if got := len(cachedPathKeys(&info.paths)); got != 0 {
 		t.Fatalf("cache holds %d paths after clear, want 0", got)
+	}
+}
+
+// The parser sizes its hop and part slices from a key's separator count, and
+// that count arrives unvalidated: a key that is mostly separators is rejected
+// at its first segment, so it must not reserve in proportion to its length
+// first.
+func TestParserReservationDoesNotScaleWithSeparators(t *testing.T) {
+	c := newCache()
+	typ := reflect.TypeOf(struct{ A string }{})
+
+	const iters = 100
+	allocated := func(dots int) uint64 {
+		key := "a" + strings.Repeat(".", dots)
+		if _, err := c.parsePath(key, typ); err == nil {
+			t.Fatalf("parsePath(%d separators) succeeded, want rejection", dots)
+		}
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		for i := 0; i < iters; i++ {
+			_, _ = c.parsePath(key, typ)
+		}
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+
+	short := allocated(maxPathReserve)
+	long := allocated(maxPathReserve * 512)
+	if long > short*4 {
+		t.Fatalf("%d separators allocate %d bytes over %d rejections against %d for %d separators: the reservation follows the key length",
+			maxPathReserve*512, long, iters, short, maxPathReserve)
 	}
 }

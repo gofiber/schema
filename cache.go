@@ -28,6 +28,13 @@ const maxDirectKeyLen = 64
 // retained memory grow exponentially. Excess keys use the generic parser.
 const maxDirectPaths = 512
 
+// maxPathReserve caps the hop and part slices the parser reserves from a
+// path's separator count. That count comes from a key nothing has validated
+// yet, so an unbounded reservation lets a key of mostly separators claim
+// megabytes before its first segment is rejected. Appending past the
+// reservation still works, and real paths are a few segments deep.
+const maxPathReserve = 16
+
 var (
 	errInvalidPath   = errors.New("schema: invalid path")
 	errIndexTooLarge = errors.New("schema: index exceeds parser limit")
@@ -132,7 +139,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	// A path yields at most one hop and one part per segment. The hops of
 	// every part share one backing array, cut into capped slices as the
 	// parts are emitted.
-	segments := strings.Count(p, ".") + 1
+	segments := min(strings.Count(p, ".")+1, maxPathReserve)
 	parts := make([]pathPart, 0, segments)
 	hopBuf := make([]pathHop, 0, segments)
 	hopStart := 0
