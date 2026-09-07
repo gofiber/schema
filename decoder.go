@@ -286,18 +286,92 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 // checkRequired checks whether required fields are empty
 //
 // The set of required fields (including those of nested structs) is
-// precomputed once per struct type in structInfo.requiredFields, so this
+// precomputed once per struct type in structInfo.requiredGroups, so this
 // only performs the per-request emptiness checks against src.
+//
+// A group is satisfied by a value under one of its own paths, or by any
+// nested key below one of them ("d.e" satisfies required "d"). Direct paths
+// are looked up first because they settle almost every group; the nested
+// keys of whatever is left are then resolved in a single pass over src,
+// walking each key's dotted prefixes, rather than rescanning the whole map
+// once per unsatisfied group.
 //
 // src is the source map for decoding, we use it here to see if those required fields are included in src
 func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
+	groups := info.requiredGroups
+	if len(groups) == 0 {
+		return nil
+	}
+
+	// One bit per group; the inline array covers every realistic struct, so
+	// the common case allocates nothing.
+	var inline [4]uint64
+	var satisfied []uint64
+	if w := (len(groups) + 63) >> 6; w <= len(inline) {
+		satisfied = inline[:w]
+	} else {
+		satisfied = make([]uint64, w)
+	}
+
+	pending := len(groups)
+	for gi := range groups {
+		if directlyProvided(groups[gi].fields, src) {
+			satisfied[gi>>6] |= 1 << uint(gi&63)
+			pending--
+		}
+	}
+
+	if pending > 0 {
+		for key, val := range src {
+			if len(val) == 0 {
+				continue
+			}
+			for off := 0; ; {
+				i := strings.IndexByte(key[off:], '.')
+				if i < 0 {
+					break
+				}
+				off += i + 1
+				for _, p := range info.requiredPrefixes[key[:off]] {
+					if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
+						continue
+					}
+					if !isEmpty(p.typ, val) {
+						satisfied[p.group>>6] |= 1 << uint(p.group&63)
+						pending--
+					}
+				}
+			}
+			if pending == 0 {
+				break
+			}
+		}
+	}
+
+	if pending == 0 {
+		return nil
+	}
 	var errs MultiError
-	for key, fields := range info.requiredFields {
-		if isEmptyFields(fields, src) {
-			errs = appendError(errs, key, EmptyFieldError{Key: key})
+	for gi := range groups {
+		if satisfied[gi>>6]&(1<<uint(gi&63)) == 0 {
+			errs = appendError(errs, groups[gi].key, EmptyFieldError{Key: groups[gi].key})
 		}
 	}
 	return errs
+}
+
+// requiredGroup is one required key together with the fields that can
+// satisfy it; its position in structInfo.requiredGroups is its bitset index.
+type requiredGroup struct {
+	key    string
+	fields []fieldWithPrefix
+}
+
+// requiredPrefix names a group a nested source key can satisfy, paired with
+// the field type that judges whether the key's value counts as non-empty.
+type requiredPrefix struct {
+	typ   reflect.Type
+	group int
 }
 
 type fieldWithPrefix struct {
@@ -325,30 +399,17 @@ func newFieldWithPrefix(f *fieldInfo, prefix string) fieldWithPrefix {
 	}
 }
 
-// isEmptyFields returns true if all of specified fields are empty.
-func isEmptyFields(fields []fieldWithPrefix, src map[string][]string) bool {
+// directlyProvided reports whether any of the group's own paths carries a
+// non-empty value in src.
+func directlyProvided(fields []fieldWithPrefix, src map[string][]string) bool {
 	for _, f := range fields {
-		for i, path := range f.searchPaths {
-			v, ok := src[path]
-			if ok && !isEmpty(f.typ, v) {
-				return false
-			}
-			// Check for nested keys that match this field.
-			pathDot := f.searchPathDots[i]
-			for key, val := range src {
-				if len(val) == 0 {
-					continue
-				}
-				// for nested structs
-				if strings.HasPrefix(key, pathDot) {
-					if !isEmpty(f.typ, val) {
-						return false
-					}
-				}
+		for _, path := range f.searchPaths {
+			if v, ok := src[path]; ok && !isEmpty(f.typ, v) {
+				return true
 			}
 		}
 	}
-	return true
+	return false
 }
 
 // isEmpty returns true if value is empty for specific type
@@ -1005,14 +1066,6 @@ func (e MultiError) Error() string {
 		return s + " (and 1 other error)"
 	}
 	return s + " (and " + utils.FormatInt(int64(len(e)-1)) + " other errors)"
-}
-
-func appendRequiredField(m map[string][]fieldWithPrefix, key string, field fieldWithPrefix) map[string][]fieldWithPrefix {
-	if m == nil {
-		m = make(map[string][]fieldWithPrefix)
-	}
-	m[key] = append(m[key], field)
-	return m
 }
 
 func appendError(m MultiError, key string, err error) MultiError {

@@ -349,7 +349,8 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			info.fieldsByName[field.aliasLower] = field
 		}
 	}
-	info.requiredFields = c.buildRequiredFields(info)
+	info.requiredGroups = c.buildRequiredFields(info)
+	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
 	info.direct = c.buildDirectPaths(info)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
 	// so it can only be skipped when neither defaults nor such pointers
@@ -542,7 +543,12 @@ type structInfo struct {
 	fields             []*fieldInfo
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
-	requiredFields     map[string][]fieldWithPrefix
+	// requiredGroups lists the required keys in a stable order so each one
+	// has an index checkRequired can address in a bitset, and
+	// requiredPrefixes maps a nested-key prefix to the groups a source key
+	// under it can satisfy; both are built once per struct type.
+	requiredGroups   []requiredGroup
+	requiredPrefixes map[string][]requiredPrefix
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
@@ -577,28 +583,69 @@ func (i *structInfo) get(alias string) *fieldInfo {
 	return i.fieldsByName[utilstrings.ToLower(alias)]
 }
 
-func (c *cache) buildRequiredFields(info *structInfo) map[string][]fieldWithPrefix {
-	var requiredFields map[string][]fieldWithPrefix
+func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
+	var groups []requiredGroup
+	var byKey map[string]int
+	add := func(key string, f fieldWithPrefix) {
+		if i, ok := byKey[key]; ok {
+			groups[i].fields = append(groups[i].fields, f)
+			return
+		}
+		if byKey == nil {
+			byKey = make(map[string]int)
+		}
+		byKey[key] = len(groups)
+		groups = append(groups, requiredGroup{key: key, fields: []fieldWithPrefix{f}})
+	}
 	for _, field := range info.fields {
 		if field.typ.Kind() == reflect.Struct {
 			nested := c.get(field.typ)
 			for _, prefix := range field.paths("") {
 				nestedPrefix := prefix + "."
-				for key, fields := range nested.requiredFields {
-					requiredKey := field.canonicalAlias + "." + key
-					for _, nestedField := range fields {
-						requiredFields = appendRequiredField(requiredFields, requiredKey,
-							newFieldWithPrefix(nestedField.fieldInfo, nestedPrefix+nestedField.prefix))
+				for _, group := range nested.requiredGroups {
+					requiredKey := field.canonicalAlias + "." + group.key
+					for _, nestedField := range group.fields {
+						add(requiredKey, newFieldWithPrefix(nestedField.fieldInfo, nestedPrefix+nestedField.prefix))
 					}
 				}
 			}
 		}
 		if field.isRequired {
-			requiredFields = appendRequiredField(requiredFields, field.canonicalAlias,
-				newFieldWithPrefix(field, ""))
+			add(field.canonicalAlias, newFieldWithPrefix(field, ""))
 		}
 	}
-	return requiredFields
+	return groups
+}
+
+// buildRequiredPrefixes indexes the groups by the nested-key prefix that can
+// satisfy them ("d." for required key "d"), so checkRequired can resolve every
+// nested key in one pass over the source map instead of rescanning it per
+// group.
+func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
+	if len(groups) == 0 {
+		return nil
+	}
+	prefixes := make(map[string][]requiredPrefix)
+	for gi := range groups {
+		for _, f := range groups[gi].fields {
+			for _, dot := range f.searchPathDots {
+				owners := prefixes[dot]
+				// The same group can reach one prefix through several
+				// fields; one entry per (group, type) is enough.
+				dup := false
+				for _, o := range owners {
+					if o.group == gi && o.typ == f.typ {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					prefixes[dot] = append(owners, requiredPrefix{group: gi, typ: f.typ})
+				}
+			}
+		}
+	}
+	return prefixes
 }
 
 func containsAlias(infos []*structInfo, alias string) bool {

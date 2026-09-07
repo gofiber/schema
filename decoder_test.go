@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
 	"strconv"
@@ -3732,6 +3733,188 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 
 	for b.Loop() {
 		_ = decoder.checkRequired(info, data)
+	}
+}
+
+// referenceCheckRequired is the pre-rewrite required-field check: for every
+// group, a linear scan of the whole source map per field path. checkRequired
+// replaced it with a bitset plus a single prefix-indexed pass, so the two must
+// agree on every input.
+func referenceCheckRequired(info *structInfo, src map[string][]string) map[string]bool {
+	missing := map[string]bool{}
+	for _, group := range info.requiredGroups {
+		empty := true
+	scan:
+		for _, f := range group.fields {
+			for i, path := range f.searchPaths {
+				if v, ok := src[path]; ok && !isEmpty(f.typ, v) {
+					empty = false
+					break scan
+				}
+				pathDot := f.searchPathDots[i]
+				for key, val := range src {
+					if len(val) == 0 {
+						continue
+					}
+					if strings.HasPrefix(key, pathDot) && !isEmpty(f.typ, val) {
+						empty = false
+						break scan
+					}
+				}
+			}
+		}
+		if empty {
+			missing[group.key] = true
+		}
+	}
+	return missing
+}
+
+func TestCheckRequiredMatchesReference(t *testing.T) {
+	t.Parallel()
+
+	type leaf struct {
+		X string `schema:"x,required"`
+		Y int    `schema:"y"`
+	}
+	type mid struct {
+		L leaf   `schema:"l,required"`
+		M string `schema:"m,required"`
+	}
+	type embedded struct {
+		E string `schema:"e,required"`
+	}
+	type outer struct {
+		embedded
+		A    string   `schema:"a,required"`
+		B    []string `schema:"b,required"`
+		Mid  mid      `schema:"mid,required"`
+		Free string   `schema:"free"`
+	}
+	type deep struct {
+		One mid `schema:"one,required"`
+		Two mid `schema:"two"`
+	}
+
+	types := []reflect.Type{
+		reflect.TypeOf(leaf{}), reflect.TypeOf(mid{}),
+		reflect.TypeOf(outer{}), reflect.TypeOf(deep{}),
+	}
+
+	// Every key any of the shapes above can be addressed by, plus a few that
+	// only look like they belong to one.
+	keys := []string{
+		"a", "b", "e", "free", "x", "y", "m", "l", "l.x", "l.y",
+		"mid", "mid.m", "mid.l", "mid.l.x", "mid.l.y",
+		"one", "one.m", "one.l.x", "two.m", "two.l.x",
+		"ab", "midx", "l.", "one.l", "unrelated", "a.b.c",
+	}
+	values := [][]string{nil, {}, {""}, {"v"}, {"", "v"}}
+
+	d := NewDecoder()
+	r := rand.New(rand.NewPCG(11, 13))
+	for _, typ := range types {
+		info := d.cache.get(typ)
+		for iter := 0; iter < 4000; iter++ {
+			src := make(map[string][]string)
+			for _, k := range keys {
+				switch r.IntN(4) {
+				case 0:
+					src[k] = values[r.IntN(len(values))]
+				case 1:
+					src[k] = values[len(values)-1]
+				}
+			}
+			want := referenceCheckRequired(info, src)
+			got := map[string]bool{}
+			for key := range d.checkRequired(info, src) {
+				got[key] = true
+			}
+			if len(got) != len(want) {
+				t.Fatalf("%s with %v: got missing %v, want %v", typ, src, got, want)
+			}
+			for key := range want {
+				if !got[key] {
+					t.Fatalf("%s with %v: got missing %v, want %v", typ, src, got, want)
+				}
+			}
+		}
+	}
+}
+
+// requiredFormStruct mirrors a typical form payload: a few required scalars
+// plus a required nested struct, which is the shape that used to force a full
+// scan of the source map per required key.
+type requiredAddress struct {
+	Street string `schema:"street,required"`
+	City   string `schema:"city,required"`
+	Zip    string `schema:"zip"`
+}
+
+type requiredFormStruct struct {
+	Name    string          `schema:"name,required"`
+	Email   string          `schema:"email,required"`
+	Age     int             `schema:"age,required"`
+	Address requiredAddress `schema:"address,required"`
+	Note    string          `schema:"note"`
+}
+
+// wideRequiredSrc is a request carrying the required fields plus the sort of
+// unrelated parameters a real query string comes with.
+func wideRequiredSrc() map[string][]string {
+	src := map[string][]string{
+		"name":           {"Grace"},
+		"email":          {"grace@example.com"},
+		"age":            {"85"},
+		"address.street": {"1 Navy Yard"},
+		"address.city":   {"Arlington"},
+		"address.zip":    {"22202"},
+	}
+	for i := 0; i < 20; i++ {
+		src["filter"+strconv.Itoa(i)] = []string{"v" + strconv.Itoa(i)}
+	}
+	return src
+}
+
+func BenchmarkCheckRequiredFieldsWideSrc(b *testing.B) {
+	src := wideRequiredSrc()
+	decoder := NewDecoder()
+	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	b.ReportAllocs()
+	for b.Loop() {
+		if errs := decoder.checkRequired(info, src); errs != nil {
+			b.Fatal(errs)
+		}
+	}
+}
+
+// The same shape with a required key missing, so the nested-key pass cannot
+// short-circuit and every group has to be resolved.
+func BenchmarkCheckRequiredFieldsWideSrcMissing(b *testing.B) {
+	src := wideRequiredSrc()
+	delete(src, "address.street")
+	delete(src, "address.city")
+	delete(src, "address.zip")
+	decoder := NewDecoder()
+	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	b.ReportAllocs()
+	for b.Loop() {
+		if errs := decoder.checkRequired(info, src); errs == nil {
+			b.Fatal("expected missing required fields")
+		}
+	}
+}
+
+func BenchmarkDecodeRequiredForm(b *testing.B) {
+	src := wideRequiredSrc()
+	decoder := NewDecoder()
+	decoder.IgnoreUnknownKeys(true)
+	s := &requiredFormStruct{}
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := decoder.Decode(s, src); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
