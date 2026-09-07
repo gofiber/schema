@@ -4036,6 +4036,102 @@ func BenchmarkDecodeRequiredForm(b *testing.B) {
 	}
 }
 
+// A typical listing request: pagination and sorting fields carry defaults, a
+// nested filter struct carries its own, and the request supplies only some.
+type defaultsPage struct {
+	Size  int    `schema:"size,default:20"`
+	Sort  string `schema:"sort,default:created"`
+	Order string `schema:"order,default:desc"`
+}
+
+type defaultsRequest struct {
+	Query   string       `schema:"q"`
+	Page    defaultsPage `schema:"page"`
+	Verbose bool         `schema:"verbose,default:false"`
+	Limit   int          `schema:"limit,default:100"`
+	Tags    []string     `schema:"tags,default:a|b"`
+}
+
+// Defaults are resolved once per struct type, so what each Decode hands out
+// must still be its own: a slice default mutated by one caller must not turn
+// up in the next result, a pointer default must be a fresh pointee, and a
+// nested struct's defaults must respect the keys provided under its prefix.
+func TestDefaultsAreFreshPerDecode(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder()
+	src := map[string][]string{"q": {"shoes"}, "page.size": {"50"}, "limit": {"10"}}
+
+	var first defaultsRequest
+	if err := d.Decode(&first, src); err != nil {
+		t.Fatal(err)
+	}
+	want := defaultsRequest{
+		Query: "shoes", Page: defaultsPage{Size: 50, Sort: "created", Order: "desc"},
+		Limit: 10, Tags: []string{"a", "b"},
+	}
+	if first.Query != want.Query || first.Page != want.Page || first.Limit != want.Limit ||
+		first.Verbose || len(first.Tags) != 2 || first.Tags[0] != "a" || first.Tags[1] != "b" {
+		t.Fatalf("first decode = %+v, want %+v", first, want)
+	}
+
+	// Scribble over everything the first decode handed out.
+	first.Tags[0], first.Tags[1] = "x", "y"
+	first.Tags = append(first.Tags, "z")
+
+	var second defaultsRequest
+	if err := d.Decode(&second, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Tags) != 2 || second.Tags[0] != "a" || second.Tags[1] != "b" {
+		t.Fatalf("second decode saw the first caller's edits: %v", second.Tags)
+	}
+	if &second.Tags[0] == &first.Tags[0] {
+		t.Fatal("decoded slices share a backing array")
+	}
+	if second.Page != (defaultsPage{Size: 20, Sort: "created", Order: "desc"}) || second.Limit != 100 {
+		t.Fatalf("second decode = %+v", second)
+	}
+
+	type ptrs struct {
+		N *int    `schema:"n,default:7"`
+		S *string `schema:"s,default:hi"`
+	}
+	var p1, p2 ptrs
+	for _, p := range []*ptrs{&p1, &p2} {
+		if err := d.Decode(p, map[string][]string{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if p1.N == p2.N || p1.S == p2.S {
+		t.Fatal("pointer defaults share a pointee")
+	}
+	*p1.N, *p1.S = 99, "changed"
+	var p3 ptrs
+	if err := d.Decode(&p3, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if *p3.N != 7 || *p3.S != "hi" {
+		t.Fatalf("pointer default saw the first caller's edits: %d %q", *p3.N, *p3.S)
+	}
+}
+
+func BenchmarkDecodeWithDefaults(b *testing.B) {
+	src := map[string][]string{
+		"q":         {"shoes"},
+		"page.size": {"50"},
+		"limit":     {"10"},
+	}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r defaultsRequest
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTimeDurationDecoding(b *testing.B) {
 	type DurationStruct struct {
 		Timeout time.Duration `schema:"timeout"`

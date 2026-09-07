@@ -203,6 +203,56 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 // setDefaults sets the default values when the `default` tag is specified,
 // default is supported on basic/primitive types and their pointers,
 // nested structs can also have default tags
+var (
+	errUnsupportedDefault = errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices")
+	errRequiredDefault    = errors.New("required fields cannot have a default value")
+)
+
+// resolveDefault converts the field's default option once, when the struct
+// metadata is built, so setDefaults assigns a resolved value on every call
+// instead of converting the string each time. Slice and pointer defaults are
+// still instantiated per call, so no two decoded values share one.
+func (f *fieldInfo) resolveDefault() {
+	if f.defaultValue == "" {
+		return
+	}
+	def := &fieldDefault{}
+	f.def = def
+	switch f.typ.Kind() {
+	case reflect.Slice:
+		elemT := f.typ.Elem()
+		conv := getBuiltinConverter(elemT.Kind())
+		if conv == nil {
+			return
+		}
+		tmpl := reflect.MakeSlice(f.typ, 0, strings.Count(f.defaultValue, "|")+1)
+		for val := range strings.SplitSeq(f.defaultValue, "|") {
+			v := conv(val)
+			if !v.IsValid() {
+				def.err = fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name)
+				break
+			}
+			// Builtin converters return the underlying kind; convert to the
+			// (possibly named) element type, else Append panics for []MyInt.
+			tmpl = reflect.Append(tmpl, v.Convert(elemT))
+		}
+		def.slice = tmpl
+	case reflect.Ptr:
+		t1 := f.typ.Elem()
+		if conv := getBuiltinConverter(t1.Kind()); conv != nil {
+			if v := conv(f.defaultValue); v.IsValid() {
+				def.val = v.Convert(t1)
+			}
+		}
+	default:
+		if conv := getBuiltinConverter(f.typ.Kind()); conv != nil {
+			if v := conv(f.defaultValue); v.IsValid() {
+				def.val = v.Convert(f.typ)
+			}
+		}
+	}
+}
+
 func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]string, prefix string) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
@@ -229,72 +279,62 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]
 			continue
 		}
 
-		if vCurrent.Type().Kind() == reflect.Struct && f.defaultValue == "" {
-			errs = mergeErrors(errs, d.setDefaults(vCurrent.Type(), vCurrent, src, prefix+f.canonicalAlias+"."))
-		} else if isPointerToStruct(vCurrent) && f.defaultValue == "" {
-			errs = mergeErrors(errs, d.setDefaults(vCurrent.Elem().Type(), vCurrent.Elem(), src, prefix+f.canonicalAlias+"."))
+		// vCurrent's type is f.typ; a nested struct is walked under its own
+		// prefix (an empty prefix concatenates without allocating).
+		kind := f.typ.Kind()
+		if kind == reflect.Struct && f.defaultValue == "" {
+			errs = mergeErrors(errs, d.setDefaults(f.typ, vCurrent, src, prefix+f.canonicalDot))
+		} else if kind == reflect.Ptr && f.defaultValue == "" && isPointerToStruct(vCurrent) {
+			errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, prefix+f.canonicalDot))
 		}
 
-		if f.defaultValue != "" && f.isRequired {
-			errs = appendError(errs, "default-"+f.name, errors.New("required fields cannot have a default value"))
-		} else if f.defaultValue != "" && vCurrent.IsZero() && !f.isRequired && !fieldProvided(src, prefix, f) {
-			if f.typ.Kind() == reflect.Struct {
-				errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
-			} else if f.typ.Kind() == reflect.Slice {
-				// check if slice has one of the supported types for defaults
-				conv := getBuiltinConverter(f.typ.Elem().Kind())
-				if conv == nil {
-					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
-					continue
-				}
-
-				elemT := f.typ.Elem()
-				defaultSlice := reflect.MakeSlice(f.typ, 0, strings.Count(f.defaultValue, "|")+1)
-				for val := range strings.SplitSeq(f.defaultValue, "|") {
-					// this check is to handle if the wrong value is provided
-					convertedVal := conv(val)
-					if !convertedVal.IsValid() {
-						errs = appendError(errs, "default-"+f.name, fmt.Errorf("failed setting default: %s is not compatible with field %s type", val, f.name))
-						break
-					}
-					// Builtin converters return the underlying kind; convert to
-					// the (possibly named) element type before appending, else
-					// reflect.Append panics for e.g. []MyInt.
-					defaultSlice = reflect.Append(defaultSlice, convertedVal.Convert(elemT))
-				}
-				vCurrent.Set(defaultSlice)
-			} else if f.typ.Kind() == reflect.Ptr {
-				t1 := f.typ.Elem()
-
-				if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
-					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
-				}
-
-				// this check is to handle if the wrong value is provided
-				if conv := getBuiltinConverter(t1.Kind()); conv != nil {
-					if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
-						// Build a pointer of the field's actual element type:
-						// the converter yields the underlying kind, which is
-						// convertible to the (possibly named) element type,
-						// and *elem is assignable to the field even when the
-						// field's type is itself a named pointer type (e.g.
-						// type MyIntPtr *MyInt), where converting a *int
-						// directly would panic.
-						p := reflect.New(t1)
-						p.Elem().Set(convertedVal.Convert(t1))
-						vCurrent.Set(p)
-					}
-				}
-			} else {
-				// this check is to handle if the wrong value is provided
-				conv := getBuiltinConverter(f.typ.Kind())
-				if conv == nil {
-					errs = appendError(errs, "default-"+f.name, errors.New("default option is supported only on: bool, float variants, string, unit variants types or their corresponding pointers or slices"))
-				} else if convertedVal := conv(f.defaultValue); convertedVal.IsValid() {
-					// Builtin converters return the underlying kind; convert to
-					// the field's (possibly named) type before assigning.
-					vCurrent.Set(convertedVal.Convert(f.typ))
-				}
+		def := f.def
+		if def == nil {
+			continue
+		}
+		if f.isRequired {
+			errs = appendError(errs, "default-"+f.name, errRequiredDefault)
+			continue
+		}
+		if !vCurrent.IsZero() || fieldProvided(src, prefix, f) {
+			continue
+		}
+		// The default itself was resolved when the metadata was built; see
+		// resolveDefault. Only the per-call parts remain: the errors a kind
+		// that takes no default reports, and a fresh pointer or slice so no
+		// two decoded values share one.
+		switch kind {
+		case reflect.Struct:
+			errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
+		case reflect.Slice:
+			if !def.slice.IsValid() {
+				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
+				continue
+			}
+			if def.err != nil {
+				errs = appendError(errs, "default-"+f.name, def.err)
+			}
+			fresh := reflect.MakeSlice(f.typ, def.slice.Len(), def.slice.Cap())
+			reflect.Copy(fresh, def.slice)
+			vCurrent.Set(fresh)
+		case reflect.Ptr:
+			t1 := f.typ.Elem()
+			if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
+				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
+			}
+			if def.val.IsValid() {
+				// *elem is assignable to the field even when the field's
+				// type is itself a named pointer type (type MyIntPtr *MyInt),
+				// where converting a *int directly would panic.
+				p := reflect.New(t1)
+				p.Elem().Set(def.val)
+				vCurrent.Set(p)
+			}
+		default:
+			if getBuiltinConverter(kind) == nil {
+				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
+			} else if def.val.IsValid() {
+				vCurrent.Set(def.val)
 			}
 		}
 	}
@@ -324,12 +364,27 @@ func isPointerToStruct(v reflect.Value) bool {
 }
 
 func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
-	for _, p := range f.paths(prefix) {
-		if _, ok := src[p]; ok {
-			return true
-		}
+	if keyProvided(src, prefix, f.alias) {
+		return true
 	}
-	return false
+	return f.alias != f.canonicalAlias && keyProvided(src, prefix, f.canonicalAlias)
+}
+
+// keyProvided reports whether prefix+name is a key of src, assembling the key
+// in a stack buffer when it fits so the probe allocates nothing.
+func keyProvided(src map[string][]string, prefix, name string) bool {
+	if prefix == "" {
+		_, ok := src[name]
+		return ok
+	}
+	if n := len(prefix) + len(name); n <= maxDirectKeyLen {
+		var buf [maxDirectKeyLen]byte
+		copy(buf[copy(buf[:], prefix):], name)
+		_, ok := src[string(buf[:n])]
+		return ok
+	}
+	_, ok := src[prefix+name]
+	return ok
 }
 
 // The set of required fields (including those of nested structs) is

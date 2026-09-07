@@ -615,13 +615,14 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		fastKind = k
 	}
 
-	return &fieldInfo{
+	f := &fieldInfo{
 		typ:              field.Type,
 		fastKind:         fastKind,
 		name:             field.Name,
 		alias:            alias,
 		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
+		canonicalDot:     canonicalAlias + ".",
 		unmarshalerInfo:  m,
 		derefUnmarshaler: derefU,
 		elemUnmarshaler:  elemU,
@@ -631,6 +632,8 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		isRequired:       options.Contains("required"),
 		defaultValue:     options.getDefaultOptionValue(),
 	}
+	f.resolveDefault()
+	return f
 }
 
 // converter returns the converter for a type.
@@ -804,6 +807,24 @@ type fieldInfo struct {
 	isAnonymous  bool
 	isRequired   bool
 	defaultValue string
+	// canonicalDot is canonicalAlias with the trailing separator, the prefix
+	// the fields of a nested struct are looked up under.
+	canonicalDot string
+	// def is the default option resolved at build time, nil for the fields
+	// that have none; see resolveDefault.
+	def *fieldDefault
+}
+
+// fieldDefault is what setDefaults assigns for a field's default option:
+// val for a scalar field (converted to the field type) or a pointer field
+// (converted to the pointee type), and slice, a template a slice field's
+// default is copied from. An element that failed to convert leaves the
+// template short and sets err, which is reported each time the default
+// applies. A kind that takes no default leaves all three unset.
+type fieldDefault struct {
+	val   reflect.Value
+	slice reflect.Value
+	err   error
 }
 
 func (f *fieldInfo) paths(prefix string) []string {
