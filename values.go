@@ -2,8 +2,7 @@ package schema
 
 import (
 	"errors"
-
-	utils "github.com/gofiber/utils/v2"
+	"hash/maphash"
 )
 
 // errValuesLength is returned by DecodeValues for keys and values of
@@ -61,6 +60,10 @@ func (src *source) hasBytes(key []byte) bool {
 // subslice of values, and any other pattern gathers into a buffer of the
 // caller's.
 //
+// The keys are the request's, so the table hashes them as a Go map would:
+// exactly, as they are grouped, and with a seed drawn per process (see
+// pairSeed), so no choice of keys can pile them onto one slot.
+//
 // Its methods only read it once it is built: a store through the pointer
 // would count, for the compiler, as a store to the heap, and take the arrays
 // DecodeValues keeps the index in on its stack with it.
@@ -78,6 +81,19 @@ type pairIndex struct {
 	last []int32
 	mask uint64
 }
+
+// pairSeed seeds the hash of pairIndex. A hash an attacker could predict,
+// or one under which distinct keys collide by construction, as keys that
+// differ only in case do under a case-folding hash, would let a request
+// with enough such keys make every insert probe past all the keys before
+// it, quadratic in their number.
+var pairSeed = maphash.MakeSeed()
+
+// pairHash is the hash pairIndex keeps key in, and pairHashBytes the same
+// hash of a key held in a byte slice.
+func pairHash(key string) uint64 { return maphash.String(pairSeed, key) }
+
+func pairHashBytes(key []byte) uint64 { return maphash.Bytes(pairSeed, key) }
 
 // indexSize returns the table length that indexes n pairs.
 func indexSize(n int) int {
@@ -129,7 +145,7 @@ func (p *pairIndex) scan() {
 func (p *pairIndex) build() {
 	keys := p.keys
 	for i, key := range keys {
-		for j := utils.HashFold(key) & p.mask; ; j = (j + 1) & p.mask {
+		for j := pairHash(key) & p.mask; ; j = (j + 1) & p.mask {
 			e := p.table[j]
 			if e == 0 {
 				p.table[j] = int32(i + 1) //nolint:gosec // G115 - bounded by the number of pairs
@@ -161,7 +177,7 @@ func (p *pairIndex) find(key string) int {
 		}
 		return -1
 	}
-	for j := utils.HashFold(key) & p.mask; ; j = (j + 1) & p.mask {
+	for j := pairHash(key) & p.mask; ; j = (j + 1) & p.mask {
 		e := p.table[j]
 		if e == 0 {
 			return -1
@@ -182,7 +198,7 @@ func (p *pairIndex) findBytes(key []byte) int {
 		}
 		return -1
 	}
-	for j := utils.HashFold(key) & p.mask; ; j = (j + 1) & p.mask {
+	for j := pairHashBytes(key) & p.mask; ; j = (j + 1) & p.mask {
 		e := p.table[j]
 		if e == 0 {
 			return -1

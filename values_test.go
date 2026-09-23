@@ -272,6 +272,78 @@ func TestDecodeValuesNestedDefaults(t *testing.T) {
 	}
 }
 
+// caseVariants returns every spelling of word, which must be lowercase
+// letters, in upper and lower case: 1<<len(word) keys naming one field.
+func caseVariants(word string) []string {
+	keys := make([]string, 1<<len(word))
+	for i := range keys {
+		b := []byte(word)
+		for j := range b {
+			if i>>j&1 == 1 {
+				b[j] -= 'a' - 'A'
+			}
+		}
+		keys[i] = string(b)
+	}
+	return keys
+}
+
+// The pairs' keys are the request's, so the table grouping them must not
+// let chosen keys pile onto one slot. Keys that differ only in case group
+// apart, and a case-folding hash sent them all to the same slot: each
+// insert then probed past every key before it, quadratic in their number.
+// Built from every case variant of one key, the table keeps every key close
+// to its home slot.
+func TestPairIndexSpreadsCaseVariants(t *testing.T) {
+	t.Parallel()
+
+	keys := caseVariants("abcdefghij")
+	n := len(keys)
+	values := make([]string, n)
+	p := newPairIndex(keys, values, make([]int32, indexSize(n)), make([]int32, n), make([]int32, n))
+	longest := 0
+	for i, key := range keys {
+		if !p.first(i) || p.find(key) != i || p.findBytes([]byte(key)) != i {
+			t.Fatalf("%q is not a key of its own", key)
+		}
+		// How far the key sits past the slot its hash names.
+		for j, d := pairHash(key)&p.mask, 0; ; j, d = (j+1)&p.mask, d+1 {
+			if int(p.table[j]) == i+1 {
+				longest = max(longest, d)
+				break
+			}
+		}
+	}
+	// A seeded hash at half load keeps the longest probe near log n; the
+	// case-folding hash put the last variant n-1 slots out.
+	if longest > 64 {
+		t.Fatalf("a key sits %d slots past its home slot of %d; the keys pile up", longest, len(p.table))
+	}
+}
+
+// Every case variant of a key names the same field. Each is a key of its
+// own, and DecodeValues decodes keys in the order they first appear, so the
+// last variant sets the field.
+func TestDecodeValuesCaseVariants(t *testing.T) {
+	t.Parallel()
+
+	type target struct {
+		F string `schema:"abcdefgh"`
+	}
+	keys := caseVariants("abcdefgh")
+	values := make([]string, len(keys))
+	for i := range values {
+		values[i] = strconv.Itoa(i)
+	}
+	var got target
+	if err := NewDecoder().DecodeValues(&got, keys, values); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := values[len(values)-1]; got.F != want {
+		t.Fatalf("got %q, want the last variant's value %q", got.F, want)
+	}
+}
+
 func TestDecodeValuesRejectsMismatchedInput(t *testing.T) {
 	t.Parallel()
 
