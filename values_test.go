@@ -300,7 +300,11 @@ func TestPairIndexSpreadsCaseVariants(t *testing.T) {
 	keys := caseVariants("abcdefghij")
 	n := len(keys)
 	values := make([]string, n)
-	p := newPairIndex(keys, values, make([]int32, indexSize(n)), make([]int32, n), make([]int32, n))
+	p := pairIndex{
+		keys: keys, values: values,
+		table: make([]int32, indexSize(n)), next: make([]int32, n), last: make([]int32, n),
+	}
+	p.index()
 	longest := 0
 	for i, key := range keys {
 		if !p.first(i) || p.find(key) != i || p.findBytes([]byte(key)) != i {

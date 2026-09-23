@@ -145,17 +145,23 @@ func (d *Decoder) DecodeValues(dst interface{}, keys, values []string) error {
 	if len(keys) != len(values) {
 		return errValuesLength
 	}
+	// The index is set up field by field where it lies. Go puts a literal for
+	// a variable whose address is taken, or a call's result, together
+	// elsewhere and copies it over, and the copy reads back in wide loads the
+	// words just stored in narrow ones, which stalls each load.
 	var p pairIndex
+	p.keys, p.values = keys, values
 	if n := len(keys); n <= maxScanPairs {
 		var next, last [maxScanPairs]int32
-		p = newPairIndex(keys, values, nil, next[:n], last[:n])
+		p.next, p.last = next[:n], last[:n]
 	} else if n <= maxInlinePairs {
 		var table [2 * maxInlinePairs]int32
 		var next, last [maxInlinePairs]int32
-		p = newPairIndex(keys, values, table[:indexSize(n)], next[:n], last[:n])
+		p.table, p.next, p.last = table[:indexSize(n)], next[:n], last[:n]
 	} else {
-		p = newPairIndex(keys, values, make([]int32, indexSize(n)), make([]int32, n), make([]int32, n))
+		p.table, p.next, p.last = make([]int32, indexSize(n)), make([]int32, n), make([]int32, n)
 	}
+	p.index()
 	s := source{pairs: &p}
 	return d.decodeSource(dst, &s, nil)
 }

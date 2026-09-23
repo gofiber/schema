@@ -64,9 +64,10 @@ func (src *source) hasBytes(key []byte) bool {
 // exactly, as they are grouped, and with a seed drawn per process (see
 // pairSeed), so no choice of keys can pile them onto one slot.
 //
-// Its methods only read it once it is built: a store through the pointer
-// would count, for the compiler, as a store to the heap, and take the arrays
-// DecodeValues keeps the index in on its stack with it.
+// DecodeValues sets its slices on it where it lies, and its methods store
+// integers only, into those slices and mask: a slice stored through a pointer
+// to it would count, for the compiler, as a store to the heap, and take the
+// arrays DecodeValues keeps the index in on its stack with it.
 type pairIndex struct {
 	keys, values []string
 	// table holds, for each key, its first pair plus one, so that 0 marks a
@@ -104,24 +105,17 @@ func indexSize(n int) int {
 	return size
 }
 
-// newPairIndex returns the index of the pairs keys[i]=values[i], kept in
-// table, next and last, which must be zeroed and sized indexSize(len(keys))
-// (or nil, for maxScanPairs pairs or fewer), len(keys) and len(keys). It
-// returns the index by value, and fills it in by writing integers into those
-// slices only, so that nothing is stored through a pointer to it; see
-// pairIndex.
-func newPairIndex(keys, values []string, table, next, last []int32) pairIndex {
-	p := pairIndex{
-		keys: keys, values: values,
-		table: table, next: next, last: last,
-	}
-	if table == nil {
+// index fills in the index of the pairs p.keys[i]=p.values[i], kept in
+// p.table, p.next and p.last, which must be zeroed and sized
+// indexSize(len(p.keys)) (or nil, for maxScanPairs pairs or fewer),
+// len(p.keys) and len(p.keys).
+func (p *pairIndex) index() {
+	if p.table == nil {
 		p.scan()
-		return p
+		return
 	}
-	p.mask = uint64(len(table) - 1)
+	p.mask = uint64(len(p.table) - 1)
 	p.build()
-	return p
 }
 
 // scan fills in the index of p's pairs, few enough to compare each key with
