@@ -237,6 +237,41 @@ func TestDecodeValuesGroupsKeys(t *testing.T) {
 	}
 }
 
+// A nested field's default applies only while no key under its struct's
+// prefix provides the field, which the check looks up with the prefix and
+// the field's name assembled in a buffer: among a few pairs by comparing
+// keys, among more through the hash table. A key given with an empty value
+// leaves its field zero but still counts as provided, as it does for Decode.
+func TestDecodeValuesNestedDefaults(t *testing.T) {
+	t.Parallel()
+
+	type inner struct {
+		A string `schema:"a,default:da"`
+		B string `schema:"b,default:db"`
+	}
+	type target struct {
+		In inner `schema:"in"`
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	for _, filler := range []int{0, 2 * maxScanPairs} {
+		keys := []string{"in.a"}
+		values := []string{""}
+		for i := range filler {
+			keys = append(keys, "filler"+strconv.Itoa(i))
+			values = append(values, "f")
+		}
+		viaValues, viaMap, errValues, errMap := decodeBoth[target](t, d, keys, values)
+		if errValues != nil || errMap != nil {
+			t.Fatalf("%d pairs: unexpected errors %v, %v", len(keys), errValues, errMap)
+		}
+		want := target{In: inner{A: "", B: "db"}}
+		if viaValues != want || viaMap != want {
+			t.Fatalf("%d pairs: DecodeValues decoded %+v, Decode %+v, want %+v", len(keys), viaValues, viaMap, want)
+		}
+	}
+}
+
 func TestDecodeValuesRejectsMismatchedInput(t *testing.T) {
 	t.Parallel()
 
