@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	utils "github.com/gofiber/utils/v2"
 )
@@ -104,25 +105,7 @@ func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) 
 // Keys are "paths" in dotted notation to the struct fields and nested structs.
 //
 // See the package documentation for a full explanation of the mechanics.
-func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) (err error) {
-	v := reflect.ValueOf(dst)
-	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
-		return errNotPointerToStruct
-	}
-
-	// Catch panics from the decoder and return them as an error.
-	// This is needed because the decoder calls reflect and reflect panics.
-	// Installed before any other work so nothing can crash the caller.
-	defer func() {
-		if r := recover(); r != nil {
-			if e, ok := r.(error); ok {
-				err = e
-			} else {
-				err = fmt.Errorf("schema: panic while decoding: %v", r)
-			}
-		}
-	}()
-
+func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) error {
 	var multipartFiles map[string][]*multipart.FileHeader
 
 	if len(files) > 0 {
@@ -141,6 +124,68 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 		}
 		src = merged
 	}
+
+	s := source{m: src}
+	return d.decodeSource(dst, &s, multipartFiles)
+}
+
+// DecodeValues decodes key/value pairs to a struct as Decode decodes the map
+// they make: values[i] is a value of the key keys[i], and a key given more
+// than once has all of its values, in the order given. It saves a caller that
+// has the pairs one at a time, as a parsed query string does, building that
+// map, and saves the decode iterating it.
+//
+// Where several keys name the same field, as keys that differ only in case
+// do, the keys decode in the order of their first pairs, so the key given
+// first the latest wins; Decode lets whichever its map yields last win.
+//
+// The first parameter must be a pointer to a struct, and keys and values must
+// be the same length. The slices are only read, and only during the call.
+func (d *Decoder) DecodeValues(dst interface{}, keys, values []string) error {
+	if len(keys) != len(values) {
+		return errValuesLength
+	}
+	// The index is set up field by field where it lies. Go puts a literal for
+	// a variable whose address is taken, or a call's result, together
+	// elsewhere and copies it over, and the copy reads back in wide loads the
+	// words just stored in narrow ones, which stalls each load.
+	var p pairIndex
+	p.keys, p.values = keys, values
+	if n := len(keys); n <= maxScanPairs {
+		var next, last [maxScanPairs]int32
+		p.next, p.last = next[:n], last[:n]
+	} else if n <= maxInlinePairs {
+		var table [2 * maxInlinePairs]int32
+		var next, last [maxInlinePairs]int32
+		p.table, p.next, p.last = table[:indexSize(n)], next[:n], last[:n]
+	} else {
+		p.table, p.next, p.last = make([]int32, indexSize(n)), make([]int32, n), make([]int32, n)
+	}
+	p.index()
+	s := source{pairs: &p}
+	return d.decodeSource(dst, &s, nil)
+}
+
+// decodeSource decodes src into dst, the pointer to a struct Decode and
+// DecodeValues were given, with the files Decode was.
+func (d *Decoder) decodeSource(dst interface{}, src *source, multipartFiles map[string][]*multipart.FileHeader) (err error) {
+	v := reflect.ValueOf(dst)
+	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
+		return errNotPointerToStruct
+	}
+
+	// Catch panics from the decoder and return them as an error.
+	// This is needed because the decoder calls reflect and reflect panics.
+	// Installed before any other work so nothing can crash the caller.
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = e
+			} else {
+				err = fmt.Errorf("schema: panic while decoding: %v", r)
+			}
+		}
+	}()
 
 	v = v.Elem()
 	t := v.Type()
@@ -162,38 +207,62 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 		var tracker growTracker
 		grow = &tracker
 	}
-	var multiErrors MultiError
-	for path, values := range src {
-		if pending > 0 {
-			if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
-				pending = markProvidedByNestedKey(rootInfo, path, i+1, values, satisfied, pending)
+	// The state decodeKey carries from key to key is kept in variables of
+	// its own rather than a struct: the compiler would let the stack values
+	// above escape along with the errors a struct holding both returns.
+	var errs MultiError
+	if p := src.pairs; p != nil {
+		// A key whose pairs are not adjacent gathers its values here.
+		var scratch [8]string
+		for i, path := range p.keys {
+			if p.first(i) {
+				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, p.group(i, scratch[:0]), errs, pending)
 			}
 		}
-		if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
-			var filesSlice []*multipart.FileHeader
-			if multipartFiles != nil {
-				filesSlice = multipartFiles[path]
-			}
-			if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
-				multiErrors = appendError(multiErrors, path, err)
-			}
-			// A key that names no field is by far the most common failure,
-			// and parsePathInfo returns that sentinel unwrapped, so the
-			// pointer compare keeps errors.Is off the per-key path.
-		} else if err != errInvalidPath && errors.Is(err, errIndexTooLarge) { //nolint:errorlint // see above
-			multiErrors = appendError(multiErrors, path, err)
-		} else if !d.ignoreUnknownKeys {
-			multiErrors = appendError(multiErrors, path, UnknownKeyError{Key: path})
+	} else {
+		for path, values := range src.m {
+			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, values, errs, pending)
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		multiErrors = mergeErrors(multiErrors, d.setDefaults(t, v, src, ""))
+		errs = mergeErrors(errs, d.setDefaults(t, v, src, ""))
 	}
-	multiErrors = mergeErrors(multiErrors, missingRequired(rootInfo.requiredGroups, satisfied, pending))
-	if len(multiErrors) > 0 {
-		return multiErrors
+	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
+	if len(errs) > 0 {
+		return errs
 	}
 	return nil
+}
+
+// decodeKey decodes the values of one source key into v, the struct whose
+// metadata is rootInfo, and returns errs with any error it met added, and
+// pending less the required groups the key settles in satisfied.
+func (d *Decoder) decodeKey(
+	v reflect.Value, rootInfo *structInfo, files map[string][]*multipart.FileHeader, grow *growTracker,
+	satisfied []uint64, path string, values []string, errs MultiError, pending int,
+) (MultiError, int) {
+	if pending > 0 {
+		if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
+			pending = markProvidedByNestedKey(rootInfo, path, i+1, values, satisfied, pending)
+		}
+	}
+	if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
+		var filesSlice []*multipart.FileHeader
+		if files != nil {
+			filesSlice = files[path]
+		}
+		if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
+			errs = appendError(errs, path, err)
+		}
+		// A key that names no field is by far the most common failure,
+		// and parsePathInfo returns that sentinel unwrapped, so the
+		// pointer compare keeps errors.Is off the per-key path.
+	} else if err != errInvalidPath && errors.Is(err, errIndexTooLarge) { //nolint:errorlint // see above
+		errs = appendError(errs, path, err)
+	} else if !d.ignoreUnknownKeys {
+		errs = appendError(errs, path, UnknownKeyError{Key: path})
+	}
+	return errs, pending
 }
 
 // setDefaults sets the default values when the `default` tag is specified,
@@ -249,7 +318,7 @@ func (f *fieldInfo) resolveDefault() {
 	}
 }
 
-func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src map[string][]string, prefix string) MultiError {
+func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix string) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
 	// no anonymous embedded pointers to allocate anywhere in the tree) — the
@@ -359,7 +428,7 @@ func isPointerToStruct(v reflect.Value) bool {
 	return !v.IsZero() && v.Type().Kind() == reflect.Ptr && v.Elem().Type().Kind() == reflect.Struct
 }
 
-func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
+func fieldProvided(src *source, prefix string, f *fieldInfo) bool {
 	if keyProvided(src, prefix, f.alias) {
 		return true
 	}
@@ -368,18 +437,17 @@ func fieldProvided(src map[string][]string, prefix string, f *fieldInfo) bool {
 
 // keyProvided reports whether prefix+name is a key of src, assembling the key
 // in a stack buffer when it fits so the probe allocates nothing.
-func keyProvided(src map[string][]string, prefix, name string) bool {
+func keyProvided(src *source, prefix, name string) bool {
 	if prefix == "" {
-		_, ok := src[name]
+		_, ok := src.lookup(name)
 		return ok
 	}
 	if n := len(prefix) + len(name); n <= maxDirectKeyLen {
 		var buf [maxDirectKeyLen]byte
 		copy(buf[copy(buf[:], prefix):], name)
-		_, ok := src[string(buf[:n])]
-		return ok
+		return src.hasBytes(buf[:n])
 	}
-	_, ok := src[prefix+name]
+	_, ok := src.lookup(prefix + name)
 	return ok
 }
 
@@ -401,7 +469,7 @@ const requiredBitWords = 4
 // markProvidedDirectly marks every required group src answers through one of
 // its own paths, returning the bitset — backed by inline when the groups fit
 // — and how many are still pending.
-func markProvidedDirectly(groups []requiredGroup, src map[string][]string, inline []uint64) ([]uint64, int) {
+func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) ([]uint64, int) {
 	if len(groups) == 0 {
 		return nil, 0
 	}
@@ -462,7 +530,8 @@ func missingRequired(groups []requiredGroup, satisfied []uint64, pending int) Mu
 // standalone form of what Decode folds into its own loop.
 func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) MultiError {
 	var inline [requiredBitWords]uint64
-	satisfied, pending := markProvidedDirectly(info.requiredGroups, src, inline[:])
+	s := source{m: src}
+	satisfied, pending := markProvidedDirectly(info.requiredGroups, &s, inline[:])
 	if pending > 0 {
 		for key, val := range src {
 			i := strings.IndexByte(key, '.')
@@ -518,10 +587,10 @@ func newFieldWithPrefix(f *fieldInfo, prefix string) fieldWithPrefix {
 
 // directlyProvided reports whether any of the group's own paths carries a
 // non-empty value in src.
-func directlyProvided(fields []fieldWithPrefix, src map[string][]string) bool {
+func directlyProvided(fields []fieldWithPrefix, src *source) bool {
 	for _, f := range fields {
 		for _, path := range f.searchPaths {
-			if v, ok := src[path]; ok && !isEmpty(f.typ, v) {
+			if v, ok := src.lookup(path); ok && !isEmpty(f.typ, v) {
 				return true
 			}
 		}
@@ -1131,10 +1200,13 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 			out = append(out, ev)
 		}
 	}
-	// v's type is exactly []T here (the dispatch switch guarantees it), so
-	// assign through the typed pointer: no reflect.ValueOf escape, no Set
-	// assignability checks, and a loud panic if the invariant is ever broken.
-	*v.Addr().Interface().(*[]T) = out
+	// v's type is exactly []T here (the dispatch switch guarantees it), and v
+	// is settable (decode returns before reaching here for a field it cannot
+	// set), so assign through a typed pointer to it: no reflect.ValueOf
+	// escape and no Set assignability checks. The pointer comes from
+	// UnsafeAddr rather than Addr().Interface(), which resolved the pointer
+	// type on every call and measured a fifth of the whole assignment's cost.
+	*(*[]T)(unsafe.Pointer(v.UnsafeAddr())) = out
 	return nil
 }
 

@@ -81,6 +81,19 @@ The supported field types in the struct are:
 
 Unsupported types are simply ignored, however custom types can be registered to be converted.
 
+## Decoding Key/Value Pairs
+
+When values arrive one key/value pair at a time, as a parsed query string's do, `DecodeValues` decodes the pairs without first building the map `Decode` takes:
+
+```go
+keys := []string{"name", "phone", "phone"}
+values := []string{"Jane Doe", "555-5555", "555-0100"}
+
+err := decoder.DecodeValues(&person, keys, values)
+```
+
+`values[i]` is a value of the key `keys[i]`, and a key given more than once has all of its values in the order given, as it would in the map. The two slices must be the same length.
+
 ## Setting Defaults
 
 It is possible to set default values when encoding/decoding by using the `default` tag option. The value of `default` is applied when a field has a zero value, a pointer has a nil value, or a slice is empty.

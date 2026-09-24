@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -405,4 +406,109 @@ func TestParserReservationDoesNotScaleWithSeparators(t *testing.T) {
 		t.Fatalf("%d separators allocate %d bytes over %d rejections against %d for %d separators: the reservation follows the key length",
 			maxPathReserve*512, long, iters, short, maxPathReserve)
 	}
+}
+
+// slotTypes returns n distinct struct types, more than the type cache has
+// slots when n > typeCacheSlots, so that some must share one.
+func slotTypes(n int) []reflect.Type {
+	types := make([]reflect.Type, n)
+	for i := range types {
+		types[i] = reflect.StructOf([]reflect.StructField{{
+			Name: "F" + strconv.Itoa(i),
+			Type: reflect.TypeFor[string](),
+		}})
+	}
+	return types
+}
+
+// The slots in front of the type cache hand every type its own metadata
+// however many share a slot, and a slot stays with the first live type that
+// claims it rather than changing hands on every call.
+func TestTypeCacheSlotsShared(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	types := slotTypes(3 * typeCacheSlots)
+	infos := make([]*structInfo, len(types))
+	for i, typ := range types {
+		infos[i] = c.get(typ)
+	}
+	for range 2 {
+		for i, typ := range types {
+			if c.get(typ) != infos[i] {
+				t.Fatalf("type %d: got different metadata on a repeat call", i)
+			}
+		}
+	}
+	for i, typ := range types {
+		if f := infos[i].fields; len(f) != 1 || f[0].name != "F"+strconv.Itoa(i) {
+			t.Fatalf("type %d: got the metadata of another type", i)
+		}
+		owner := slices.IndexFunc(types, func(u reflect.Type) bool { return typeSlot(u) == typeSlot(typ) })
+		if e := c.slots[typeSlot(typ)].Load(); e == nil || e.typ != types[owner] {
+			t.Fatalf("type %d: slot %d is not held by type %d, the first to claim it", i, typeSlot(typ), owner)
+		}
+	}
+}
+
+// A reconfiguration turns the slots' entries away, and an entry left from an
+// older configuration gives its slot up to the current one.
+func TestTypeCacheSlotsReset(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	typ := slotTypes(1)[0]
+	before := c.get(typ)
+
+	c.l.Lock()
+	c.reset()
+	c.l.Unlock()
+	for i := range c.slots {
+		if c.slots[i].Load() != nil {
+			t.Fatalf("slot %d survived the reset", i)
+		}
+	}
+	after := c.get(typ)
+	if after == before {
+		t.Fatal("got the metadata built before the reset")
+	}
+
+	// An entry a build racing the reset stored after it.
+	slot := &c.slots[typeSlot(typ)]
+	slot.Store(&cacheEntry{info: before, typ: typ, gen: c.gen.Load() - 1})
+	if c.get(typ) != after {
+		t.Fatal("got the metadata of a stale slot entry")
+	}
+	if e := slot.Load(); e == nil || e.info != after || e.gen != c.gen.Load() {
+		t.Fatal("the stale slot entry was not replaced")
+	}
+}
+
+// Concurrent lookups of types sharing slots, interleaved with
+// reconfigurations, always return metadata of the type asked for.
+func TestTypeCacheSlotsConcurrent(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	types := slotTypes(2 * typeCacheSlots)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			for n := range 200 {
+				i := (g*7 + n) % len(types)
+				if f := c.get(types[i]).fields; len(f) != 1 || f[0].name != "F"+strconv.Itoa(i) {
+					t.Errorf("type %d: got the metadata of another type", i)
+					return
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 20 {
+			c.l.Lock()
+			c.reset()
+			c.l.Unlock()
+		}
+	})
+	wg.Wait()
 }
