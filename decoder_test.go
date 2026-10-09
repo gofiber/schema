@@ -5596,6 +5596,73 @@ func TestDecodeMapFieldDetachesKey(t *testing.T) {
 	}
 }
 
+func TestDecodeMapFieldEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string   `schema:"attributes"`
+		Tags       map[string][]string `schema:"tags"`
+	}
+	src := map[string][]string{"attributes.kept": {""}, "attributes.added": {""}, "tags.x": {""}}
+
+	// As with a plain string field, an empty value is ignored.
+	s := S{Attributes: map[string]string{"kept": "1"}}
+	if err := NewDecoder().Decode(&s, src); err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"kept": "1"}; !reflect.DeepEqual(s.Attributes, want) {
+		t.Errorf("Attributes = %v, want %v", s.Attributes, want)
+	}
+	// As with a slice field, a slice value is replaced with an empty one.
+	if want := map[string][]string{"x": {}}; !reflect.DeepEqual(s.Tags, want) {
+		t.Errorf("Tags = %#v, want %#v", s.Tags, want)
+	}
+
+	var nilMap S
+	if err := NewDecoder().Decode(&nilMap, map[string][]string{"attributes.added": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	if nilMap.Attributes != nil {
+		t.Errorf("Attributes = %v, want nil: an ignored value allocates no map", nilMap.Attributes)
+	}
+
+	// With ZeroEmpty, an empty value sets the zero value, as for a field.
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	zeroed := S{Attributes: map[string]string{"kept": "1"}}
+	if err := d.Decode(&zeroed, src); err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"kept": "", "added": ""}; !reflect.DeepEqual(zeroed.Attributes, want) {
+		t.Errorf("Attributes = %v, want %v", zeroed.Attributes, want)
+	}
+}
+
+type mapBatchItem struct{ V string }
+
+type mapBatch []mapBatchItem
+
+func (b *mapBatch) UnmarshalText(text []byte) error {
+	for _, v := range strings.Split(string(text), ",") {
+		*b = append(*b, mapBatchItem{V: v})
+	}
+	return nil
+}
+
+func TestDecodeMapFieldSliceTextUnmarshaler(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Batches map[string]mapBatch `schema:"batches"`
+	}
+	if err := NewDecoder().Decode(&s, map[string][]string{"batches.b": {"x,y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := (mapBatch{{V: "x"}, {V: "y"}}); !reflect.DeepEqual(s.Batches["b"], want) {
+		t.Fatalf("Batches = %v, want b: %v", s.Batches, want)
+	}
+}
+
 func TestDecodeMapFieldRequired(t *testing.T) {
 	t.Parallel()
 

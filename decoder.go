@@ -975,6 +975,12 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 // the last of several values the way such a field does; the key is stored
 // exactly as sent.
 func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string) error {
+	// A plain scalar field ignores an empty value unless ZeroEmpty is set, so
+	// such a value leaves the map as it is rather than storing a zero value.
+	if k := part.field.mapValue[0].field.fastKind; k != reflect.Invalid && !d.zeroEmpty &&
+		(len(values) == 0 || values[len(values)-1] == "") {
+		return nil
+	}
 	t := v.Type()
 	value := reflect.New(t.Elem()).Elem()
 	if err := d.decode(value, path, part.field.mapValue, values, nil, nil); err != nil {

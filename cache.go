@@ -738,11 +738,16 @@ func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias 
 }
 
 // decodesFromText reports whether a map value described by f is filled from
-// one text value per element: a struct, or a slice of them, needs a converter
-// or encoding.TextUnmarshaler to be, since its fields have no keys of their
-// own here.
+// text: a struct, or a slice of them, needs a converter or
+// encoding.TextUnmarshaler to be, since its fields have no keys of their own
+// here.
 func (c *cache) decodesFromText(f *fieldInfo) bool {
 	t := indirectType(f.typ)
+	// A type that unmarshals itself, such as a slice type implementing
+	// encoding.TextUnmarshaler, is decoded as a whole.
+	if f.derefUnmarshaler.IsValid && !f.derefUnmarshaler.IsSliceElement {
+		return true
+	}
 	if f.isSliceOfStructs {
 		return f.elemUnmarshaler.IsValid || c.converter(indirectType(t.Elem())) != nil
 	}
