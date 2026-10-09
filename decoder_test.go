@@ -17,6 +17,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	utils "github.com/gofiber/utils/v2"
 )
 
 type IntAlias int
@@ -5357,5 +5359,297 @@ func TestDecodeDoesNotMutateCallerSrc(t *testing.T) {
 	}
 	if _, ok := src2["g"]; ok || len(src2) != 1 {
 		t.Errorf("caller src mutated with file key: %v", src2)
+	}
+}
+
+func TestDecodeMapFields(t *testing.T) {
+	t.Parallel()
+
+	type Filter struct {
+		Attributes map[string]string   `schema:"attributes"`
+		Tags       map[string][]string `schema:"tags"`
+		Limits     map[string]int      `schema:"limits"`
+		Untouched  map[string]string   `schema:"untouched"`
+	}
+	var f Filter
+	err := NewDecoder().Decode(&f, map[string][]string{
+		"attributes.Colour": {"red"},
+		"ATTRIBUTES.size":   {"m"},
+		"attributes.a.b":    {"dotted"},
+		"tags.x":            {"1", "2"},
+		"limits.max":        {"10"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The field prefix matches case-insensitively, like any field; the key is
+	// kept exactly as sent, and everything after the prefix is the key.
+	wantAttributes := map[string]string{"Colour": "red", "size": "m", "a.b": "dotted"}
+	if !reflect.DeepEqual(f.Attributes, wantAttributes) {
+		t.Errorf("Attributes = %v, want %v", f.Attributes, wantAttributes)
+	}
+	if want := map[string][]string{"x": {"1", "2"}}; !reflect.DeepEqual(f.Tags, want) {
+		t.Errorf("Tags = %v, want %v", f.Tags, want)
+	}
+	if want := map[string]int{"max": 10}; !reflect.DeepEqual(f.Limits, want) {
+		t.Errorf("Limits = %v, want %v", f.Limits, want)
+	}
+	if f.Untouched != nil {
+		t.Errorf("Untouched = %v, want nil", f.Untouched)
+	}
+}
+
+func TestDecodeMapFieldLastValueWins(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Attributes map[string]string `schema:"attributes"`
+		Name       string            `schema:"name"`
+	}
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"attributes.colour": {"a", "b"},
+		"name":              {"a", "b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The same rule as a scalar field.
+	if s.Attributes["colour"] != "b" || s.Name != "b" {
+		t.Fatalf("got attributes.colour=%q name=%q, want both %q", s.Attributes["colour"], s.Name, "b")
+	}
+}
+
+func TestDecodeMapFieldAddsToExistingMap(t *testing.T) {
+	t.Parallel()
+
+	s := struct {
+		Attributes map[string]string `schema:"attributes"`
+	}{Attributes: map[string]string{"kept": "1", "replaced": "1"}}
+	err := NewDecoder().Decode(&s, map[string][]string{"attributes.replaced": {"2"}, "attributes.added": {"3"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"kept": "1", "replaced": "2", "added": "3"}
+	if !reflect.DeepEqual(s.Attributes, want) {
+		t.Fatalf("Attributes = %v, want %v", s.Attributes, want)
+	}
+}
+
+func TestDecodeMapFieldConversionError(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Limits map[string]int `schema:"limits"`
+	}
+	err := NewDecoder().Decode(&s, map[string][]string{"limits.max": {"ten"}})
+	var errs MultiError
+	if !errors.As(err, &errs) {
+		t.Fatalf("got %v, want a MultiError", err)
+	}
+	var conv ConversionError
+	if !errors.As(errs["limits.max"], &conv) || conv.Type != reflect.TypeOf(0) {
+		t.Fatalf("got %#v, want a ConversionError for an int at limits.max", errs["limits.max"])
+	}
+	if s.Limits != nil {
+		t.Fatalf("Limits = %v, want nil: a value that failed to convert adds no entry", s.Limits)
+	}
+}
+
+func TestDecodeMapFieldKeyRequired(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(false)
+	for _, key := range []string{"attributes", "attributes."} {
+		err := d.Decode(&s, map[string][]string{key: {"x"}})
+		var errs MultiError
+		if !errors.As(err, &errs) {
+			t.Fatalf("%q: got %v, want a MultiError", key, err)
+		}
+		if _, ok := errs[key].(UnknownKeyError); !ok {
+			t.Fatalf("%q: got %v, want an UnknownKeyError: a map field needs a key", key, errs[key])
+		}
+	}
+}
+
+func TestDecodeMapFieldNested(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	type Inner struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	var s struct {
+		Inner    Inner  `schema:"inner"`
+		InnerPtr *Inner `schema:"innerptr"`
+		Items    []Item `schema:"items"`
+	}
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"inner.attributes.a":    {"1"},
+		"innerptr.attributes.b": {"2"},
+		"items.1.attributes.c":  {"3"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Inner.Attributes["a"] != "1" || s.InnerPtr.Attributes["b"] != "2" || s.Items[1].Attributes["c"] != "3" {
+		t.Fatalf("got %+v", s)
+	}
+}
+
+type mapValueUnmarshaler string
+
+func (u *mapValueUnmarshaler) UnmarshalText(text []byte) error {
+	*u = mapValueUnmarshaler(strings.ToUpper(string(text)))
+	return nil
+}
+
+func TestDecodeMapFieldValueKinds(t *testing.T) {
+	t.Parallel()
+
+	type Custom struct{ V string }
+	type Key string
+	var s struct {
+		Pointers    map[string]*int                `schema:"pointers"`
+		Times       map[string]time.Time           `schema:"times"`
+		Unmarshaled map[string]mapValueUnmarshaler `schema:"unmarshaled"`
+		Converted   map[string]Custom              `schema:"converted"`
+		ConvSlices  map[string][]Custom            `schema:"convslices"`
+		NamedKeys   map[Key]string                 `schema:"named"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(Custom{}, func(s string) reflect.Value { return reflect.ValueOf(Custom{V: s}) })
+	err := d.Decode(&s, map[string][]string{
+		"pointers.a":    {"7"},
+		"times.t":       {"2026-10-09T10:00:00Z"},
+		"unmarshaled.u": {"abc"},
+		"converted.c":   {"x"},
+		"convslices.s":  {"y", "z"},
+		"named.k":       {"v"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := s.Pointers["a"]; p == nil || *p != 7 {
+		t.Errorf("Pointers = %v", s.Pointers)
+	}
+	if got := s.Times["t"]; !got.Equal(time.Date(2026, 10, 9, 10, 0, 0, 0, time.UTC)) {
+		t.Errorf("Times = %v", s.Times)
+	}
+	if s.Unmarshaled["u"] != "ABC" {
+		t.Errorf("Unmarshaled = %v", s.Unmarshaled)
+	}
+	if s.Converted["c"] != (Custom{V: "x"}) {
+		t.Errorf("Converted = %v", s.Converted)
+	}
+	if want := []Custom{{V: "y"}, {V: "z"}}; !reflect.DeepEqual(s.ConvSlices["s"], want) {
+		t.Errorf("ConvSlices = %v", s.ConvSlices)
+	}
+	if s.NamedKeys["k"] != "v" {
+		t.Errorf("NamedKeys = %v", s.NamedKeys)
+	}
+}
+
+func TestDecodeMapFieldUnsupportedIgnored(t *testing.T) {
+	t.Parallel()
+
+	type Nested struct{ V string }
+	var s struct {
+		IntKeys map[int]string               `schema:"intkeys"`
+		Structs map[string]Nested            `schema:"structs"`
+		Maps    map[string]map[string]string `schema:"maps"`
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(false)
+	err := d.Decode(&s, map[string][]string{"intkeys.1": {"x"}, "structs.a": {"x"}, "maps.a.b": {"x"}})
+	var errs MultiError
+	if !errors.As(err, &errs) || len(errs) != 3 {
+		t.Fatalf("got %v, want an unknown key error for each field", err)
+	}
+	for key, e := range errs {
+		if _, ok := e.(UnknownKeyError); !ok {
+			t.Errorf("%s: got %v, want an UnknownKeyError", key, e)
+		}
+	}
+}
+
+func TestDecodeMapFieldDetachesKey(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	buf := []byte("attributes.colour")
+	key := utils.UnsafeString(buf)
+	if err := NewDecoder().Decode(&s, map[string][]string{key: {"red"}}); err != nil {
+		t.Fatal(err)
+	}
+	copy(buf, "attributes.xxxxxx") // simulate fasthttp reusing the key's bytes
+	if s.Attributes["colour"] != "red" {
+		t.Fatalf("Attributes = %v; the map key must not alias the source key", s.Attributes)
+	}
+}
+
+func TestDecodeMapFieldRequired(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes,required"`
+	}
+	d := NewDecoder()
+	var s S
+	if err := d.Decode(&s, map[string][]string{"attributes.colour": {"red"}}); err != nil {
+		t.Fatalf("a key under the map field should satisfy required: %v", err)
+	}
+	var missing S
+	err := d.Decode(&missing, map[string][]string{})
+	var errs MultiError
+	if !errors.As(err, &errs) {
+		t.Fatalf("got %v, want a MultiError", err)
+	}
+	if _, ok := errs["attributes"].(EmptyFieldError); !ok {
+		t.Fatalf("got %v, want an EmptyFieldError for attributes", errs["attributes"])
+	}
+}
+
+func TestDecodeValuesMapField(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	err := NewDecoder().DecodeValues(&s, []string{"attributes.a", "attributes.b"}, []string{"1", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"a": "1", "b": "2"}; !reflect.DeepEqual(s.Attributes, want) {
+		t.Fatalf("Attributes = %v, want %v", s.Attributes, want)
+	}
+}
+
+func BenchmarkMapFieldDecode(b *testing.B) {
+	type Filter struct {
+		Attributes map[string]string `schema:"attributes"`
+		Limits     map[string]int    `schema:"limits"`
+		Name       string            `schema:"name"`
+	}
+	data := map[string][]string{
+		"attributes.colour": {"red"},
+		"attributes.size":   {"m"},
+		"limits.max":        {"10"},
+		"name":              {"n"},
+	}
+	decoder := NewDecoder()
+	for b.Loop() {
+		var f Filter
+		if err := decoder.Decode(&f, data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

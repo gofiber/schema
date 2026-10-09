@@ -78,8 +78,23 @@ The supported field types in the struct are:
 * struct
 * a pointer to one of the above types
 * a slice or a pointer to a slice of one of the above types
+* a map with string keys whose values are one of the non-struct types above, a type with a registered converter or an `encoding.TextUnmarshaler` implementation, or a pointer or slice of those (see below)
 
 Unsupported types are simply ignored, however custom types can be registered to be converted.
+
+### Map fields
+
+A map field is filled from keys of the form `<field>.<key>`, one map entry per key:
+
+```go
+type Filter struct {
+    Attributes map[string]string   `schema:"attributes"` // attributes.colour=red
+    Tags       map[string][]string `schema:"tags"`       // tags.size=m&tags.size=l
+    Limits     map[string]int      `schema:"limits"`     // limits.max=10
+}
+```
+
+The field name matches case-insensitively like any other field, while the key is kept exactly as sent, and everything after the field name is the key (`attributes.a.b` gives the key `a.b`). Each value is decoded as a field of the map's value type would be, so a single-value map takes the last of several values. A map is allocated on first use and entries are added to an existing one. A map type with a registered converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from the field's own key instead.
 
 ## Decoding Key/Value Pairs
 

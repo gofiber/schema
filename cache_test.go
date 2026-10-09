@@ -193,6 +193,8 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 		A string `schema:"same"`
 		B string `schema:"same"`
 	}
+	// A named map type is still a map field, decoded entry by entry.
+	type Attrs map[string]string
 	type Shapes struct {
 		Embedded
 		Dup
@@ -206,6 +208,7 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 		Unexported string     `schema:"unexported"`
 		Dotted     string     `schema:"dot.ted"`
 		Deep       [][]string `schema:"deep"`
+		Attrs      Attrs      `schema:"attrs"`
 	}
 
 	types := []reflect.Type{
@@ -217,6 +220,7 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 		"value", "same", "promoted", "plain", "mixedcase", "MixedCase", "MIXEDCASE",
 		"nested", "nestedptr", "items", "scalars", "skipped", "-", "unexported",
 		"dot.ted", "dotted", "deep", "embedded", "dup", "missing", "", "plainx", "Plain",
+		"attrs", "ATTRS",
 	}
 
 	d := NewDecoder()
@@ -304,6 +308,56 @@ func TestParsePathDetachesCacheKey(t *testing.T) {
 	}
 	if keys[0] != "items.0.value" {
 		t.Fatalf("path cache key mutated to %q; key must be cloned before caching", keys[0])
+	}
+}
+
+// Map keys are chosen by the client, so a path through a map field must not be
+// cached: otherwise every distinct key ever sent would stay in the cache.
+func TestMapKeysAreNotCached(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Name  string            `schema:"name"`
+		Attrs map[string]string `schema:"attrs"`
+	}
+	type S struct {
+		Attrs  map[string]string `schema:"attrs"`
+		Nested struct {
+			Attrs map[string]int `schema:"attrs"`
+		} `schema:"nested"`
+		Items []Item `schema:"items"`
+	}
+
+	d := NewDecoder()
+	var s S
+	// A path through a slice of structs is cached, as before.
+	if err := d.Decode(&s, map[string][]string{"items.0.name": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	paths := &d.cache.get(reflect.TypeOf(s)).paths
+	before := len(cachedPathKeys(paths))
+	if before != 1 {
+		t.Fatalf("expected the slice path to be cached, got %d entries", before)
+	}
+
+	const n = 2 * maxFastPaths
+	for i := 0; i < n; i++ {
+		key := strconv.Itoa(i)
+		src := map[string][]string{
+			"attrs." + key:         {"v"},
+			"nested.attrs." + key:  {"1"},
+			"items.0.attrs." + key: {"v"},
+		}
+		if err := d.Decode(&s, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if after := len(cachedPathKeys(paths)); after != before {
+		t.Fatalf("decoding %d distinct map keys grew the path cache from %d to %d entries", n, before, after)
+	}
+	if len(s.Attrs) != n || len(s.Nested.Attrs) != n || len(s.Items[0].Attrs) != n {
+		t.Fatalf("got %d, %d and %d entries, want %d each", len(s.Attrs), len(s.Nested.Attrs), len(s.Items[0].Attrs), n)
 	}
 }
 

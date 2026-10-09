@@ -820,6 +820,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		return nil
 	}
 
+	if parts[0].field.mapValue != nil {
+		return d.decodeMapEntry(v, path, &parts[0], values)
+	}
+
 	// Dereference if needed.
 	t := v.Type()
 	if t.Kind() == reflect.Ptr {
@@ -962,6 +966,26 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return fmt.Errorf("schema: converter not found for %v", t)
 		}
 	}
+	return nil
+}
+
+// decodeMapEntry decodes values into the entry of the map field v that the
+// rest of path from part.keyStart names, allocating the map on first use. The value is decoded as
+// a field of the map's value type, so it converts, reports errors and takes
+// the last of several values the way such a field does; the key is stored
+// exactly as sent.
+func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string) error {
+	t := v.Type()
+	value := reflect.New(t.Elem()).Elem()
+	if err := d.decode(value, path, part.field.mapValue, values, nil, nil); err != nil {
+		return err
+	}
+	if v.IsNil() {
+		v.Set(reflect.MakeMap(t))
+	}
+	// The key may alias the caller's buffer, so it is cloned before the map
+	// keeps it.
+	v.SetMapIndex(reflect.ValueOf(strings.Clone(path[part.keyStart:])).Convert(t.Key()), value)
 	return nil
 }
 
