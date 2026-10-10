@@ -165,6 +165,24 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		// when the structInfo was built, so the decoder walks plain indices
 		// instead of repeating FieldByName lookups on every Decode call.
 		hopBuf = append(hopBuf, pathHop{index: field.index, ensure: struc.anonymousPtrFields})
+		if field.mapValue != nil {
+			// The rest of the path is a key of this map field, kept exactly
+			// as sent. Keys are chosen by the client, so this path is not
+			// cached: caching it would keep every key ever sent for the life
+			// of the process.
+			keyStart = keyEnd + 1
+			if keyStart >= len(p) {
+				return nil, errInvalidPath
+			}
+			hops := hopBuf[hopStart:len(hopBuf):len(hopBuf)]
+			return append(parts, pathPart{
+				hops:      hops,
+				field:     field,
+				index:     -1,
+				soleIndex: soleHopIndex(hops),
+				keyStart:  int32(keyStart),
+			}), nil
+		}
 		if field.takesIndex() {
 			// Parse a special case: slices of structs.
 			// i+1 must be the slice index.
@@ -555,7 +573,7 @@ func directEligible(info *structInfo, f *fieldInfo) bool {
 	if info.fieldsByName[f.aliasLower] != f || strings.IndexByte(f.aliasLower, '.') >= 0 {
 		return false
 	}
-	return !f.takesIndex()
+	return !f.takesIndex() && f.mapValue == nil
 }
 
 // takesIndex reports whether a path through f must carry a slice element
@@ -611,6 +629,10 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	canonicalAlias := alias
 	if parentAlias != "" {
 		canonicalAlias = parentAlias + "." + alias
+	}
+	if field.Type.Kind() == reflect.Map && c.converter(field.Type) == nil &&
+		!isTextUnmarshaler(reflect.Zero(field.Type)).IsValid {
+		return c.createMapField(field, alias, canonicalAlias, options, tag)
 	}
 	// Check if the type is supported and don't cache it if not.
 	// First let's get the basic type.
@@ -679,6 +701,61 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	}
 	f.resolveDefault()
 	return f
+}
+
+// createMapField creates the fieldInfo for a map field, which is decoded from
+// keys of the form "<alias>.<key>", one map entry per key. Only maps with
+// string keys are supported, and only values the decoder fills from text:
+// scalars, types with a converter or encoding.TextUnmarshaler, pointers to
+// them, and slices of them. A map with no converter of its own is not
+// otherwise decodable, so any other map field is ignored, as before.
+func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias string, options tagOptions, tag string) *fieldInfo {
+	t := field.Type
+	if t.Key().Kind() != reflect.String || t.Elem().Kind() == reflect.Map {
+		return nil
+	}
+	// The value is described as a field of the value type, so decode handles
+	// it the way it handles any field of that type.
+	value := c.createField(reflect.StructField{Name: field.Name, Type: t.Elem()}, "", tag)
+	if value == nil || value.isMultipart || !c.decodesFromText(value) {
+		return nil
+	}
+	f := &fieldInfo{
+		typ:            t,
+		fastKind:       reflect.Invalid,
+		name:           field.Name,
+		alias:          alias,
+		aliasLower:     utilstrings.ToLower(alias),
+		canonicalAlias: canonicalAlias,
+		canonicalDot:   canonicalAlias + ".",
+		isAnonymous:    field.Anonymous,
+		isRequired:     options.Contains("required"),
+		defaultValue:   options.getDefaultOptionValue(),
+		mapValue:       []pathPart{{field: value, index: -1, soleIndex: -1}},
+	}
+	f.resolveDefault()
+	return f
+}
+
+// decodesFromText reports whether a map value described by f is filled from
+// text: a struct, or a slice of them, needs a converter or
+// encoding.TextUnmarshaler to be, since its fields have no keys of their own
+// here.
+func (c *cache) decodesFromText(f *fieldInfo) bool {
+	t := indirectType(f.typ)
+	// A type with a converter of its own, or that unmarshals itself, such as
+	// a slice type implementing encoding.TextUnmarshaler, is decoded as a
+	// whole.
+	if c.converter(t) != nil || f.derefUnmarshaler.IsValid && !f.derefUnmarshaler.IsSliceElement {
+		return true
+	}
+	if f.isSliceOfStructs {
+		return f.elemUnmarshaler.IsValid || c.converter(indirectType(t.Elem())) != nil
+	}
+	if t.Kind() == reflect.Struct {
+		return f.derefUnmarshaler.IsValid || c.converter(t) != nil
+	}
+	return true
 }
 
 // converter returns the converter for a type.
@@ -865,6 +942,10 @@ type fieldInfo struct {
 	// def is the default option resolved at build time, nil for the fields
 	// that have none; see resolveDefault.
 	def *fieldDefault
+	// mapValue is set for a map field decoded entry by entry: the path part
+	// decode fills a map value with, describing the map's value type as a
+	// field of its own. Nil for every other field.
+	mapValue []pathPart
 }
 
 // fieldDefault is what setDefaults assigns for a field's default option:
@@ -897,6 +978,11 @@ type pathPart struct {
 	// the decoder's value is then an element of the slice field rather than
 	// the field itself.
 	elem bool
+	// keyStart is where, in the path, the key of the map entry that a
+	// terminal part through a map field names begins. Such a part is never
+	// cached, so the offset always refers to the path being decoded; an int32
+	// sits in elem's padding and leaves every other part the size it was.
+	keyStart int32
 }
 
 // soleHopIndex returns the single struct field index hops walks, or -1 when
