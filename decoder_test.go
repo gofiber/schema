@@ -5685,6 +5685,52 @@ func TestDecodeMapFieldRequired(t *testing.T) {
 	}
 }
 
+func TestDecodeMapFieldRequiredEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes,required"`
+	}
+	// An empty value is ignored, so it does not satisfy required.
+	var s S
+	err := NewDecoder().Decode(&s, map[string][]string{"attributes.colour": {""}})
+	var errs MultiError
+	if !errors.As(err, &errs) {
+		t.Fatalf("got %v, want a MultiError", err)
+	}
+	if _, ok := errs["attributes"].(EmptyFieldError); !ok {
+		t.Fatalf("got %v, want an EmptyFieldError for attributes", errs["attributes"])
+	}
+	if s.Attributes != nil {
+		t.Fatalf("Attributes = %v, want nil", s.Attributes)
+	}
+}
+
+type mapConvItem struct{ V string }
+
+func TestDecodeMapFieldWholeValueConverter(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		Lists map[string][]mapConvItem `schema:"lists"`
+	}
+	d := NewDecoder()
+	// A converter for the slice type itself, but none for its element type.
+	d.RegisterConverter([]mapConvItem{}, func(value string) reflect.Value {
+		var items []mapConvItem
+		for _, v := range strings.Split(value, ",") {
+			items = append(items, mapConvItem{V: v})
+		}
+		return reflect.ValueOf(items)
+	})
+	if err := d.Decode(&s, map[string][]string{"lists.a": {"x,y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := []mapConvItem{{V: "x"}, {V: "y"}}; !reflect.DeepEqual(s.Lists["a"], want) {
+		t.Fatalf("Lists = %v, want a: %v", s.Lists, want)
+	}
+}
+
 func TestDecodeValuesMapField(t *testing.T) {
 	t.Parallel()
 

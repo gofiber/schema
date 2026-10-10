@@ -743,9 +743,10 @@ func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias 
 // here.
 func (c *cache) decodesFromText(f *fieldInfo) bool {
 	t := indirectType(f.typ)
-	// A type that unmarshals itself, such as a slice type implementing
-	// encoding.TextUnmarshaler, is decoded as a whole.
-	if f.derefUnmarshaler.IsValid && !f.derefUnmarshaler.IsSliceElement {
+	// A type with a converter of its own, or that unmarshals itself, such as
+	// a slice type implementing encoding.TextUnmarshaler, is decoded as a
+	// whole.
+	if c.converter(t) != nil || f.derefUnmarshaler.IsValid && !f.derefUnmarshaler.IsSliceElement {
 		return true
 	}
 	if f.isSliceOfStructs {

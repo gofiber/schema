@@ -603,6 +603,11 @@ func isEmpty(t reflect.Type, value []string) bool {
 	if len(value) == 0 {
 		return true
 	}
+	// A key under a map field gives one entry, which is empty when its value
+	// would be.
+	if t.Kind() == reflect.Map {
+		t = t.Elem()
+	}
 	switch t.Kind() {
 	case boolType, float32Type, float64Type,
 		intType, int8Type, int16Type, int32Type, int64Type,
