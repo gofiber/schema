@@ -1,3 +1,8 @@
+<p align="center">
+  <img height="125" alt="Fiber Schema" src="https://raw.githubusercontent.com/gofiber/schema/main/.github/logo-dark.svg#gh-dark-mode-only" />
+  <img height="125" alt="Fiber Schema" src="https://raw.githubusercontent.com/gofiber/schema/main/.github/logo.svg#gh-light-mode-only" />
+</p>
+
 # gofiber/schema
 
 Package gofiber/schema converts structs to and from form values.
