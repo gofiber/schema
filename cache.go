@@ -863,19 +863,25 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 	prefixes := make(map[string][]requiredPrefix)
 	for gi := range groups {
 		for _, f := range groups[gi].fields {
+			typ := f.typ
+			if f.mapValue != nil {
+				// A key under a map field gives one entry, so it is empty
+				// when a value of the map's value type would be.
+				typ = typ.Elem()
+			}
 			for _, dot := range f.searchPathDots {
 				owners := prefixes[dot]
 				// One entry per (group, type): several fields of a group
 				// can reach the same prefix.
 				dup := false
 				for _, o := range owners {
-					if o.group == gi && o.typ == f.typ {
+					if o.group == gi && o.typ == typ {
 						dup = true
 						break
 					}
 				}
 				if !dup {
-					prefixes[dot] = append(owners, requiredPrefix{group: gi, typ: f.typ})
+					prefixes[dot] = append(owners, requiredPrefix{group: gi, typ: typ})
 				}
 			}
 		}

@@ -5706,6 +5706,27 @@ func TestDecodeMapFieldRequiredEmptyValue(t *testing.T) {
 	}
 }
 
+func TestDecodeRequiredConvertedMapEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	// A map with a converter of its own is decoded as a whole from its key,
+	// so an empty value is still a provided value, as on main.
+	type S struct {
+		M map[string]string `schema:"m,required"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(map[string]string{}, func(s string) reflect.Value {
+		return reflect.ValueOf(map[string]string{"raw": s})
+	})
+	var s S
+	if err := d.Decode(&s, map[string][]string{"m": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"raw": ""}; !reflect.DeepEqual(s.M, want) {
+		t.Fatalf("M = %v, want %v", s.M, want)
+	}
+}
+
 type mapConvItem struct{ V string }
 
 func TestDecodeMapFieldWholeValueConverter(t *testing.T) {
