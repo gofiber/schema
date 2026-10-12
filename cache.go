@@ -655,7 +655,9 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		}
 	}
 	if isStruct = ft.Kind() == reflect.Struct; !isStruct {
-		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil {
+		// A map type that unmarshals itself is decoded as a whole.
+		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil &&
+			(ft.Kind() != reflect.Map || !m.IsValid) {
 			// Type is not supported.
 			return nil
 		}

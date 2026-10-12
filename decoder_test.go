@@ -5727,6 +5727,42 @@ func TestDecodeRequiredConvertedMapEmptyValue(t *testing.T) {
 	}
 }
 
+type textMap map[string]string
+
+func (m *textMap) UnmarshalText(text []byte) error {
+	*m = textMap{"raw": string(text)}
+	return nil
+}
+
+func TestDecodeTextUnmarshalerMap(t *testing.T) {
+	t.Parallel()
+
+	// A map type that implements encoding.TextUnmarshaler is decoded as a
+	// whole from its own key, not entry by entry.
+	type S struct {
+		M textMap  `schema:"m,required"`
+		P *textMap `schema:"p"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{"m": {"x"}, "p": {"y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := (textMap{"raw": "x"}); !reflect.DeepEqual(s.M, want) {
+		t.Fatalf("M = %v, want %v", s.M, want)
+	}
+	if s.P == nil || !reflect.DeepEqual(*s.P, textMap{"raw": "y"}) {
+		t.Fatalf("P = %v, want &%v", s.P, textMap{"raw": "y"})
+	}
+
+	var empty S
+	if err := NewDecoder().Decode(&empty, map[string][]string{"m": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := (textMap{"raw": ""}); !reflect.DeepEqual(empty.M, want) {
+		t.Fatalf("M = %v, want %v", empty.M, want)
+	}
+}
+
 type mapConvItem struct{ V string }
 
 func TestDecodeMapFieldWholeValueConverter(t *testing.T) {
