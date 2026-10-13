@@ -5763,6 +5763,25 @@ func TestDecodeTextUnmarshalerMap(t *testing.T) {
 	}
 }
 
+func TestDecodeSliceOfTextUnmarshalerMapsIgnored(t *testing.T) {
+	t.Parallel()
+
+	// Only the map type itself is decoded as a whole; a slice of such maps is
+	// unsupported, so it is ignored as on main.
+	var s struct {
+		M []textMap  `schema:"m"`
+		P []*textMap `schema:"p"`
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	if err := d.Decode(&s, map[string][]string{"m": {"a", "b"}, "p": {"c"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.M != nil || s.P != nil {
+		t.Fatalf("M = %v, P = %v, want both nil", s.M, s.P)
+	}
+}
+
 type mapConvItem struct{ V string }
 
 func TestDecodeMapFieldWholeValueConverter(t *testing.T) {
