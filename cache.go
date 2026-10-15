@@ -93,7 +93,7 @@ type cacheEntry struct {
 }
 
 // registerConverter registers a converter function for a custom type.
-func (c *cache) registerConverter(value interface{}, converterFunc Converter) {
+func (c *cache) registerConverter(value any, converterFunc Converter) {
 	c.l.Lock()
 	next := make(map[reflect.Type]Converter)
 	if prev := c.regconv.Load(); prev != nil {
@@ -215,18 +215,18 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			})
 
 			// Get the next struct type, dropping ptrs.
-			if field.typ.Kind() == reflect.Ptr {
+			if field.typ.Kind() == reflect.Pointer {
 				t = field.typ.Elem()
 			} else {
 				t = field.typ
 			}
 			if t.Kind() == reflect.Slice {
 				t = t.Elem()
-				if t.Kind() == reflect.Ptr {
+				if t.Kind() == reflect.Pointer {
 					t = t.Elem()
 				}
 			}
-		} else if field.typ.Kind() == reflect.Ptr {
+		} else if field.typ.Kind() == reflect.Pointer {
 			t = field.typ.Elem()
 		} else {
 			t = field.typ
@@ -464,7 +464,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		structField := t.Field(i)
 		// Only exported anonymous pointers can be allocated; unexported ones
 		// are not settable and Set would panic.
-		if structField.Anonymous && structField.Type.Kind() == reflect.Ptr && structField.IsExported() {
+		if structField.Anonymous && structField.Type.Kind() == reflect.Pointer && structField.IsExported() {
 			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
 		}
 		if f := c.createField(structField, parentAlias, tag); f != nil {
@@ -502,7 +502,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			info.hasIndexedSlice = true
 		}
 		if k := f.typ.Kind(); f.def != nil || k == reflect.Struct ||
-			(k == reflect.Ptr && f.typ.Elem().Kind() == reflect.Struct) {
+			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct) {
 			info.defaultFields = append(info.defaultFields, f)
 		}
 	}
@@ -590,7 +590,7 @@ func (f *fieldInfo) takesIndex() bool {
 // tree. visited guards against recursive types. tag is the alias tag
 // snapshot for this build, so no per-field config lock is taken.
 func (c *cache) needsDefaultsWalk(t reflect.Type, tag string, visited map[reflect.Type]bool) bool {
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct || visited[t] {
@@ -601,7 +601,7 @@ func (c *cache) needsDefaultsWalk(t reflect.Type, tag string, visited map[reflec
 		field := t.Field(i)
 		// Mirror the anonymousPtrFields filter: only exported anonymous
 		// pointers are ever allocated, so only they justify the walk.
-		if field.Anonymous && field.Type.Kind() == reflect.Ptr && field.IsExported() {
+		if field.Anonymous && field.Type.Kind() == reflect.Pointer && field.IsExported() {
 			return true
 		}
 		alias, options := fieldAlias(field, tag)
@@ -639,18 +639,18 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	isSlice, isStruct := false, false
 	ft := field.Type
 	m := isTextUnmarshaler(reflect.Zero(ft))
-	if ft.Kind() == reflect.Ptr {
+	if ft.Kind() == reflect.Pointer {
 		ft = ft.Elem()
 	}
 	if isSlice = ft.Kind() == reflect.Slice; isSlice {
 		ft = ft.Elem()
-		if ft.Kind() == reflect.Ptr {
+		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
 	}
 	if ft.Kind() == reflect.Array {
 		ft = ft.Elem()
-		if ft.Kind() == reflect.Ptr {
+		if ft.Kind() == reflect.Pointer {
 			ft = ft.Elem()
 		}
 	}
@@ -680,7 +680,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	// can skip decode's dispatch entirely; converter registration resets the
 	// cache, so this build-time decision stays valid.
 	fastKind := reflect.Invalid
-	if k := field.Type.Kind(); k != reflect.Ptr && !m.IsValid &&
+	if k := field.Type.Kind(); k != reflect.Pointer && !m.IsValid &&
 		getBuiltinConverter(k) != nil && c.converter(field.Type) == nil {
 		fastKind = k
 	}
@@ -1017,7 +1017,7 @@ type pathHop struct {
 // ----------------------------------------------------------------------------
 
 func indirectType(typ reflect.Type) reflect.Type {
-	if typ.Kind() == reflect.Ptr {
+	if typ.Kind() == reflect.Pointer {
 		return typ.Elem()
 	}
 	return typ
@@ -1043,8 +1043,8 @@ type tagOptions string
 // parseTag splits a struct field's url tag into its name and comma-separated
 // options.
 func parseTag(tag string) (string, tagOptions) {
-	if idx := strings.IndexByte(tag, ','); idx != -1 {
-		return tag[:idx], tagOptions(tag[idx+1:])
+	if before, after, ok := strings.Cut(tag, ","); ok {
+		return before, tagOptions(after)
 	}
 	return tag, ""
 }

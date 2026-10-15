@@ -93,7 +93,7 @@ func (d *Decoder) MaxSize(size int) {
 }
 
 // RegisterConverter registers a converter function for a custom type.
-func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) {
+func (d *Decoder) RegisterConverter(value any, converterFunc Converter) {
 	d.cache.registerConverter(value, converterFunc)
 }
 
@@ -105,7 +105,7 @@ func (d *Decoder) RegisterConverter(value interface{}, converterFunc Converter) 
 // Keys are "paths" in dotted notation to the struct fields and nested structs.
 //
 // See the package documentation for a full explanation of the mechanics.
-func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[string][]*multipart.FileHeader) error {
+func (d *Decoder) Decode(dst any, src map[string][]string, files ...map[string][]*multipart.FileHeader) error {
 	var multipartFiles map[string][]*multipart.FileHeader
 
 	if len(files) > 0 {
@@ -141,7 +141,7 @@ func (d *Decoder) Decode(dst interface{}, src map[string][]string, files ...map[
 //
 // The first parameter must be a pointer to a struct, and keys and values must
 // be the same length. The slices are only read, and only during the call.
-func (d *Decoder) DecodeValues(dst interface{}, keys, values []string) error {
+func (d *Decoder) DecodeValues(dst any, keys, values []string) error {
 	if len(keys) != len(values) {
 		return errValuesLength
 	}
@@ -168,7 +168,7 @@ func (d *Decoder) DecodeValues(dst interface{}, keys, values []string) error {
 
 // decodeSource decodes src into dst, the pointer to a struct Decode and
 // DecodeValues were given, with the files Decode was.
-func (d *Decoder) decodeSource(dst interface{}, src *source, multipartFiles map[string][]*multipart.FileHeader) (err error) {
+func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][]*multipart.FileHeader) (err error) {
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
 		return errNotPointerToStruct
@@ -302,7 +302,7 @@ func (f *fieldInfo) resolveDefault() {
 			tmpl = reflect.Append(tmpl, v.Convert(elemT))
 		}
 		def.slice = tmpl
-	case reflect.Ptr:
+	case reflect.Pointer:
 		t1 := f.typ.Elem()
 		if conv := getBuiltinConverter(t1.Kind()); conv != nil {
 			if v := conv(f.defaultValue); v.IsValid() {
@@ -349,7 +349,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		kind := f.typ.Kind()
 		if kind == reflect.Struct && f.defaultValue == "" {
 			errs = mergeErrors(errs, d.setDefaults(f.typ, vCurrent, src, prefix+f.canonicalDot))
-		} else if kind == reflect.Ptr && f.defaultValue == "" && isPointerToStruct(vCurrent) {
+		} else if kind == reflect.Pointer && f.defaultValue == "" && isPointerToStruct(vCurrent) {
 			errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, prefix+f.canonicalDot))
 		}
 
@@ -382,7 +382,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			fresh := reflect.MakeSlice(f.typ, def.slice.Len(), def.slice.Cap())
 			reflect.Copy(fresh, def.slice)
 			vCurrent.Set(fresh)
-		case reflect.Ptr:
+		case reflect.Pointer:
 			t1 := f.typ.Elem()
 			if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
 				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
@@ -425,7 +425,7 @@ func (d *Decoder) growCap(n int, tracked bool) int {
 }
 
 func isPointerToStruct(v reflect.Value) bool {
-	return !v.IsZero() && v.Type().Kind() == reflect.Ptr && v.Elem().Type().Kind() == reflect.Struct
+	return !v.IsZero() && v.Type().Kind() == reflect.Pointer && v.Elem().Type().Kind() == reflect.Struct
 }
 
 func fieldProvided(src *source, prefix string, f *fieldInfo) bool {
@@ -614,8 +614,8 @@ func isEmpty(t reflect.Type, value []string) bool {
 }
 
 var (
-	multipartFileHeaderPointerType      = reflect.TypeOf(&multipart.FileHeader{})
-	sliceMultipartFileHeaderPointerType = reflect.TypeOf([]*multipart.FileHeader{})
+	multipartFileHeaderPointerType      = reflect.TypeFor[*multipart.FileHeader]()
+	sliceMultipartFileHeaderPointerType = reflect.TypeFor[[]*multipart.FileHeader]()
 )
 
 // Supported multiple types:
@@ -674,7 +674,7 @@ func isMultipartField(typ reflect.Type) bool {
 	}
 
 	// Check for *[]*multipart.FileHeader
-	if typ.Kind() == reflect.Ptr {
+	if typ.Kind() == reflect.Pointer {
 		typ = typ.Elem()
 
 		if typ == sliceMultipartFileHeaderPointerType {
@@ -696,7 +696,7 @@ func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
 		if !v.IsValid() {
 			return v
 		}
-		if v.Kind() == reflect.Ptr {
+		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				v.Set(reflect.New(v.Type().Elem()))
 			}
@@ -723,7 +723,7 @@ func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
 // field.
 func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 	for j, fi := range chain {
-		if j > 0 && v.Kind() == reflect.Ptr {
+		if j > 0 && v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				if !v.CanSet() {
 					return reflect.Value{}
@@ -826,7 +826,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 
 	// Dereference if needed.
 	t := v.Type()
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 		if v.IsNil() {
 			v.Set(reflect.New(t))
@@ -881,7 +881,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	}
 	if conv == nil && t.Kind() == reflect.Slice && m.IsSliceElement {
 		elemT := t.Elem()
-		isPtrElem := elemT.Kind() == reflect.Ptr
+		isPtrElem := elemT.Kind() == reflect.Pointer
 		if isPtrElem {
 			elemT = elemT.Elem()
 		}
@@ -1179,13 +1179,13 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 
 // Exact (unnamed) builtin slice types eligible for the native decode path.
 var (
-	typSliceString  = reflect.TypeOf([]string(nil))
-	typSliceInt     = reflect.TypeOf([]int(nil))
-	typSliceInt64   = reflect.TypeOf([]int64(nil))
-	typSliceUint    = reflect.TypeOf([]uint(nil))
-	typSliceUint64  = reflect.TypeOf([]uint64(nil))
-	typSliceFloat64 = reflect.TypeOf([]float64(nil))
-	typSliceBool    = reflect.TypeOf([]bool(nil))
+	typSliceString  = reflect.TypeFor[[]string]()
+	typSliceInt     = reflect.TypeFor[[]int]()
+	typSliceInt64   = reflect.TypeFor[[]int64]()
+	typSliceUint    = reflect.TypeFor[[]uint]()
+	typSliceUint64  = reflect.TypeFor[[]uint64]()
+	typSliceFloat64 = reflect.TypeFor[[]float64]()
+	typSliceBool    = reflect.TypeFor[[]bool]()
 )
 
 // decodeNativeSlice mirrors the generic decodeBuiltinSlice loop for a field
@@ -1256,7 +1256,7 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 
 	// if v is []T or *[]T create new T
 	t := v.Type()
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() == reflect.Slice {
@@ -1264,7 +1264,7 @@ func isTextUnmarshaler(v reflect.Value) unmarshaler {
 		// here: the value-level assert above already covered it. Check
 		// whether the elements do.
 		m.IsSliceElement = true
-		if t = t.Elem(); t.Kind() == reflect.Ptr {
+		if t = t.Elem(); t.Kind() == reflect.Pointer {
 			t = reflect.PointerTo(t.Elem())
 			m.IsSliceElementPtr = true
 			_, m.IsValid = reflect.TypeAssert[encoding.TextUnmarshaler](reflect.Zero(t))

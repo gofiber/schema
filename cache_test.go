@@ -81,7 +81,7 @@ func TestNeedsDefaultsWalk(t *testing.T) {
 	}
 
 	d := NewDecoder()
-	if d.cache.get(reflect.TypeOf(onlyUnexported{})).needsDefaultsWalk {
+	if d.cache.get(reflect.TypeFor[onlyUnexported]()).needsDefaultsWalk {
 		t.Error("unexported anonymous pointer must not force the defaults walk")
 	}
 
@@ -92,14 +92,14 @@ func TestNeedsDefaultsWalk(t *testing.T) {
 		*Inner
 		A string `schema:"a"`
 	}
-	if !d.cache.get(reflect.TypeOf(withExported{})).needsDefaultsWalk {
+	if !d.cache.get(reflect.TypeFor[withExported]()).needsDefaultsWalk {
 		t.Error("exported anonymous pointer must keep the defaults walk (it allocates)")
 	}
 
 	type withDefaults struct {
 		A string `schema:"a,default:z"`
 	}
-	if !d.cache.get(reflect.TypeOf(withDefaults{})).needsDefaultsWalk {
+	if !d.cache.get(reflect.TypeFor[withDefaults]()).needsDefaultsWalk {
 		t.Error("default tags must keep the defaults walk")
 	}
 }
@@ -112,7 +112,7 @@ func BenchmarkParsePathCacheMiss(b *testing.B) {
 		Items []Nested `schema:"items"`
 	}
 	d := NewDecoder()
-	typ := reflect.TypeOf(Outer{})
+	typ := reflect.TypeFor[Outer]()
 	b.ReportAllocs()
 	info := d.cache.get(typ)
 	for b.Loop() {
@@ -130,12 +130,12 @@ func TestFoldASCIILower(t *testing.T) {
 	t.Parallel()
 
 	alphabet := make([]byte, 0, 256)
-	for c := 0; c < 256; c++ {
+	for c := range 256 {
 		alphabet = append(alphabet, byte(c))
 	}
 
 	for n := 0; n <= maxDirectKeyLen; n++ {
-		for off := 0; off < 256; off++ {
+		for off := range 256 {
 			in := make([]byte, n)
 			for i := range in {
 				in[i] = alphabet[(off+i*7)%256]
@@ -165,7 +165,7 @@ func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {
 		Items []Nested `schema:"items"`
 	}
 	d := NewDecoder()
-	typ := reflect.TypeOf(Outer{})
+	typ := reflect.TypeFor[Outer]()
 	b.ReportAllocs()
 	info := d.cache.get(typ)
 	for b.Loop() {
@@ -212,8 +212,8 @@ func TestDirectMapCoversEveryBareAlias(t *testing.T) {
 	}
 
 	types := []reflect.Type{
-		reflect.TypeOf(Leaf{}), reflect.TypeOf(Dup{}),
-		reflect.TypeOf(Embedded{}), reflect.TypeOf(Shapes{}),
+		reflect.TypeFor[Leaf](), reflect.TypeFor[Dup](),
+		reflect.TypeFor[Embedded](), reflect.TypeFor[Shapes](),
 	}
 	// Every alias above, some case variants, and keys that only resemble one.
 	keys := []string{
@@ -253,11 +253,11 @@ func TestPathCacheConcurrentSpill(t *testing.T) {
 	d := NewDecoder()
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines)
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		wg.Add(1)
 		go func(g int) {
 			defer wg.Done()
-			for i := 0; i < per; i++ {
+			for i := range per {
 				idx := (g*per + i) % (maxFastPaths + 128) // overlap between goroutines
 				key := "items." + strconv.Itoa(idx) + ".value"
 				var s S
@@ -277,7 +277,7 @@ func TestPathCacheConcurrentSpill(t *testing.T) {
 	for err := range errs {
 		t.Fatal(err)
 	}
-	info := d.cache.get(reflect.TypeOf(S{}))
+	info := d.cache.get(reflect.TypeFor[S]())
 	if !info.paths.sealed.Load() {
 		t.Fatal("expected the cache to have sealed")
 	}
@@ -341,7 +341,7 @@ func TestMapKeysAreNotCached(t *testing.T) {
 	}
 
 	const n = 2 * maxFastPaths
-	for i := 0; i < n; i++ {
+	for i := range n {
 		key := strconv.Itoa(i)
 		src := map[string][]string{
 			"attrs." + key:         {"v"},
@@ -388,12 +388,12 @@ func TestPathCacheSpill(t *testing.T) {
 		Items []Item `schema:"items"`
 	}
 	d := NewDecoder()
-	typ := reflect.TypeOf(S{})
+	typ := reflect.TypeFor[S]()
 	info := d.cache.get(typ)
 
 	const n = maxFastPaths + 64
 	want := make([]string, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		want = append(want, "items."+strconv.Itoa(i)+".value")
 	}
 	for _, p := range want {
@@ -447,7 +447,7 @@ func TestParserReservationDoesNotScaleWithSeparators(t *testing.T) {
 		var before, after runtime.MemStats
 		runtime.GC()
 		runtime.ReadMemStats(&before)
-		for i := 0; i < iters; i++ {
+		for range iters {
 			_, _ = c.parsePath(key, typ)
 		}
 		runtime.ReadMemStats(&after)

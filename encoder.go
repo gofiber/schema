@@ -97,7 +97,7 @@ func NewEncoder() *Encoder {
 // Encode encodes a struct into map[string][]string.
 //
 // Intended for use with url.Values.
-func (e *Encoder) Encode(src interface{}, dst map[string][]string) (err error) {
+func (e *Encoder) Encode(src any, dst map[string][]string) (err error) {
 	if dst == nil {
 		return errNilDst
 	}
@@ -120,7 +120,7 @@ func (e *Encoder) Encode(src interface{}, dst map[string][]string) (err error) {
 }
 
 // RegisterEncoder registers a converter for encoding a custom type.
-func (e *Encoder) RegisterEncoder(value interface{}, encoder func(reflect.Value) string) {
+func (e *Encoder) RegisterEncoder(value any, encoder func(reflect.Value) string) {
 	e.cache.l.Lock()
 	e.regenc[reflect.TypeOf(value)] = encoder
 	e.cache.l.Unlock()
@@ -165,7 +165,7 @@ func (e *Encoder) structInfo(t reflect.Type) (fields []encField, freshKeys bool)
 			idx:       i,
 			name:      name,
 			omitEmpty: opts.Contains("omitempty"),
-			recurseStructPtr: ft.Kind() == reflect.Ptr &&
+			recurseStructPtr: ft.Kind() == reflect.Pointer &&
 				ft.Elem().Kind() == reflect.Struct &&
 				!e.hasCustomEncoder(ft),
 			enc:         typeEncoder(ft, e.regenc),
@@ -178,10 +178,10 @@ func (e *Encoder) structInfo(t reflect.Type) (fields []encField, freshKeys bool)
 				f.isStruct = true
 			case reflect.Slice:
 				f.elemEnc = typeEncoder(ft.Elem(), e.regenc)
-				if f.elemEnc == nil && ft.Elem().Kind() == reflect.Ptr {
+				if f.elemEnc == nil && ft.Elem().Kind() == reflect.Pointer {
 					f.elemPtrNil = true
 				}
-			case reflect.Ptr:
+			case reflect.Pointer:
 				f.nilAsNull = true
 			}
 		}
@@ -263,7 +263,7 @@ func isZero(v reflect.Value) bool {
 		return true
 	case reflect.Struct:
 		if v.CanInterface() {
-			if iz, ok := v.Interface().(interface{ IsZero() bool }); ok {
+			if iz, ok := reflect.TypeAssert[interface{ IsZero() bool }](v); ok {
 				return iz.IsZero()
 			}
 		}
@@ -279,7 +279,7 @@ func isZero(v reflect.Value) bool {
 }
 
 func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 	if v.Kind() != reflect.Struct {
@@ -380,7 +380,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 			// Pointer elements with no encoder (elemPtrNil): nil encodes as
 			// "null" (as historically), a non-nil such element is an error.
 			bad := false
-			for j := 0; j < n; j++ {
+			for j := range n {
 				if fieldValue.Index(j).IsNil() {
 					values[j] = "null"
 					continue
@@ -393,7 +393,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 				continue
 			}
 		} else {
-			for j := 0; j < n; j++ {
+			for j := range n {
 				values[j] = f.elemEnc(fieldValue.Index(j))
 			}
 		}
@@ -435,7 +435,7 @@ func scratchSafeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) bool {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
 		reflect.Float32, reflect.Float64:
 		return true
-	case reflect.Ptr:
+	case reflect.Pointer:
 		return scratchSafeEncoder(t.Elem(), reg)
 	default:
 		return false
@@ -470,7 +470,7 @@ func typeEncoder(t reflect.Type, reg map[reflect.Type]encoderFunc) encoderFunc {
 		return encodeFloat32
 	case reflect.Float64:
 		return encodeFloat64
-	case reflect.Ptr:
+	case reflect.Pointer:
 		f := typeEncoder(t.Elem(), reg)
 		if f == nil {
 			// No encoder for the element: report unsupported instead of

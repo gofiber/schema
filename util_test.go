@@ -22,7 +22,7 @@ func TestFieldAlias(t *testing.T) {
 	type S struct {
 		Field string `json:"custom,omitempty"`
 	}
-	f, ok := reflect.TypeOf(S{}).FieldByName("Field")
+	f, ok := reflect.TypeFor[S]().FieldByName("Field")
 	if !ok {
 		t.Fatal("field not found")
 	}

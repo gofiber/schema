@@ -3,6 +3,7 @@ package schema
 import (
 	"errors"
 	"hash/maphash"
+	"slices"
 )
 
 // errValuesLength is returned by DecodeValues for keys and values of
@@ -214,7 +215,7 @@ func (p *pairIndex) group(i int, scratch []string) []string {
 				scratch = append(scratch, p.values[i])
 				n := p.next[i]
 				if n == 0 {
-					return scratch[:len(scratch):len(scratch)]
+					return slices.Clip(scratch)
 				}
 				i = int(n - 1)
 			}

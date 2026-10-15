@@ -1307,7 +1307,7 @@ func TestCacheParsePathInvalidPathCases(t *testing.T) {
 	}
 
 	c := newCache()
-	payloadType := reflect.TypeOf(payload{})
+	payloadType := reflect.TypeFor[payload]()
 
 	tests := []struct {
 		name string
@@ -1317,7 +1317,7 @@ func TestCacheParsePathInvalidPathCases(t *testing.T) {
 		{
 			name: "non struct type",
 			path: "name",
-			typ:  reflect.TypeOf(0),
+			typ:  reflect.TypeFor[int](),
 		},
 		{
 			name: "unknown field",
@@ -1454,7 +1454,7 @@ func TestRegisterConverterMap(t *testing.T) {
 	decoder.IgnoreUnknownKeys(false)
 	decoder.RegisterConverter(map[string]string{}, func(input string) reflect.Value {
 		m := make(map[string]string)
-		for _, pair := range strings.Split(input, ",") {
+		for pair := range strings.SplitSeq(input, ",") {
 			parts := strings.Split(pair, ":")
 			switch len(parts) {
 			case 2:
@@ -1650,11 +1650,11 @@ func TestExpectedType(t *testing.T) {
 		t.Errorf("Expected bool, index: 1 got %+v, index: %d", e.Type, e.Index)
 	}
 	e = err.(MultiError)["date"].(ConversionError)
-	if e.Type != reflect.TypeOf(time.Time{}) {
+	if e.Type != reflect.TypeFor[time.Time]() {
 		t.Errorf("Expected time.Time got %+v", e.Type)
 	}
 	e = err.(MultiError)["Foo.Bar"].(ConversionError)
-	if e.Type != reflect.TypeOf(0) {
+	if e.Type != reflect.TypeFor[int]() {
 		t.Errorf("Expected int got %+v", e.Type)
 	}
 }
@@ -2466,7 +2466,7 @@ func TestDecodeSliceIndexGrowth(t *testing.T) {
 	}
 
 	src := map[string][]string{}
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		src["items."+strconv.Itoa(i)+".price"] = []string{strconv.Itoa(i * 3)}
 	}
 	d := NewDecoder()
@@ -2559,7 +2559,7 @@ func TestSliceGrowthKeepsSiblingSlicesApart(t *testing.T) {
 	}
 
 	d := NewDecoder()
-	for i := 0; i < 200; i++ { // map order varies, so repeat
+	for range 200 { // map order varies, so repeat
 		var o outer
 		if err := d.Decode(&o, map[string][]string{
 			"x.items.0.v": {"x0"},
@@ -2605,7 +2605,7 @@ func TestSliceGrowthFillsEveryIndex(t *testing.T) {
 	}
 
 	d := NewDecoder()
-	for round := 0; round < 50; round++ {
+	for range 50 {
 		var c cart
 		if err := d.Decode(&c, src); err != nil {
 			t.Fatal(err)
@@ -2634,7 +2634,7 @@ func BenchmarkSliceManyIndicesDecode(b *testing.B) {
 		Items []item `schema:"items"`
 	}
 	src := map[string][]string{}
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		idx := strconv.Itoa(i)
 		src["items."+idx+".name"] = []string{"x"}
 		src["items."+idx+".price"] = []string{idx}
@@ -3102,7 +3102,6 @@ func TestDecoder_MaxSize(t *testing.T) {
 	}
 
 	for _, tc := range testcases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			dec := NewDecoder()
@@ -3536,31 +3535,31 @@ func TestIsMultipartFile(t *testing.T) {
 		expected bool
 	}{
 		{
-			typ:      reflect.TypeOf(string("")),
+			typ:      reflect.TypeFor[string](),
 			expected: false,
 		},
 		{
-			typ:      reflect.TypeOf([]string{}),
+			typ:      reflect.TypeFor[[]string](),
 			expected: false,
 		},
 		{
-			typ:      reflect.TypeOf([]*multipart.FileHeader{}),
+			typ:      reflect.TypeFor[[]*multipart.FileHeader](),
 			expected: true,
 		},
 		{
-			typ:      reflect.TypeOf(multipart.FileHeader{}),
+			typ:      reflect.TypeFor[multipart.FileHeader](),
 			expected: false,
 		},
 		{
-			typ:      reflect.TypeOf(&multipart.FileHeader{}),
+			typ:      reflect.TypeFor[*multipart.FileHeader](),
 			expected: true,
 		},
 		{
-			typ:      reflect.TypeOf([]multipart.FileHeader{}),
+			typ:      reflect.TypeFor[[]multipart.FileHeader](),
 			expected: false,
 		},
 		{
-			typ:      reflect.TypeOf(&[]*multipart.FileHeader{}),
+			typ:      reflect.TypeFor[*[]*multipart.FileHeader](),
 			expected: true,
 		},
 	}
@@ -3577,25 +3576,25 @@ func BenchmarkIsMultipartFile(b *testing.B) {
 		typ reflect.Type
 	}{
 		{
-			typ: reflect.TypeOf(string("")),
+			typ: reflect.TypeFor[string](),
 		},
 		{
-			typ: reflect.TypeOf([]string{}),
+			typ: reflect.TypeFor[[]string](),
 		},
 		{
-			typ: reflect.TypeOf([]*multipart.FileHeader{}),
+			typ: reflect.TypeFor[[]*multipart.FileHeader](),
 		},
 		{
-			typ: reflect.TypeOf(multipart.FileHeader{}),
+			typ: reflect.TypeFor[multipart.FileHeader](),
 		},
 		{
-			typ: reflect.TypeOf(&multipart.FileHeader{}),
+			typ: reflect.TypeFor[*multipart.FileHeader](),
 		},
 		{
-			typ: reflect.TypeOf([]multipart.FileHeader{}),
+			typ: reflect.TypeFor[[]multipart.FileHeader](),
 		},
 		{
-			typ: reflect.TypeOf(&[]*multipart.FileHeader{}),
+			typ: reflect.TypeFor[*[]*multipart.FileHeader](),
 		},
 	}
 
@@ -3920,8 +3919,8 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 	}
 
 	types := []reflect.Type{
-		reflect.TypeOf(leaf{}), reflect.TypeOf(mid{}),
-		reflect.TypeOf(outer{}), reflect.TypeOf(deep{}),
+		reflect.TypeFor[leaf](), reflect.TypeFor[mid](),
+		reflect.TypeFor[outer](), reflect.TypeFor[deep](),
 	}
 
 	// Every key the shapes above can be addressed by, plus lookalikes.
@@ -3937,7 +3936,7 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 	r := rand.New(rand.NewPCG(11, 13))
 	for _, typ := range types {
 		info := d.cache.get(typ)
-		for iter := 0; iter < 4000; iter++ {
+		for range 4000 {
 			src := make(map[string][]string)
 			for _, k := range keys {
 				switch r.IntN(4) {
@@ -3991,7 +3990,7 @@ func wideRequiredSrc() map[string][]string {
 		"address.city":   {"Arlington"},
 		"address.zip":    {"22202"},
 	}
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		src["filter"+strconv.Itoa(i)] = []string{"v" + strconv.Itoa(i)}
 	}
 	return src
@@ -4000,7 +3999,7 @@ func wideRequiredSrc() map[string][]string {
 func BenchmarkCheckRequiredFieldsWideSrc(b *testing.B) {
 	src := wideRequiredSrc()
 	decoder := NewDecoder()
-	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	info := decoder.cache.get(reflect.TypeFor[requiredFormStruct]())
 	b.ReportAllocs()
 	for b.Loop() {
 		if errs := decoder.checkRequired(info, src); errs != nil {
@@ -4017,7 +4016,7 @@ func BenchmarkCheckRequiredFieldsWideSrcMissing(b *testing.B) {
 	delete(src, "address.city")
 	delete(src, "address.zip")
 	decoder := NewDecoder()
-	info := decoder.cache.get(reflect.TypeOf(requiredFormStruct{}))
+	info := decoder.cache.get(reflect.TypeFor[requiredFormStruct]())
 	b.ReportAllocs()
 	for b.Loop() {
 		if errs := decoder.checkRequired(info, src); errs == nil {
@@ -4139,7 +4138,7 @@ func TestCheckRequiredWithoutRequiredFields(t *testing.T) {
 		A string `schema:"a"`
 	}
 	d := NewDecoder()
-	info := d.cache.get(reflect.TypeOf(S{}))
+	info := d.cache.get(reflect.TypeFor[S]())
 	if errs := d.checkRequired(info, map[string][]string{"a": {"x"}}); errs != nil {
 		t.Fatalf("expected no errors, got %v", errs)
 	}
@@ -4152,11 +4151,11 @@ func TestCheckRequiredBeyondInlineBitset(t *testing.T) {
 
 	const n = requiredBitWords*64 + 8
 	fields := make([]reflect.StructField, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		name := "F" + strconv.Itoa(i)
 		fields = append(fields, reflect.StructField{
 			Name: name,
-			Type: reflect.TypeOf(""),
+			Type: reflect.TypeFor[string](),
 			Tag:  reflect.StructTag(`schema:"f` + strconv.Itoa(i) + `,required"`),
 		})
 	}
@@ -4176,7 +4175,7 @@ func TestCheckRequiredBeyondInlineBitset(t *testing.T) {
 
 	// All provided: nothing is reported.
 	src := make(map[string][]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		src["f"+strconv.Itoa(i)] = []string{"v"}
 	}
 	dst = reflect.New(typ)
@@ -4412,7 +4411,7 @@ func TestErrorMessagesMatchSprintf(t *testing.T) {
 
 	// MultiError reports the count of the errors it does not render.
 	me := MultiError{}
-	for i := 0; i < 130; i++ {
+	for i := range 130 {
 		me[strconv.Itoa(i)] = errors.New("only")
 		got := me.Error()
 		switch n := len(me); n {
@@ -4455,7 +4454,7 @@ func TestIsTextUnmarshaler(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name  string
-		val   interface{}
+		val   any
 		check func(t *testing.T, u unmarshaler)
 	}{
 		{"value", valueUM(""), func(t *testing.T, u unmarshaler) {
@@ -4974,13 +4973,13 @@ func TestIsMultipartFieldShapes(t *testing.T) {
 		typ  reflect.Type
 		want bool
 	}{
-		{reflect.TypeOf(&multipart.FileHeader{}), true},
-		{reflect.TypeOf([]*multipart.FileHeader{}), true},
-		{reflect.TypeOf(&[]*multipart.FileHeader{}), true},
-		{reflect.TypeOf(multipart.FileHeader{}), false},
-		{reflect.TypeOf(0), false},
-		{reflect.TypeOf(new(int)), false},
-		{reflect.TypeOf([]int{}), false},
+		{reflect.TypeFor[*multipart.FileHeader](), true},
+		{reflect.TypeFor[[]*multipart.FileHeader](), true},
+		{reflect.TypeFor[*[]*multipart.FileHeader](), true},
+		{reflect.TypeFor[multipart.FileHeader](), false},
+		{reflect.TypeFor[int](), false},
+		{reflect.TypeFor[*int](), false},
+		{reflect.TypeFor[[]int](), false},
 	}
 	for _, c := range cases {
 		if got := isMultipartField(c.typ); got != c.want {
@@ -5021,7 +5020,7 @@ func TestDecoderReconfigureDuringDecode(t *testing.T) {
 	type T1 struct {
 		A string `schema:"schemaname" url:"urlname"`
 	}
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		d := NewDecoder()
 		done := make(chan struct{})
 		go func() {
@@ -5049,20 +5048,18 @@ func TestConcurrentSamePathDecode(t *testing.T) {
 		A string `schema:"a"`
 		B int    `schema:"b"`
 	}
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		d := NewDecoder()
 		var wg sync.WaitGroup
-		for g := 0; g < 4; g++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range 4 {
+			wg.Go(func() {
 				var s S
 				if err := d.Decode(&s, map[string][]string{"a": {"x"}, "b": {"7"}}); err != nil {
 					t.Errorf("decode failed: %v", err)
 				} else if s.A != "x" || s.B != 7 {
 					t.Errorf("wrong result: %+v", s)
 				}
-			}()
+			})
 		}
 		wg.Wait()
 	}
@@ -5124,7 +5121,7 @@ func TestDecoderStaleCacheEntryIgnored(t *testing.T) {
 		A string `schema:"schemaname" url:"urlname"`
 	}
 	d := NewDecoder()
-	typ := reflect.TypeOf(T1{})
+	typ := reflect.TypeFor[T1]()
 
 	var dst T1
 	if err := d.Decode(&dst, map[string][]string{"schemaname": {"x"}}); err != nil {
@@ -5157,7 +5154,7 @@ func TestDecoderRegisterConverterDuringDecode(t *testing.T) {
 		A string `schema:"a"`
 	}
 	conv := func(v string) reflect.Value { return reflect.ValueOf(CV("conv:" + v)) }
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		d := NewDecoder()
 		done := make(chan error, 1)
 		go func() {
@@ -5448,7 +5445,7 @@ func TestDecodeMapFieldConversionError(t *testing.T) {
 		t.Fatalf("got %v, want a MultiError", err)
 	}
 	var conv ConversionError
-	if !errors.As(errs["limits.max"], &conv) || conv.Type != reflect.TypeOf(0) {
+	if !errors.As(errs["limits.max"], &conv) || conv.Type != reflect.TypeFor[int]() {
 		t.Fatalf("got %#v, want a ConversionError for an int at limits.max", errs["limits.max"])
 	}
 	if s.Limits != nil {
@@ -5643,7 +5640,7 @@ type mapBatchItem struct{ V string }
 type mapBatch []mapBatchItem
 
 func (b *mapBatch) UnmarshalText(text []byte) error {
-	for _, v := range strings.Split(string(text), ",") {
+	for v := range strings.SplitSeq(string(text), ",") {
 		*b = append(*b, mapBatchItem{V: v})
 	}
 	return nil
@@ -5794,7 +5791,7 @@ func TestDecodeMapFieldWholeValueConverter(t *testing.T) {
 	// A converter for the slice type itself, but none for its element type.
 	d.RegisterConverter([]mapConvItem{}, func(value string) reflect.Value {
 		var items []mapConvItem
-		for _, v := range strings.Split(value, ",") {
+		for v := range strings.SplitSeq(value, ",") {
 			items = append(items, mapConvItem{V: v})
 		}
 		return reflect.ValueOf(items)

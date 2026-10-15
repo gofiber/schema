@@ -179,7 +179,7 @@ func TestEncodeIntegerWidths(t *testing.T) {
 	}
 
 	// The 8- and 16-bit widths are small enough to cover exhaustively.
-	for n := 0; n < 1<<16; n++ {
+	for n := range 1 << 16 {
 		check(sized{
 			I8: int8(n), I16: int16(n), U8: uint8(n), U16: uint16(n),
 			I32: int32(n), I64: int64(n), I: n,
@@ -270,10 +270,10 @@ func TestEncodeRepeatedKeys(t *testing.T) {
 		typ  reflect.Type
 		want bool
 	}{
-		{reflect.TypeOf(flat{}), true},
-		{reflect.TypeOf(dup{}), false},
-		{reflect.TypeOf(outerVal{}), false},
-		{reflect.TypeOf(outerPtr{}), false},
+		{reflect.TypeFor[flat](), true},
+		{reflect.TypeFor[dup](), false},
+		{reflect.TypeFor[outerVal](), false},
+		{reflect.TypeFor[outerPtr](), false},
 	} {
 		if _, got := enc.structInfo(tc.typ); got != tc.want {
 			t.Fatalf("%s: freshKeys=%v, want %v", tc.typ, got, tc.want)
@@ -1083,7 +1083,7 @@ func TestEncoderReconfigureDuringEncode(t *testing.T) {
 	type T1 struct {
 		A string `schema:"schemaname" url:"urlname"`
 	}
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		e := NewEncoder()
 		done := make(chan struct{})
 		go func() {
@@ -1133,7 +1133,7 @@ func TestEncoderStaleCacheEntryIgnored(t *testing.T) {
 		A string `schema:"schemaname" url:"urlname"`
 	}
 	e := NewEncoder()
-	typ := reflect.TypeOf(T1{})
+	typ := reflect.TypeFor[T1]()
 
 	dst := map[string][]string{}
 	if err := e.Encode(T1{A: "x"}, dst); err != nil {

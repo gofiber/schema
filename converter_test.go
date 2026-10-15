@@ -10,7 +10,7 @@ func TestConverters(t *testing.T) {
 	tests := []struct {
 		name  string
 		v     reflect.Value
-		want  interface{}
+		want  any
 		valid bool
 	}{
 		{"boolTrue", convertBool("true"), true, true},
@@ -123,31 +123,31 @@ func typeForKind(k reflect.Kind) reflect.Type {
 	case reflect.Bool:
 		return reflect.TypeOf(false)
 	case reflect.Float32:
-		return reflect.TypeOf(float32(0))
+		return reflect.TypeFor[float32]()
 	case reflect.Float64:
-		return reflect.TypeOf(float64(0))
+		return reflect.TypeFor[float64]()
 	case reflect.Int:
-		return reflect.TypeOf(int(0))
+		return reflect.TypeFor[int]()
 	case reflect.Int8:
-		return reflect.TypeOf(int8(0))
+		return reflect.TypeFor[int8]()
 	case reflect.Int16:
-		return reflect.TypeOf(int16(0))
+		return reflect.TypeFor[int16]()
 	case reflect.Int32:
-		return reflect.TypeOf(int32(0))
+		return reflect.TypeFor[int32]()
 	case reflect.Int64:
-		return reflect.TypeOf(int64(0))
+		return reflect.TypeFor[int64]()
 	case reflect.String:
-		return reflect.TypeOf("")
+		return reflect.TypeFor[string]()
 	case reflect.Uint:
-		return reflect.TypeOf(uint(0))
+		return reflect.TypeFor[uint]()
 	case reflect.Uint8:
-		return reflect.TypeOf(uint8(0))
+		return reflect.TypeFor[uint8]()
 	case reflect.Uint16:
-		return reflect.TypeOf(uint16(0))
+		return reflect.TypeFor[uint16]()
 	case reflect.Uint32:
-		return reflect.TypeOf(uint32(0))
+		return reflect.TypeFor[uint32]()
 	case reflect.Uint64:
-		return reflect.TypeOf(uint64(0))
+		return reflect.TypeFor[uint64]()
 	}
 	return reflect.TypeOf(struct{}{})
 }

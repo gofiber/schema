@@ -24,7 +24,7 @@ func TestFormatFloatFixedConstants(t *testing.T) {
 	t.Parallel()
 
 	scale := 1
-	for i := 0; i < encFloatPrec; i++ {
+	for range encFloatPrec {
 		scale *= 10
 	}
 	if scale != scaleFixed {
@@ -77,7 +77,7 @@ func TestFormatFloatFixedTies(t *testing.T) {
 // One ULP either side of a x.xxxxxx5 boundary is where a rounding bug shows
 // up without being an exact tie.
 func TestFormatFloatFixedBoundaries(t *testing.T) {
-	for m := int64(0); m < 200_000; m++ {
+	for m := range int64(200_000) {
 		f := float64(m)/1e6 + 5e-7
 		for _, v := range [...]float64{
 			math.Nextafter(f, math.Inf(-1)), f, math.Nextafter(f, math.Inf(1)),
@@ -90,7 +90,7 @@ func TestFormatFloatFixedBoundaries(t *testing.T) {
 
 func TestFormatFloatFixedRandom(t *testing.T) {
 	r := rand.New(rand.NewPCG(0x5eed, 0xf10a7))
-	for i := 0; i < 200_000; i++ {
+	for i := range 200_000 {
 		var f float64
 		switch i % 5 {
 		case 0:
