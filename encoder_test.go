@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -275,7 +277,7 @@ func TestEncodeRepeatedKeys(t *testing.T) {
 		{reflect.TypeFor[outerVal](), false},
 		{reflect.TypeFor[outerPtr](), false},
 	} {
-		if _, got := enc.structInfo(tc.typ); got != tc.want {
+		if got := enc.structInfo(tc.typ).freshKeys; got != tc.want {
 			t.Fatalf("%s: freshKeys=%v, want %v", tc.typ, got, tc.want)
 		}
 	}
@@ -1366,5 +1368,182 @@ func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
 	}
 	if err := NewEncoder().Encode(SMap{M: map[string]string{"k": "v"}}, map[string][]string{}); err == nil {
 		t.Errorf("non-empty map field should error 'encoder not found'")
+	}
+}
+
+// A struct that is mostly strings, encoded into a fresh map: only the numbers
+// can use the shared scratch array, so it should be no larger than they need.
+func BenchmarkEncodeMostlyStringsFreshDst(b *testing.B) {
+	type S struct {
+		A string `schema:"a"`
+		B string `schema:"b"`
+		C string `schema:"c"`
+		D string `schema:"d"`
+		E string `schema:"e"`
+		F string `schema:"f"`
+		G int    `schema:"g"`
+		H int    `schema:"h"`
+	}
+	s := S{A: "a", B: "b", C: "c", D: "d", E: "e", F: "f", G: 1234, H: 5678}
+	enc := NewEncoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		vals := make(map[string][]string, 8)
+		if err := enc.Encode(&s, vals); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The slots in front of the plan cache hand every type its own plan however
+// many share a slot, and a slot stays with the first live type that claims it
+// rather than changing hands on every call.
+func TestEncoderPlanSlotsShared(t *testing.T) {
+	t.Parallel()
+
+	e := NewEncoder()
+	types := slotTypes(3 * typeCacheSlots)
+	plans := make([]*encPlan, len(types))
+	for i, typ := range types {
+		plans[i] = e.structInfo(typ)
+	}
+	for range 2 {
+		for i, typ := range types {
+			if e.structInfo(typ) != plans[i] {
+				t.Fatalf("type %d: got a different plan on a repeat call", i)
+			}
+		}
+	}
+	for i, typ := range types {
+		if f := plans[i].fields; len(f) != 1 || f[0].name != "F"+strconv.Itoa(i) {
+			t.Fatalf("type %d: got the plan of another type", i)
+		}
+		owner := slices.IndexFunc(types, func(u reflect.Type) bool { return typeSlot(u) == typeSlot(typ) })
+		if p := e.encSlots[typeSlot(typ)].Load(); p == nil || p.typ != types[owner] {
+			t.Fatalf("type %d: slot %d is not held by type %d, the first to claim it", i, typeSlot(typ), owner)
+		}
+	}
+}
+
+// A reconfiguration turns the slots' plans away, and a plan left from an older
+// configuration gives its slot up to the current one.
+func TestEncoderPlanSlotsReset(t *testing.T) {
+	t.Parallel()
+
+	for name, reconfigure := range map[string]func(*Encoder){
+		"SetAliasTag":     func(e *Encoder) { e.SetAliasTag("url") },
+		"RegisterEncoder": func(e *Encoder) { e.RegisterEncoder(time.Time{}, func(reflect.Value) string { return "" }) },
+	} {
+		e := NewEncoder()
+		typ := slotTypes(1)[0]
+		before := e.structInfo(typ)
+
+		reconfigure(e)
+		for i := range e.encSlots {
+			if e.encSlots[i].Load() != nil {
+				t.Fatalf("%s: slot %d survived the reconfiguration", name, i)
+			}
+		}
+		after := e.structInfo(typ)
+		if after == before {
+			t.Fatalf("%s: got the plan built before the reconfiguration", name)
+		}
+
+		// A plan a build racing the reconfiguration stored after it.
+		slot := &e.encSlots[typeSlot(typ)]
+		slot.Store(&encPlan{typ: typ, fields: before.fields, gen: e.encGen.Load() - 1})
+		if e.structInfo(typ) != after {
+			t.Fatalf("%s: got the plan of a stale slot entry", name)
+		}
+		if p := slot.Load(); p != after {
+			t.Fatalf("%s: the stale slot entry was not replaced", name)
+		}
+	}
+}
+
+// Concurrent lookups of types sharing slots, interleaved with reconfigurations,
+// always return the plan of the type asked for.
+func TestEncoderPlanSlotsConcurrent(t *testing.T) {
+	t.Parallel()
+
+	e := NewEncoder()
+	types := slotTypes(2 * typeCacheSlots)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			for n := range 200 {
+				i := (g*7 + n) % len(types)
+				if f := e.structInfo(types[i]).fields; len(f) != 1 || f[0].name != "F"+strconv.Itoa(i) {
+					t.Errorf("type %d: got the plan of another type", i)
+					return
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for range 20 {
+			e.SetAliasTag("schema")
+		}
+	})
+	wg.Wait()
+}
+
+// Encoding through the slots gives what it gave through the cache alone, for
+// every one of many types that cannot all hold a slot.
+func TestEncoderEncodesThroughSharedSlots(t *testing.T) {
+	t.Parallel()
+
+	e := NewEncoder()
+	types := slotTypes(3 * typeCacheSlots)
+	for range 2 {
+		for i, typ := range types {
+			v := reflect.New(typ).Elem()
+			v.Field(0).SetString("v" + strconv.Itoa(i))
+			dst := map[string][]string{}
+			if err := e.Encode(v.Interface(), dst); err != nil {
+				t.Fatal(err)
+			}
+			if want := map[string][]string{"F" + strconv.Itoa(i): {"v" + strconv.Itoa(i)}}; !reflect.DeepEqual(dst, want) {
+				t.Fatalf("type %d: encoded %v, want %v", i, dst, want)
+			}
+		}
+	}
+}
+
+// The scratch array is sized for the values that can go in it, not for every
+// field: the scratch-safe ones, and the ones that encode a nil as "null".
+func TestEncoderPlanScratchValues(t *testing.T) {
+	t.Parallel()
+
+	type inner struct{ X string }
+	type S struct {
+		Name    string   `schema:"name"`    // a caller's string: never in the scratch
+		Age     int      `schema:"age"`     // scratch-safe
+		OK      *bool    `schema:"ok"`      // scratch-safe through the pointer
+		Score   float64  `schema:"score"`   // scratch-safe
+		Tags    []string `schema:"tags"`    // a slice of its own
+		Nested  inner    `schema:"nested"`  // a struct, recursed into
+		Next    *inner   `schema:"next"`    // encodes "null" when nil
+		Skipped int      `schema:"-"`       // not in the plan
+		Custom  uint8    `schema:"custom"`  // overridden below: no longer scratch-safe
+		Counter uint16   `schema:"counter"` // scratch-safe
+	}
+	e := NewEncoder()
+	e.RegisterEncoder(uint8(0), func(v reflect.Value) string { return "custom" })
+	plan := e.structInfo(reflect.TypeFor[S]())
+	if want := 5; plan.scratch != want {
+		t.Fatalf("scratch = %d, want %d (age, ok, score, next, counter)", plan.scratch, want)
+	}
+
+	// And every one of them lands in it: encoding all five into a fresh map
+	// gives the right values.
+	dst := map[string][]string{}
+	if err := e.Encode(S{Name: "n", Age: 1, Score: 2.5, Tags: []string{"t"}, Custom: 3, Counter: 4}, dst); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{"age": "1", "ok": "null", "score": "2.500000", "next": "null", "counter": "4", "custom": "custom", "name": "n"} {
+		if got := dst[key]; len(got) != 1 || got[0] != want {
+			t.Errorf("%s = %v, want [%s]", key, got, want)
+		}
 	}
 }
