@@ -1206,7 +1206,9 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 				i++ // slot stays zero
 			}
 		case split && strings.IndexByte(value, ',') != -1:
-			for item := range strings.SplitSeq(value, ",") {
+			for rest, more := value, true; more; {
+				var item string
+				item, rest, more = utils.CutByte(rest, ',')
 				if item == "" {
 					if d.zeroEmpty {
 						i++ // slot stays zero
@@ -1264,7 +1266,9 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 				out = append(out, zero)
 			}
 		case split && strings.IndexByte(value, ',') != -1:
-			for item := range strings.SplitSeq(value, ",") {
+			for rest, more := value, true; more; {
+				var item string
+				item, rest, more = utils.CutByte(rest, ',')
 				if item == "" {
 					if zeroEmpty {
 						out = append(out, zero)

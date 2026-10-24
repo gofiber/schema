@@ -5900,6 +5900,58 @@ func BenchmarkMapFieldManyEntriesDecode(b *testing.B) {
 	}
 }
 
+// Comma separated lists, the shape of ?ids=1,2,3 once a framework has joined
+// the values of a key.
+func BenchmarkCommaListDecode(b *testing.B) {
+	type S struct {
+		IDs  []int     `schema:"ids"`
+		Tags []string  `schema:"tags"`
+		Fs   []float64 `schema:"fs"`
+	}
+	ids := make([]string, 48)
+	fs := make([]string, 24)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i * 7)
+	}
+	for i := range fs {
+		fs[i] = strconv.Itoa(i) + ".5"
+	}
+	data := map[string][]string{
+		"ids":  {strings.Join(ids, ",")},
+		"tags": {"a,b,c,d,e,f,g,h"},
+		"fs":   {strings.Join(fs, ",")},
+	}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Comma separated lists into element types the native slice path does not cover.
+func BenchmarkCommaListNamedDecode(b *testing.B) {
+	type S struct {
+		A []int32  `schema:"a"`
+		B []uint16 `schema:"b"`
+	}
+	a := make([]string, 40)
+	for i := range a {
+		a[i] = strconv.Itoa(i * 11)
+	}
+	data := map[string][]string{"a": {strings.Join(a, ",")}, "b": {strings.Join(a[:20], ",")}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // A map field promoted from an embedded struct is named by its own alias and
 // through the embedded field's, and each of the two reaches the field by a path
 // of its own, the embedded pointer allocated on the way.
@@ -6235,5 +6287,47 @@ func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
 	}
 	if !old[0] || !old[1] {
 		t.Fatalf("the old backing array was written to: %v", old[:2])
+	}
+}
+
+// Comma separated lists split alike on every path that splits them: the native
+// element types, the others, empty items and all.
+func TestDecodeCommaListsSplitAlike(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ints  []int    `schema:"ints"`
+		Int32 []int32  `schema:"int32"`
+		U16   []uint16 `schema:"u16"`
+		Strs  []string `schema:"strs"`
+	}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		var s S
+		err := d.Decode(&s, map[string][]string{
+			"ints":  {"1,2", ",3,,4,", "5"},
+			"int32": {"1,2", ",3,,4,", "5"},
+			"u16":   {",", "6"},
+			"strs":  {"a,b", ",c"},
+		})
+		if err != nil {
+			t.Fatalf("zeroEmpty=%v: %v", zeroEmpty, err)
+		}
+		wantInts := []int{1, 2, 3, 4, 5}
+		wantInt32 := []int32{1, 2, 3, 4, 5}
+		wantU16 := []uint16{6}
+		if zeroEmpty {
+			wantInts = []int{1, 2, 0, 3, 0, 4, 0, 5}
+			wantInt32 = []int32{1, 2, 0, 3, 0, 4, 0, 5}
+			wantU16 = []uint16{0, 0, 6}
+		}
+		if !reflect.DeepEqual(s.Ints, wantInts) || !reflect.DeepEqual(s.Int32, wantInt32) || !reflect.DeepEqual(s.U16, wantU16) {
+			t.Errorf("zeroEmpty=%v: Ints=%v Int32=%v U16=%v", zeroEmpty, s.Ints, s.Int32, s.U16)
+		}
+		// Strings are never split.
+		if !reflect.DeepEqual(s.Strs, []string{"a,b", ",c"}) {
+			t.Errorf("zeroEmpty=%v: Strs = %q", zeroEmpty, s.Strs)
+		}
 	}
 }
