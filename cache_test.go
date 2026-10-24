@@ -566,3 +566,125 @@ func TestTypeCacheSlotsConcurrent(t *testing.T) {
 	})
 	wg.Wait()
 }
+
+// caseMask upper-cases the letters of s whose position has its bit set in mask.
+func caseMask(s string, mask int) string {
+	b := []byte(s)
+	for i := range b {
+		if mask&(1<<i) != 0 && b[i] >= 'a' && b[i] <= 'z' {
+			b[i] -= 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// The cache is keyed by the path as sent, and "ITEMS.0001.value" is "items.1.value":
+// the client can spell one path as many ways as it likes, so the cache has to
+// stop taking them, while every spelling goes on decoding.
+func TestPathCacheIsBoundedBySpellings(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	// More spellings than the cache holds, none longer than it keeps.
+	const pads, masks = 200, 128
+	if pads*masks <= maxFastPaths+maxSpillPaths {
+		t.Fatal("the test sends fewer spellings than the cache holds")
+	}
+	for pad := range pads {
+		for mask := range masks {
+			key := caseMask("items", mask) + "." + strings.Repeat("0", pad) + "1." + caseMask("value", mask>>5)
+			var s S
+			if err := d.Decode(&s, map[string][]string{key: {"x"}}); err != nil {
+				t.Fatalf("%q: %v", key, err)
+			}
+			if len(s.Items) != 2 || s.Items[1].Value != "x" {
+				t.Fatalf("%q decoded to %+v", key, s.Items)
+			}
+		}
+	}
+	if got := len(cachedPathKeys(&info.paths)); got < maxFastPaths || got > maxFastPaths+maxSpillPaths {
+		t.Fatalf("cache holds %d paths, want between %d and %d", got, maxFastPaths, maxFastPaths+maxSpillPaths)
+	}
+	if !info.paths.full() {
+		t.Fatal("the cache should have filled")
+	}
+}
+
+// A key too long to be a path of the struct's is parsed but not kept.
+func TestPathCacheSkipsLongKeys(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	long := "items." + strings.Repeat("0", maxCachedPathLen) + "1.value"
+	var s S
+	if err := d.Decode(&s, map[string][]string{long: {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Items) != 2 || s.Items[1].Value != "x" {
+		t.Fatalf("decoded to %+v", s.Items)
+	}
+	if keys := cachedPathKeys(&info.paths); len(keys) != 0 {
+		t.Fatalf("cache kept %d paths of a key of %d bytes", len(keys), len(long))
+	}
+
+	// A key at the limit is kept.
+	exact := "items." + strings.Repeat("0", maxCachedPathLen-len("items.1.value")) + "1.value"
+	if len(exact) != maxCachedPathLen {
+		t.Fatalf("test key is %d bytes, want %d", len(exact), maxCachedPathLen)
+	}
+	if err := d.Decode(&s, map[string][]string{exact: {"y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if keys := cachedPathKeys(&info.paths); len(keys) != 1 {
+		t.Fatalf("cache holds %d paths, want the one at the limit", len(keys))
+	}
+}
+
+// Clearing the cache lets it take paths again, spill included.
+func TestPathCacheClearReopensSpill(t *testing.T) {
+	t.Parallel()
+
+	var c pathCache
+	for i := range maxFastPaths + 8 {
+		c.loadOrStore(strconv.Itoa(i), nil)
+	}
+	if !c.sealed.Load() || c.spillLen.Load() != 8 {
+		t.Fatalf("sealed=%v spillLen=%d, want sealed with 8 spilled", c.sealed.Load(), c.spillLen.Load())
+	}
+	c.clear()
+	if c.sealed.Load() || c.spillLen.Load() != 0 || c.full() {
+		t.Fatalf("clear left sealed=%v spillLen=%d full=%v", c.sealed.Load(), c.spillLen.Load(), c.full())
+	}
+}
+
+// The spill stops at its cap whoever fills it, and every path still resolves.
+func TestPathCacheSpillStopsAtCap(t *testing.T) {
+	t.Parallel()
+
+	var c pathCache
+	for i := range maxFastPaths + maxSpillPaths {
+		c.loadOrStore(strconv.Itoa(i), nil)
+	}
+	if !c.full() {
+		t.Fatalf("cache of %d spilled paths is not full", c.spillLen.Load())
+	}
+	if got := len(cachedPathKeys(&c)); got != maxFastPaths+maxSpillPaths {
+		t.Fatalf("cache holds %d paths, want %d", got, maxFastPaths+maxSpillPaths)
+	}
+}

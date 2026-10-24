@@ -255,6 +255,9 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		elem:      len(hops) == 0,
 	})
 
+	if len(p) > maxCachedPathLen || rootInfo.paths.full() {
+		return parts, nil
+	}
 	// Detach the key: callers may pass strings aliasing reused request buffers.
 	cached, _ := rootInfo.paths.loadOrStore(strings.Clone(p), parts)
 	return cached, nil
@@ -265,6 +268,22 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 // structs stay well inside it.
 const maxFastPaths = 512
 
+// The cache is keyed by the path as sent, and the client chooses how to send
+// it: a path with an index parses the same in any letter case and with any
+// amount of zero padding on the index ("ITEMS.0001.value" is "items.1.value"),
+// so one path has as many keys as the client cares to make, each kept for the
+// life of the decoder. These bound what that can cost. Past either, a path is
+// parsed again each time it comes, as the path of a map entry is.
+const (
+	// maxSpillPaths caps the paths the cache holds past maxFastPaths. A path
+	// with an index has up to maxParserIndex+1 keys, so the cap holds sixteen
+	// such paths in full, far more than a struct has.
+	maxSpillPaths = 16384
+	// maxCachedPathLen is the longest path the cache will keep. Real paths are
+	// a few aliases and an index.
+	maxCachedPathLen = 256
+)
+
 // pathCache caches parsed paths for one struct type, keyed by the raw source
 // key. Lookups run against a plain string-keyed map published atomically —
 // sync.Map's interface keys cost a type hash and a trie walk, and
@@ -273,10 +292,17 @@ const maxFastPaths = 512
 type pathCache struct {
 	fast atomic.Pointer[map[string][]pathPart]
 	// spill holds paths seen after fast was sealed, so a key space larger
-	// than maxFastPaths keeps its cache.
-	spill  sync.Map // map[string][]pathPart
-	mu     sync.Mutex
-	sealed atomic.Bool
+	// than maxFastPaths keeps its cache, up to maxSpillPaths of them.
+	spill    sync.Map // map[string][]pathPart
+	spillLen atomic.Int64
+	mu       sync.Mutex
+	sealed   atomic.Bool
+}
+
+// full reports whether the cache takes no more paths. Concurrent writers can
+// carry it a few paths past the bound before they notice.
+func (c *pathCache) full() bool {
+	return c.sealed.Load() && c.spillLen.Load() >= maxSpillPaths
 }
 
 func (c *pathCache) load(key string) ([]pathPart, bool) {
@@ -323,6 +349,9 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 		c.mu.Unlock()
 	}
 	v, loaded := c.spill.LoadOrStore(key, parts)
+	if !loaded {
+		c.spillLen.Add(1)
+	}
 	return v.([]pathPart), loaded
 }
 
@@ -332,6 +361,7 @@ func (c *pathCache) clear() {
 	// Nothing reaches spill before the seal, so an unsealed cache has none.
 	if c.sealed.Load() {
 		c.spill.Clear()
+		c.spillLen.Store(0)
 		c.sealed.Store(false)
 	}
 	c.mu.Unlock()
