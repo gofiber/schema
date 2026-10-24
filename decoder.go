@@ -905,6 +905,12 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return d.decodeBuiltinSlice(v, t, path, values)
 		}
 
+		// Elements that unmarshal themselves, and are not pointers, are
+		// unmarshaled where they will live.
+		if m.IsValid && !isPtrElem {
+			return d.decodeUnmarshalerSlice(v, t, path, values)
+		}
+
 		return d.decodeBoxedSlice(v, t, elemT, path, values, conv, m, isPtrElem)
 	} else {
 		val := ""
@@ -1025,9 +1031,9 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 }
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
-// to round-trip through a reflect.Value: a custom converter, a
-// TextUnmarshaler, or pointer elements. It is split out so that decode, which
-// runs once per source key, carries no defer of its own.
+// to round-trip through a reflect.Value: a custom converter, or pointer
+// elements. It is split out so that decode, which runs once per source key,
+// carries no defer of its own.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
 	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
 	items := (*itemsBuf)[:0]
@@ -1043,10 +1049,9 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 				items = append(items, reflect.Zero(t.Elem()))
 			}
 		} else if m.IsValid {
+			// Only pointer elements get here (see decodeUnmarshalerSlice), and
+			// each is the new value itself.
 			u := reflect.New(elemT)
-			if m.IsSliceElementPtr {
-				u = reflect.New(reflect.PointerTo(elemT).Elem())
-			}
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 			if err := um.UnmarshalText([]byte(value)); err != nil {
 				return ConversionError{
@@ -1056,13 +1061,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 					Err:   err,
 				}
 			}
-			if m.IsSliceElementPtr {
-				items = append(items, u.Elem().Addr())
-			} else {
-				// u is always a pointer from reflect.New; store the
-				// pointed-to value.
-				items = append(items, u.Elem())
-			}
+			items = append(items, u)
 		} else if item := conv(value); item.IsValid() {
 			items = appendConvertedItem(items, item, elemT, isPtrElem)
 		} else {
@@ -1115,6 +1114,41 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 		item = ptr
 	}
 	return append(items, item)
+}
+
+// decodeUnmarshalerSlice decodes values into the slice field v of type t,
+// whose elements are not pointers and implement encoding.TextUnmarshaler
+// through their address, by unmarshaling each straight into its slot of the
+// slice being built. decodeBoxedSlice would unmarshal into a value of its own
+// per element and copy it over, which costs an allocation apiece. As there,
+// the slice is built detached and only assigned to v when every value
+// unmarshaled, and an empty value is skipped unless ZeroEmpty is set.
+func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
+	sl := reflect.MakeSlice(t, len(values), len(values))
+	i := 0
+	for key, value := range values {
+		if value == "" {
+			if d.zeroEmpty {
+				i++ // slot stays zero
+			}
+			continue
+		}
+		um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](sl.Index(i).Addr())
+		if err := um.UnmarshalText([]byte(value)); err != nil {
+			return ConversionError{
+				Key:   path,
+				Type:  t,
+				Index: key,
+				Err:   err,
+			}
+		}
+		i++
+	}
+	if i < len(values) {
+		sl = sl.Slice(0, i)
+	}
+	v.Set(sl)
+	return nil
 }
 
 // decodeBuiltinSlice decodes values into the slice field v of type t whose

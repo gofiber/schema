@@ -5840,6 +5840,22 @@ func BenchmarkMapFieldDecode(b *testing.B) {
 	}
 }
 
+// A slice of values that unmarshal themselves, each into a non-pointer element.
+func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
+	type S struct {
+		Flags []rudeBool `schema:"flags"`
+	}
+	data := map[string][]string{"flags": {"Yup", "Nope", "Yup", "Yup", "Nope", "Yup"}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // Keys that name no field, with and without a separator, are skipped by a
 // decoder told to ignore unknown keys.
 func BenchmarkUnknownKeysDecode(b *testing.B) {
@@ -6102,5 +6118,122 @@ func TestDecodeMapFieldConverterPanic(t *testing.T) {
 	var ok S
 	if err := d.Decode(&ok, map[string][]string{"attributes.a": {"1s"}}); err != nil || ok.Attributes["a"] != time.Second {
 		t.Fatalf("decode after the panic: %v, %v", ok.Attributes, err)
+	}
+}
+
+// Elements that unmarshal themselves are unmarshaled in place: the values are
+// kept in order, an empty one is skipped unless ZeroEmpty is set, and the slice
+// is not empty-but-nil when nothing is left of it.
+func TestDecodeUnmarshalerSlice(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	for _, tc := range []struct {
+		name      string
+		zeroEmpty bool
+		in        []string
+		want      []rudeBool
+	}{
+		{"values", false, []string{"Yup", "Nope", "yup"}, []rudeBool{true, false, true}},
+		{"empty skipped", false, []string{"Yup", "", "Yup"}, []rudeBool{true, true}},
+		{"empty zeroed", true, []string{"Yup", "", "Yup"}, []rudeBool{true, false, true}},
+		{"leading and trailing empty", true, []string{"", "Yup", ""}, []rudeBool{false, true, false}},
+		{"only empty, skipped", false, []string{""}, []rudeBool{}},
+		{"only empty, zeroed", true, []string{"", ""}, []rudeBool{false, false}},
+		{"no values", false, []string{}, []rudeBool{}},
+	} {
+		d := NewDecoder()
+		d.ZeroEmpty(tc.zeroEmpty)
+		var s S
+		if err := d.Decode(&s, map[string][]string{"b": tc.in}); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(s.B, tc.want) {
+			t.Errorf("%s: B = %#v, want %#v", tc.name, s.B, tc.want)
+		}
+	}
+}
+
+// A value that does not unmarshal fails the field with the index of the value,
+// the type of the slice and the unmarshaler's error, and leaves the field as it
+// was rather than half filled.
+func TestDecodeUnmarshalerSliceError(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	s := S{B: []rudeBool{true, true, true}}
+	err := NewDecoder().Decode(&s, map[string][]string{"b": {"Yup", "maybe", "Nope"}})
+	var me MultiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want a MultiError", err)
+	}
+	ce, ok := me["b"].(ConversionError)
+	if !ok {
+		t.Fatalf("me[b] = %#v, want a ConversionError", me["b"])
+	}
+	if ce.Key != "b" || ce.Index != 1 || ce.Type != reflect.TypeFor[[]rudeBool]() || ce.Err == nil {
+		t.Errorf("ConversionError = %#v", ce)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{true, true, true}) {
+		t.Errorf("B = %v after a failed decode, want it untouched", s.B)
+	}
+}
+
+// Slices of pointers to such elements, and slices of a named slice type, keep
+// their results: each pointer is its own value, the named type is the one asked
+// for.
+func TestDecodeUnmarshalerSliceShapes(t *testing.T) {
+	t.Parallel()
+
+	type Flags []rudeBool
+	var s struct {
+		Ptrs  []*rudeBool `schema:"ptrs"`
+		Named Flags       `schema:"named"`
+		Whole *[]rudeBool `schema:"whole"`
+	}
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"ptrs": {"Yup", "Nope", "Yup"}, "named": {"Nope", "Yup"}, "whole": {"Yup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Ptrs) != 3 || *s.Ptrs[0] != true || *s.Ptrs[1] != false || *s.Ptrs[2] != true {
+		t.Errorf("Ptrs = %v", s.Ptrs)
+	}
+	if s.Ptrs[0] == s.Ptrs[2] {
+		t.Error("two elements share one pointer")
+	}
+	if !reflect.DeepEqual(s.Named, Flags{false, true}) {
+		t.Errorf("Named = %#v", s.Named)
+	}
+	if s.Whole == nil || !reflect.DeepEqual(*s.Whole, []rudeBool{true}) {
+		t.Errorf("Whole = %v", s.Whole)
+	}
+}
+
+// Replacing a slice leaves nothing of the old one, and does not write into its
+// backing array, which a caller may still hold.
+func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	old := make([]rudeBool, 2, 8)
+	old[0], old[1] = true, true
+	s := S{B: old}
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"Nope"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
+		t.Fatalf("B = %v", s.B)
+	}
+	if !old[0] || !old[1] {
+		t.Fatalf("the old backing array was written to: %v", old[:2])
 	}
 }
