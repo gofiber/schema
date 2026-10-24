@@ -5839,3 +5839,28 @@ func BenchmarkMapFieldDecode(b *testing.B) {
 		}
 	}
 }
+
+// Keys that name no field, with and without a separator, are skipped by a
+// decoder told to ignore unknown keys.
+func BenchmarkUnknownKeysDecode(b *testing.B) {
+	type S struct {
+		Name string `schema:"name"`
+		Age  int    `schema:"age"`
+	}
+	data := map[string][]string{
+		"name":       {"n"},
+		"age":        {"3"},
+		"utm.source": {"x"},
+		"filter.a.b": {"y"},
+		"trace":      {"z"},
+	}
+	decoder := NewDecoder()
+	decoder.IgnoreUnknownKeys(true)
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

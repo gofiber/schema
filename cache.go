@@ -149,9 +149,8 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	// A path yields at most one hop and one part per segment. The hops of
 	// every part share one backing array, cut into capped slices as the
 	// parts are emitted.
-	segments := min(strings.Count(p, ".")+1, maxPathReserve)
-	parts := make([]pathPart, 0, segments)
-	hopBuf := make([]pathHop, 0, segments)
+	var parts []pathPart
+	var hopBuf []pathHop
 	hopStart := 0
 	for keyStart := 0; ; {
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
@@ -160,6 +159,13 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		}
 		if field = struc.get(segment); field == nil {
 			return nil, errInvalidPath
+		}
+		if parts == nil {
+			// Reserved once the first segment names a field, not before: a key
+			// that names none, the most common failure, then costs nothing.
+			segments := min(strings.Count(p, ".")+1, maxPathReserve)
+			parts = make([]pathPart, 0, segments)
+			hopBuf = make([]pathHop, 0, segments)
 		}
 		// Valid field. Append the hop; the field's index chain was resolved
 		// when the structInfo was built, so the decoder walks plain indices

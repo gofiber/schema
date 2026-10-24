@@ -688,3 +688,25 @@ func TestPathCacheSpillStopsAtCap(t *testing.T) {
 		t.Fatalf("cache holds %d paths, want %d", got, maxFastPaths+maxSpillPaths)
 	}
 }
+
+// A key that names no field is rejected before the parser reserves anything.
+func TestUnknownPathDoesNotAllocate(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Name  string `schema:"name"`
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	for _, key := range []string{"nope.x", "utm.source.medium", "NOPE.0.value", "nope.", "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t"} {
+		if _, err := d.cache.parsePathInfo(key, info); err != errInvalidPath { //nolint:errorlint // the sentinel itself, as decodeKey compares it
+			t.Errorf("parsePathInfo(%q) = %v, want errInvalidPath", key, err)
+		}
+		if allocs := testing.AllocsPerRun(100, func() { _, _ = d.cache.parsePathInfo(key, info) }); allocs != 0 {
+			t.Errorf("parsePathInfo(%q) allocated %v times", key, allocs)
+		}
+	}
+}
