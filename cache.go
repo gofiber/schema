@@ -142,6 +142,18 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		return cached, nil
 	}
 
+	// An entry of a map field never reaches the cache, since its key is the
+	// client's to choose, so each one would be parsed anew. When the field
+	// is named by its bare alias, which is by far the usual case, the parsed
+	// path is the same for every key and is shared.
+	if rootInfo.hasMapFields {
+		if i := strings.IndexByte(p, '.'); i > 0 && i+1 < len(p) {
+			if f := rootInfo.get(p[:i]); f != nil && f.mapRoot != nil {
+				return f.mapRoot, nil
+			}
+		}
+	}
+
 	struc := rootInfo
 	var t reflect.Type
 	var field *fieldInfo
@@ -541,6 +553,13 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct) {
 			info.defaultFields = append(info.defaultFields, f)
 		}
+		if f.mapValue != nil {
+			// A promoted field is a copy of the embedded type's, whose path
+			// is relative to that type, so every field gets its own here.
+			hops := []pathHop{{index: f.index, ensure: info.anonymousPtrFields}}
+			f.mapRoot = []pathPart{{hops: hops, field: f, index: -1, soleIndex: soleHopIndex(hops)}}
+			info.hasMapFields = true
+		}
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
 	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
@@ -771,6 +790,7 @@ func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias 
 		isRequired:     options.Contains("required"),
 		defaultValue:   options.getDefaultOptionValue(),
 		mapValue:       []pathPart{{field: value, index: -1, soleIndex: -1}},
+		entries:        newMapEntryPool(t),
 	}
 	f.resolveDefault()
 	return f
@@ -829,6 +849,9 @@ type structInfo struct {
 	// hasIndexedSlice reports whether any field's paths carry a slice element
 	// index, and so may grow that slice while decoding.
 	hasIndexedSlice bool
+	// hasMapFields reports whether any field is a map decoded entry by entry,
+	// and so has a mapRoot for parsePathInfo to hand out.
+	hasMapFields bool
 	// defaultFields are the fields the setDefaults walk has to visit: those
 	// with a default, and the structs and pointers to structs it descends
 	// into. The rest of the fields can never be affected by it.
@@ -991,6 +1014,13 @@ type fieldInfo struct {
 	// decode fills a map value with, describing the map's value type as a
 	// field of its own. Nil for every other field.
 	mapValue []pathPart
+	// mapRoot is, for such a field, its parsed path when the field is named by
+	// its bare alias in the struct whose metadata holds it. It does not carry
+	// the entry's key offset (see pathPart.keyStart), so every key can share it.
+	mapRoot []pathPart
+	// entries pools the scratch values that decode fills a map entry through;
+	// see decodeMapEntry. It is shared by the copies promotion makes.
+	entries *sync.Pool
 }
 
 // fieldDefault is what setDefaults assigns for a field's default option:
@@ -1027,6 +1057,9 @@ type pathPart struct {
 	// terminal part through a map field names begins. Such a part is never
 	// cached, so the offset always refers to the path being decoded; an int32
 	// sits in elem's padding and leaves every other part the size it was.
+	// Zero, which no key starts at, marks the shared part of a map field named
+	// by its bare alias (see fieldInfo.mapRoot): the key follows the first
+	// separator.
 	keyStart int32
 }
 

@@ -5864,3 +5864,243 @@ func BenchmarkUnknownKeysDecode(b *testing.B) {
 		}
 	}
 }
+
+// One map field filled by many entries.
+func BenchmarkMapFieldManyEntriesDecode(b *testing.B) {
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	data := make(map[string][]string, 16)
+	for i := range 16 {
+		data["attributes.key"+strconv.Itoa(i)] = []string{"value" + strconv.Itoa(i)}
+	}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// A map field promoted from an embedded struct is named by its own alias and
+// through the embedded field's, and each of the two reaches the field by a path
+// of its own, the embedded pointer allocated on the way.
+func TestDecodeMapFieldEmbedded(t *testing.T) {
+	t.Parallel()
+
+	type Base struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	type ByValue struct {
+		Base
+		Name string `schema:"name"`
+	}
+	type ByPointer struct {
+		*Base
+		Name string `schema:"name"`
+	}
+	want := map[string]string{"a": "1", "b": "2"}
+	src := map[string][]string{"attributes.a": {"1"}, "Base.attributes.b": {"2"}, "name": {"n"}}
+
+	var v ByValue
+	if err := NewDecoder().Decode(&v, src); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(v.Attributes, want) || v.Name != "n" {
+		t.Errorf("by value: %+v", v)
+	}
+
+	var p ByPointer
+	if err := NewDecoder().Decode(&p, src); err != nil {
+		t.Fatal(err)
+	}
+	if p.Base == nil || !reflect.DeepEqual(p.Attributes, want) || p.Name != "n" {
+		t.Errorf("by pointer: %+v", p)
+	}
+}
+
+// What follows a map field's alias is its key, as sent, up to the end of the
+// path; an alias with nothing after it, or no alias, is no entry.
+func TestDecodeMapFieldKeyForms(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	for _, tc := range []struct {
+		key  string
+		want map[string]string // nil: the key is rejected
+	}{
+		{"attributes.a", map[string]string{"a": "v"}},
+		{"ATTRIBUTES.A", map[string]string{"A": "v"}},
+		{"Attributes.a.b.c", map[string]string{"a.b.c": "v"}},
+		{"attributes..", map[string]string{".": "v"}},
+		{"attributes.a b", map[string]string{"a b": "v"}},
+		{"attributes.é", map[string]string{"é": "v"}},
+		{"attributes.", nil},
+		{"attributes", nil},
+		{".a", nil},
+		{"attribute.a", nil},
+	} {
+		var s S
+		err := NewDecoder().Decode(&s, map[string][]string{tc.key: {"v"}})
+		if tc.want == nil {
+			if err == nil || s.Attributes != nil {
+				t.Errorf("%q: err = %v, Attributes = %v; want an error and no map", tc.key, err, s.Attributes)
+			}
+			continue
+		}
+		if err != nil || !reflect.DeepEqual(s.Attributes, tc.want) {
+			t.Errorf("%q: Attributes = %v, err = %v; want %v", tc.key, s.Attributes, err, tc.want)
+		}
+	}
+}
+
+// An entry is built in values that go back to a pool for the next, so nothing
+// of one may show in another: not its value, not a pointer it allocated, not an
+// entry that failed halfway. Decoding runs the entries in map order, so many
+// rounds put them in many orders.
+func TestDecodeMapFieldEntriesDoNotCarryOver(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ptrs  map[string]*int     `schema:"ptrs"`
+		Lists map[string][]string `schema:"lists"`
+		Nums  map[string]int      `schema:"nums"`
+	}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		src := map[string][]string{
+			"ptrs.a": {"1"}, "ptrs.b": {""}, "ptrs.c": {"3"},
+			"lists.x": {"p", "q"}, "lists.y": {""}, "lists.z": {"r"},
+			"nums.ok": {"5"}, "nums.empty": {""}, "nums.bad": {"abc"},
+		}
+		var first S
+		firstErr := d.Decode(&first, src)
+		var me MultiError
+		if !errors.As(firstErr, &me) || len(me) != 1 || me["nums.bad"] == nil {
+			t.Fatalf("zeroEmpty=%v: err = %v, want only nums.bad to fail", zeroEmpty, firstErr)
+		}
+		for round := range 200 {
+			var s S
+			err := d.Decode(&s, src)
+			if !reflect.DeepEqual(err, firstErr) || !reflect.DeepEqual(s, first) {
+				t.Fatalf("zeroEmpty=%v round %d: got %+v, %v; want %+v, %v", zeroEmpty, round, s, err, first, firstErr)
+			}
+			// Without the failing entry the same decode succeeds, whatever the
+			// last one left in the pool.
+			delete(src, "nums.bad")
+			var ok S
+			if err := d.Decode(&ok, src); err != nil {
+				t.Fatalf("zeroEmpty=%v round %d: %v", zeroEmpty, round, err)
+			}
+			if _, has := ok.Nums["bad"]; has || ok.Nums["ok"] != 5 {
+				t.Fatalf("zeroEmpty=%v round %d: Nums = %v", zeroEmpty, round, ok.Nums)
+			}
+			src["nums.bad"] = []string{"abc"}
+		}
+	}
+}
+
+// Pointers and slices an entry holds are its own: the next entry decoded into
+// the same pooled values must not write through them.
+func TestDecodeMapFieldEntriesAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ptrs  map[string]*int     `schema:"ptrs"`
+		Lists map[string][]string `schema:"lists"`
+	}
+	d := NewDecoder()
+	for range 100 {
+		var s S
+		src := map[string][]string{
+			"ptrs.a": {"1"}, "ptrs.b": {"2"}, "ptrs.c": {"3"},
+			"lists.x": {"p"}, "lists.y": {"q", "r"}, "lists.z": {"s"},
+		}
+		if err := d.Decode(&s, src); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.Ptrs) != 3 || *s.Ptrs["a"] != 1 || *s.Ptrs["b"] != 2 || *s.Ptrs["c"] != 3 {
+			t.Fatalf("Ptrs = %v", s.Ptrs)
+		}
+		if s.Ptrs["a"] == s.Ptrs["b"] || s.Ptrs["b"] == s.Ptrs["c"] {
+			t.Fatal("two entries share one pointer")
+		}
+		if !reflect.DeepEqual(s.Lists, map[string][]string{"x": {"p"}, "y": {"q", "r"}, "z": {"s"}}) {
+			t.Fatalf("Lists = %v", s.Lists)
+		}
+	}
+}
+
+// Named map and key types are filled through the same pooled values.
+func TestDecodeMapFieldNamedTypes(t *testing.T) {
+	t.Parallel()
+
+	type Key string
+	type Attrs map[Key]mapValueUnmarshaler
+	var s struct {
+		Attributes Attrs `schema:"attributes"`
+	}
+	if err := NewDecoder().Decode(&s, map[string][]string{"attributes.a": {"x"}, "attributes.b": {"y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Attrs{"a": "X", "b": "Y"}); !reflect.DeepEqual(s.Attributes, want) {
+		t.Fatalf("Attributes = %v, want %v", s.Attributes, want)
+	}
+}
+
+// Map fields decoded by many goroutines at once through one decoder share its
+// pools; each result must hold its own entries and no one else's.
+func TestDecodeMapFieldConcurrent(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+		Counts     map[string]int    `schema:"counts"`
+	}
+	d := NewDecoder()
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			for n := range 300 {
+				key := strconv.Itoa(g*1000 + n)
+				var s S
+				err := d.Decode(&s, map[string][]string{"attributes." + key: {key}, "counts." + key: {strconv.Itoa(n)}})
+				if err != nil || len(s.Attributes) != 1 || len(s.Counts) != 1 || s.Attributes[key] != key || s.Counts[key] != n {
+					t.Errorf("goroutine %d round %d: %+v, %v", g, n, s, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// A map entry's decode panicking is recovered as any decode's is, and leaves the
+// pool able to serve the next.
+func TestDecodeMapFieldConverterPanic(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]time.Duration `schema:"attributes"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(time.Duration(0), func(value string) reflect.Value {
+		if value == "boom" {
+			panic("converter blew up")
+		}
+		return reflect.ValueOf(time.Second)
+	})
+	var s S
+	if err := d.Decode(&s, map[string][]string{"attributes.a": {"boom"}}); err == nil || !strings.Contains(err.Error(), "converter blew up") {
+		t.Fatalf("err = %v, want the panic as an error", err)
+	}
+	var ok S
+	if err := d.Decode(&ok, map[string][]string{"attributes.a": {"1s"}}); err != nil || ok.Attributes["a"] != time.Second {
+		t.Fatalf("decode after the panic: %v, %v", ok.Attributes, err)
+	}
+}

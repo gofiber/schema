@@ -969,30 +969,59 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
+// mapEntry is the pair of values decodeMapEntry builds a map entry from: a
+// zero value of the map's value type to decode into, and a string-kinded one
+// to hold the key. Both are copied into the map, so one pair serves entry
+// after entry instead of two reflect.New and a boxed key apiece.
+type mapEntry struct {
+	key, val reflect.Value
+}
+
+// newMapEntryPool returns the pool of mapEntry values for the map type t.
+func newMapEntryPool(t reflect.Type) *sync.Pool {
+	return &sync.Pool{New: func() any {
+		return &mapEntry{key: reflect.New(t.Key()).Elem(), val: reflect.New(t.Elem()).Elem()}
+	}}
+}
+
 // decodeMapEntry decodes values into the entry of the map field v that the
 // rest of path from part.keyStart names, allocating the map on first use. The value is decoded as
 // a field of the map's value type, so it converts, reports errors and takes
 // the last of several values the way such a field does; the key is stored
 // exactly as sent.
 func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string) error {
+	f := part.field
 	// A plain scalar field ignores an empty value unless ZeroEmpty is set, so
 	// such a value leaves the map as it is rather than storing a zero value.
-	if k := part.field.mapValue[0].field.fastKind; k != reflect.Invalid && !d.zeroEmpty &&
+	if k := f.mapValue[0].field.fastKind; k != reflect.Invalid && !d.zeroEmpty &&
 		(len(values) == 0 || values[len(values)-1] == "") {
 		return nil
 	}
-	t := v.Type()
-	value := reflect.New(t.Elem()).Elem()
-	if err := d.decode(value, path, part.field.mapValue, values, nil, nil); err != nil {
-		return err
+	keyStart := int(part.keyStart)
+	if keyStart == 0 {
+		// The shared part of a map field named by its bare alias, which cannot
+		// carry the offset: the key is whatever follows the alias.
+		keyStart = strings.IndexByte(path, '.') + 1
 	}
-	if v.IsNil() {
-		v.Set(reflect.MakeMap(t))
+	e, _ := f.entries.Get().(*mapEntry)
+	err := d.decode(e.val, path, f.mapValue, values, nil, nil)
+	if err == nil {
+		if v.IsNil() {
+			v.Set(reflect.MakeMap(v.Type()))
+		}
+		// The key may alias the caller's buffer, so it is cloned before the map
+		// keeps it.
+		e.key.SetString(strings.Clone(path[keyStart:]))
+		v.SetMapIndex(e.key, e.val)
 	}
-	// The key may alias the caller's buffer, so it is cloned before the map
-	// keeps it.
-	v.SetMapIndex(reflect.ValueOf(strings.Clone(path[part.keyStart:])).Convert(t.Key()), value)
-	return nil
+	// The map holds its own copy of both. Zeroing them readies the pair for the
+	// next entry, which must decode into a fresh value, and keeps the pool from
+	// holding on to the request's data. A decode that panics never returns the
+	// pair, so a half-filled one is not reused.
+	e.val.SetZero()
+	e.key.SetZero()
+	f.entries.Put(e)
+	return err
 }
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have

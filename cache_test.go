@@ -689,6 +689,52 @@ func TestPathCacheSpillStopsAtCap(t *testing.T) {
 	}
 }
 
+// A path through a map field named by its bare alias is the same for every key
+// the client puts after it, so it is shared rather than parsed for each.
+func TestMapEntryPathIsShared(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type S struct {
+		Attrs map[string]string `schema:"attrs"`
+		Other map[string]int    `schema:"other"`
+		Name  string            `schema:"name"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	parse := func(key string) []pathPart {
+		t.Helper()
+		parts, err := d.cache.parsePathInfo(key, info)
+		if err != nil {
+			t.Fatalf("parsePathInfo(%q): %v", key, err)
+		}
+		return parts
+	}
+	a, b, c, o := parse("attrs.a"), parse("ATTRS.b.c"), parse("attrs.zzzzzz"), parse("other.x")
+	if &a[0] != &b[0] || &a[0] != &c[0] {
+		t.Error("the keys of one map field do not share a path")
+	}
+	if &a[0] == &o[0] || a[0].field == o[0].field {
+		t.Error("two map fields share a path")
+	}
+	if a[0].keyStart != 0 || a[0].field.mapValue == nil {
+		t.Errorf("shared path: keyStart=%d, mapValue=%v; want 0 and a map field", a[0].keyStart, a[0].field.mapValue)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _, _ = d.cache.parsePathInfo("attrs.colour", info) }); allocs != 0 {
+		t.Errorf("parsePathInfo of a map entry allocated %v times", allocs)
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != 0 {
+		t.Errorf("the cache kept %d map entry paths", got)
+	}
+
+	// Not a map entry: a bare alias, a missing key, a field that is not a map.
+	for _, key := range []string{"attrs", "attrs.", ".a", "name.x"} {
+		if parts, err := d.cache.parsePathInfo(key, info); err == nil {
+			if parts[0].field.mapValue != nil {
+				t.Errorf("parsePathInfo(%q) named a map entry", key)
+			}
+		}
+	}
+}
+
 // A key that names no field is rejected before the parser reserves anything.
 func TestUnknownPathDoesNotAllocate(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
 	type Item struct {
