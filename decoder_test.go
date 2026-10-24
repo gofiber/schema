@@ -5952,6 +5952,40 @@ func BenchmarkCommaListNamedDecode(b *testing.B) {
 	}
 }
 
+// The same struct decoded by a decoder with no converters and by one with an
+// unrelated converter registered, which sends every field that is not a plain
+// scalar to look its type up in the registry.
+func benchConverterLookup(b *testing.B, register bool) {
+	type Inner struct {
+		V string `schema:"v"`
+	}
+	type S struct {
+		A *int     `schema:"a"`
+		B *string  `schema:"b"`
+		C []string `schema:"c"`
+		D []int    `schema:"d"`
+		E Inner    `schema:"e"`
+		F *bool    `schema:"f"`
+	}
+	data := map[string][]string{
+		"a": {"1"}, "b": {"x"}, "c": {"p", "q"}, "d": {"1", "2"}, "e.v": {"z"}, "f": {"true"},
+	}
+	decoder := NewDecoder()
+	if register {
+		decoder.RegisterConverter(struct{ unrelated int }{}, func(string) reflect.Value { return reflect.Value{} })
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConverterLookupNone(b *testing.B)       { benchConverterLookup(b, false) }
+func BenchmarkConverterLookupRegistered(b *testing.B) { benchConverterLookup(b, true) }
+
 // A map field promoted from an embedded struct is named by its own alias and
 // through the embedded field's, and each of the two reaches the field by a path
 // of its own, the embedded pointer allocated on the way.

@@ -756,3 +756,109 @@ func TestUnknownPathDoesNotAllocate(t *testing.T) { //nolint:paralleltest // tes
 		}
 	}
 }
+
+// converter() answers from the slots of the registered types when it can, and
+// from the registry when a type shares a slot with one, so it has to agree with
+// the registry for every type however they fall.
+func TestConverterRegistrySlots(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	if c.converter(reflect.TypeFor[int]()) != nil {
+		t.Fatal("an empty registry returned a converter")
+	}
+
+	types := slotTypes(3 * typeCacheSlots)
+	registered, others := types[:typeCacheSlots/2], types[typeCacheSlots/2:]
+	converterFor := func(i int) Converter {
+		return func(string) reflect.Value { return reflect.ValueOf(i) }
+	}
+	for i, typ := range registered {
+		c.registerConverter(reflect.Zero(typ).Interface(), converterFor(i))
+	}
+
+	for i, typ := range registered {
+		conv := c.converter(typ)
+		if conv == nil || conv("").Int() != int64(i) {
+			t.Fatalf("registered type %d: got the wrong converter", i)
+		}
+	}
+	collisions := 0
+	for i, typ := range others {
+		if c.converter(typ) != nil {
+			t.Fatalf("type %d was never registered but has a converter", i)
+		}
+		if c.regconv.Load().slots&(1<<typeSlot(typ)) != 0 {
+			collisions++
+		}
+	}
+	if collisions == 0 {
+		t.Fatal("no unregistered type shares a slot with a registered one; the test checks nothing")
+	}
+
+	// Registering again replaces, and keeps the others.
+	c.registerConverter(reflect.Zero(registered[0]).Interface(), converterFor(100))
+	if conv := c.converter(registered[0]); conv == nil || conv("").Int() != 100 {
+		t.Fatal("re-registering did not replace the converter")
+	}
+	if conv := c.converter(registered[1]); conv == nil || conv("").Int() != 1 {
+		t.Fatal("re-registering lost another converter")
+	}
+}
+
+// Converters registered while others are looked up never show a half-built registry.
+func TestConverterRegistryConcurrent(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	types := slotTypes(2 * typeCacheSlots)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			for n := range 500 {
+				typ := types[(g*13+n)%len(types)]
+				if conv := c.converter(typ); conv != nil && conv("").Int() != int64(slices.Index(types, typ)) {
+					t.Errorf("type %d: got the converter of another type", slices.Index(types, typ))
+					return
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for i, typ := range types {
+			c.registerConverter(reflect.Zero(typ).Interface(), func(string) reflect.Value { return reflect.ValueOf(i) })
+		}
+	})
+	wg.Wait()
+}
+
+// The converter lookup of a type nobody registered, which is the answer for
+// nearly every field that is not a plain scalar.
+func BenchmarkConverterMiss(b *testing.B) {
+	c := newCache()
+	for _, typ := range slotTypes(3) {
+		c.registerConverter(reflect.Zero(typ).Interface(), func(string) reflect.Value { return reflect.Value{} })
+	}
+	// Whether the slots turn a type away depends on where the runtime put its
+	// descriptor, which no benchmark controls, so take the first of a few
+	// ordinary types that no registered type shares a slot with.
+	var typ reflect.Type
+	for _, candidate := range []reflect.Type{
+		reflect.TypeFor[*int](), reflect.TypeFor[*string](), reflect.TypeFor[[]string](),
+		reflect.TypeFor[*bool](), reflect.TypeFor[[]int](), reflect.TypeFor[float64](),
+	} {
+		if c.regconv.Load().slots&(1<<typeSlot(candidate)) == 0 {
+			typ = candidate
+			break
+		}
+	}
+	if typ == nil {
+		b.Skip("every candidate type shares a slot with a registered one")
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if c.converter(typ) != nil {
+			b.Fatal("unexpected converter")
+		}
+	}
+}

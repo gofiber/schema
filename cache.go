@@ -53,10 +53,11 @@ func newCache() *cache {
 type cache struct {
 	l sync.RWMutex // serializes configuration writes (tag, regconv)
 	m sync.Map     // map[reflect.Type]cacheEntry
-	// regconv holds the registered converters as an immutable map published
-	// atomically: registerConverter replaces the whole map (copy-on-write
-	// under l), so readers never touch a map that is being written.
-	regconv atomic.Pointer[map[reflect.Type]Converter]
+	// regconv holds the registered converters as an immutable registry
+	// published atomically: registerConverter replaces the whole registry
+	// (copy-on-write under l), so readers never touch a map that is being
+	// written.
+	regconv atomic.Pointer[converterRegistry]
 	tag     string
 	// gen is bumped (under l) before m is cleared on configuration changes;
 	// cached entries are tagged with the generation they were built under
@@ -92,15 +93,34 @@ type cacheEntry struct {
 	gen  uint64
 }
 
+// converterRegistry is the registered converters, by type. It is never
+// modified once published.
+type converterRegistry struct {
+	m map[reflect.Type]Converter
+	// slots has the bit typeSlot(t) set for every registered type t. Decode
+	// asks for the converter of the type of nearly every field that is not a
+	// plain scalar, and all but a few are not registered: with slots, those
+	// are turned away by a bit test, where a lookup in m hashes the type as an
+	// interface. A type that shares a slot with a registered one only falls
+	// through to m.
+	slots uint64
+}
+
+// slots must hold a bit for each of typeCacheSlots.
+const _ = uint8(64 - typeCacheSlots)
+
 // registerConverter registers a converter function for a custom type.
 func (c *cache) registerConverter(value any, converterFunc Converter) {
 	c.l.Lock()
-	next := make(map[reflect.Type]Converter)
+	t := reflect.TypeOf(value)
+	next := &converterRegistry{m: make(map[reflect.Type]Converter)}
 	if prev := c.regconv.Load(); prev != nil {
-		maps.Copy(next, *prev)
+		maps.Copy(next.m, prev.m)
+		next.slots = prev.slots
 	}
-	next[reflect.TypeOf(value)] = converterFunc
-	c.regconv.Store(&next)
+	next.m[t] = converterFunc
+	next.slots |= 1 << typeSlot(t)
+	c.regconv.Store(next)
 	c.reset()
 	c.l.Unlock()
 }
@@ -820,10 +840,10 @@ func (c *cache) decodesFromText(f *fieldInfo) bool {
 // converter returns the converter for a type.
 func (c *cache) converter(t reflect.Type) Converter {
 	reg := c.regconv.Load()
-	if reg == nil {
+	if reg == nil || reg.slots&(1<<typeSlot(t)) == 0 {
 		return nil
 	}
-	return (*reg)[t]
+	return reg.m[t]
 }
 
 // ----------------------------------------------------------------------------
