@@ -6270,6 +6270,34 @@ func TestDecodeUnmarshalerSliceError(t *testing.T) {
 	}
 }
 
+// The same failure on a slice of pointers, which has a path of its own: the
+// error carries the index of the value and the type of the slice, and the field
+// is left as it was.
+func TestDecodeUnmarshalerSlicePointerElementsError(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []*rudeBool `schema:"b"`
+	}
+	keep := []*rudeBool{new(rudeBool)}
+	s := S{B: keep}
+	err := NewDecoder().Decode(&s, map[string][]string{"b": {"Yup", "maybe", "Nope"}})
+	var me MultiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want a MultiError", err)
+	}
+	ce, ok := me["b"].(ConversionError)
+	if !ok {
+		t.Fatalf("me[b] = %#v, want a ConversionError", me["b"])
+	}
+	if ce.Key != "b" || ce.Index != 1 || ce.Type != reflect.TypeFor[[]*rudeBool]() || ce.Err == nil {
+		t.Errorf("ConversionError = %#v", ce)
+	}
+	if len(s.B) != 1 || s.B[0] != keep[0] {
+		t.Errorf("B = %v after a failed decode, want it untouched", s.B)
+	}
+}
+
 // Slices of pointers to such elements, and slices of a named slice type, keep
 // their results: each pointer is its own value, the named type is the one asked
 // for.
