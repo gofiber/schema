@@ -6409,6 +6409,18 @@ func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
 		if err == nil && (s.Big == nil || len(s.Big) != 0) {
 			t.Errorf("%s: Big = %v, want an empty non-nil slice", tc.name, s.Big)
 		}
+		if err != nil {
+			// The error must be the first value's, from the unmarshaler: any
+			// other would mean the values never reached it.
+			var me MultiError
+			if !errors.As(err, &me) {
+				t.Fatalf("%s: err = %v, want a MultiError", tc.name, err)
+			}
+			ce, ok := me["big"].(ConversionError)
+			if !ok || ce.Index != 0 || ce.Type != reflect.TypeFor[[]bigUnmarshaler]() || ce.Err == nil {
+				t.Errorf("%s: me[big] = %#v, want the first value's ConversionError", tc.name, me["big"])
+			}
+		}
 	}
 }
 
