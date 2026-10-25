@@ -1371,8 +1371,7 @@ func TestEncodeEmptySliceUnencodableElem(t *testing.T) {
 	}
 }
 
-// A struct that is mostly strings, encoded into a fresh map: only the numbers
-// can use the shared scratch array, so it should be no larger than they need.
+// A struct that is mostly strings, encoded into a fresh map: only the numbers use the scratch array.
 func BenchmarkEncodeMostlyStringsFreshDst(b *testing.B) {
 	type S struct {
 		A string `schema:"a"`
@@ -1395,9 +1394,8 @@ func BenchmarkEncodeMostlyStringsFreshDst(b *testing.B) {
 	}
 }
 
-// The slots in front of the plan cache hand every type its own plan however
-// many share a slot, and a slot stays with the first live type that claims it
-// rather than changing hands on every call.
+// Types sharing a slot each get their own plan, and the slot stays with the
+// first live type that claims it rather than changing hands on every call.
 func TestEncoderPlanSlotsShared(t *testing.T) {
 	t.Parallel()
 
@@ -1425,8 +1423,7 @@ func TestEncoderPlanSlotsShared(t *testing.T) {
 	}
 }
 
-// A reconfiguration turns the slots' plans away, and a plan left from an older
-// configuration gives its slot up to the current one.
+// A reconfiguration turns the slots' plans away; a plan from an older one yields its slot.
 func TestEncoderPlanSlotsReset(t *testing.T) {
 	t.Parallel()
 
@@ -1461,8 +1458,7 @@ func TestEncoderPlanSlotsReset(t *testing.T) {
 	}
 }
 
-// Concurrent lookups of types sharing slots, interleaved with reconfigurations,
-// always return the plan of the type asked for.
+// Concurrent lookups of types sharing slots, amid reconfigurations, return the plan asked for.
 func TestEncoderPlanSlotsConcurrent(t *testing.T) {
 	t.Parallel()
 
@@ -1488,8 +1484,6 @@ func TestEncoderPlanSlotsConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// Encoding through the slots gives what it gave through the cache alone, for
-// every one of many types that cannot all hold a slot.
 func TestEncoderEncodesThroughSharedSlots(t *testing.T) {
 	t.Parallel()
 
@@ -1510,23 +1504,22 @@ func TestEncoderEncodesThroughSharedSlots(t *testing.T) {
 	}
 }
 
-// The scratch array is sized for the values that can go in it, not for every
-// field: the scratch-safe ones, and the ones that encode a nil as "null".
+// The scratch array is sized for the values that can go in it, not for every field.
 func TestEncoderPlanScratchValues(t *testing.T) {
 	t.Parallel()
 
 	type inner struct{ X string }
 	type S struct {
-		Name    string   `schema:"name"`    // a caller's string: never in the scratch
-		Age     int      `schema:"age"`     // scratch-safe
-		OK      *bool    `schema:"ok"`      // scratch-safe through the pointer
-		Score   float64  `schema:"score"`   // scratch-safe
-		Tags    []string `schema:"tags"`    // a slice of its own
-		Nested  inner    `schema:"nested"`  // a struct, recursed into
-		Next    *inner   `schema:"next"`    // encodes "null" when nil
-		Skipped int      `schema:"-"`       // not in the plan
-		Custom  uint8    `schema:"custom"`  // overridden below: no longer scratch-safe
-		Counter uint16   `schema:"counter"` // scratch-safe
+		Name    string   `schema:"name"` // a caller's string: never in the scratch
+		Age     int      `schema:"age"`
+		OK      *bool    `schema:"ok"`
+		Score   float64  `schema:"score"`
+		Tags    []string `schema:"tags"`
+		Nested  inner    `schema:"nested"`
+		Next    *inner   `schema:"next"` // encodes "null" when nil
+		Skipped int      `schema:"-"`
+		Custom  uint8    `schema:"custom"` // overridden below: no longer scratch-safe
+		Counter uint16   `schema:"counter"`
 	}
 	e := NewEncoder()
 	e.RegisterEncoder(uint8(0), func(v reflect.Value) string { return "custom" })
@@ -1535,8 +1528,6 @@ func TestEncoderPlanScratchValues(t *testing.T) {
 		t.Fatalf("scratch = %d, want %d (age, ok, score, next, counter)", plan.scratch, want)
 	}
 
-	// And every one of them lands in it: encoding all five into a fresh map
-	// gives the right values.
 	dst := map[string][]string{}
 	if err := e.Encode(S{Name: "n", Age: 1, Score: 2.5, Tags: []string{"t"}, Custom: 3, Counter: 4}, dst); err != nil {
 		t.Fatal(err)

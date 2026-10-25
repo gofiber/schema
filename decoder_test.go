@@ -5841,7 +5841,6 @@ func BenchmarkMapFieldDecode(b *testing.B) {
 	}
 }
 
-// A slice of values that unmarshal themselves, each into a non-pointer element.
 func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
 	type S struct {
 		Flags []rudeBool `schema:"flags"`
@@ -5857,8 +5856,7 @@ func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
 	}
 }
 
-// Keys that name no field, with and without a separator, are skipped by a
-// decoder told to ignore unknown keys.
+// Keys that name no field, with and without a separator, under IgnoreUnknownKeys.
 func BenchmarkUnknownKeysDecode(b *testing.B) {
 	type S struct {
 		Name string `schema:"name"`
@@ -5882,7 +5880,6 @@ func BenchmarkUnknownKeysDecode(b *testing.B) {
 	}
 }
 
-// One map field filled by many entries.
 func BenchmarkMapFieldManyEntriesDecode(b *testing.B) {
 	type S struct {
 		Attributes map[string]string `schema:"attributes"`
@@ -5901,8 +5898,7 @@ func BenchmarkMapFieldManyEntriesDecode(b *testing.B) {
 	}
 }
 
-// Comma separated lists, the shape of ?ids=1,2,3 once a framework has joined
-// the values of a key.
+// Comma separated lists, as in ?ids=1,2,3.
 func BenchmarkCommaListDecode(b *testing.B) {
 	type S struct {
 		IDs  []int     `schema:"ids"`
@@ -5953,9 +5949,7 @@ func BenchmarkCommaListNamedDecode(b *testing.B) {
 	}
 }
 
-// The same struct decoded by a decoder with no converters and by one with an
-// unrelated converter registered, which sends every field that is not a plain
-// scalar to look its type up in the registry.
+// The same struct decoded with and without an unrelated converter registered.
 func benchConverterLookup(b *testing.B, register bool) {
 	type Inner struct {
 		V string `schema:"v"`
@@ -5987,9 +5981,8 @@ func benchConverterLookup(b *testing.B, register bool) {
 func BenchmarkConverterLookupNone(b *testing.B)       { benchConverterLookup(b, false) }
 func BenchmarkConverterLookupRegistered(b *testing.B) { benchConverterLookup(b, true) }
 
-// A map field promoted from an embedded struct is named by its own alias and
-// through the embedded field's, and each of the two reaches the field by a path
-// of its own, the embedded pointer allocated on the way.
+// A map field promoted from an embedded struct is reached by its own alias and
+// through the embedded field's, each by a path of its own.
 func TestDecodeMapFieldEmbedded(t *testing.T) {
 	t.Parallel()
 
@@ -6024,8 +6017,7 @@ func TestDecodeMapFieldEmbedded(t *testing.T) {
 	}
 }
 
-// What follows a map field's alias is its key, as sent, up to the end of the
-// path; an alias with nothing after it, or no alias, is no entry.
+// What follows a map field's alias is its key as sent; an alias alone is no entry.
 func TestDecodeMapFieldKeyForms(t *testing.T) {
 	t.Parallel()
 
@@ -6061,10 +6053,8 @@ func TestDecodeMapFieldKeyForms(t *testing.T) {
 	}
 }
 
-// An entry is built in values that go back to a pool for the next, so nothing
-// of one may show in another: not its value, not a pointer it allocated, not an
-// entry that failed halfway. Decoding runs the entries in map order, so many
-// rounds put them in many orders.
+// Entries are built in pooled values; nothing of one may show in another (its
+// value, a pointer it allocated, a failed entry). Many rounds vary the order.
 func TestDecodeMapFieldEntriesDoNotCarryOver(t *testing.T) {
 	t.Parallel()
 
@@ -6093,8 +6083,6 @@ func TestDecodeMapFieldEntriesDoNotCarryOver(t *testing.T) {
 			if !reflect.DeepEqual(err, firstErr) || !reflect.DeepEqual(s, first) {
 				t.Fatalf("zeroEmpty=%v round %d: got %+v, %v; want %+v, %v", zeroEmpty, round, s, err, first, firstErr)
 			}
-			// Without the failing entry the same decode succeeds, whatever the
-			// last one left in the pool.
 			delete(src, "nums.bad")
 			var ok S
 			if err := d.Decode(&ok, src); err != nil {
@@ -6108,8 +6096,7 @@ func TestDecodeMapFieldEntriesDoNotCarryOver(t *testing.T) {
 	}
 }
 
-// Pointers and slices an entry holds are its own: the next entry decoded into
-// the same pooled values must not write through them.
+// Pointers and slices an entry holds are its own: the next entry must not write through them.
 func TestDecodeMapFieldEntriesAreIndependent(t *testing.T) {
 	t.Parallel()
 
@@ -6139,7 +6126,6 @@ func TestDecodeMapFieldEntriesAreIndependent(t *testing.T) {
 	}
 }
 
-// Named map and key types are filled through the same pooled values.
 func TestDecodeMapFieldNamedTypes(t *testing.T) {
 	t.Parallel()
 
@@ -6156,8 +6142,7 @@ func TestDecodeMapFieldNamedTypes(t *testing.T) {
 	}
 }
 
-// Map fields decoded by many goroutines at once through one decoder share its
-// pools; each result must hold its own entries and no one else's.
+// Goroutines decoding map fields through one decoder share its pools; results must not mix.
 func TestDecodeMapFieldConcurrent(t *testing.T) {
 	t.Parallel()
 
@@ -6183,8 +6168,7 @@ func TestDecodeMapFieldConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// A map entry's decode panicking is recovered as any decode's is, and leaves the
-// pool able to serve the next.
+// A panic in a map entry's decode is recovered like any other and leaves the pool usable.
 func TestDecodeMapFieldConverterPanic(t *testing.T) {
 	t.Parallel()
 
@@ -6208,9 +6192,8 @@ func TestDecodeMapFieldConverterPanic(t *testing.T) {
 	}
 }
 
-// Elements that unmarshal themselves are unmarshaled in place: the values are
-// kept in order, an empty one is skipped unless ZeroEmpty is set, and the slice
-// is not empty-but-nil when nothing is left of it.
+// Elements that unmarshal themselves keep their order; an empty value is skipped
+// unless ZeroEmpty is set, and a slice with nothing left is empty, not nil.
 func TestDecodeUnmarshalerSlice(t *testing.T) {
 	t.Parallel()
 
@@ -6244,9 +6227,8 @@ func TestDecodeUnmarshalerSlice(t *testing.T) {
 	}
 }
 
-// A value that does not unmarshal fails the field with the index of the value,
-// the type of the slice and the unmarshaler's error, and leaves the field as it
-// was rather than half filled.
+// A value that does not unmarshal fails the field with its index, the slice's type
+// and the unmarshaler's error, and leaves the field as it was.
 func TestDecodeUnmarshalerSliceError(t *testing.T) {
 	t.Parallel()
 
@@ -6271,9 +6253,7 @@ func TestDecodeUnmarshalerSliceError(t *testing.T) {
 	}
 }
 
-// The same failure on a slice of pointers, which has a path of its own: the
-// error carries the index of the value and the type of the slice, and the field
-// is left as it was.
+// The same failure on a slice of pointers, which has a path of its own.
 func TestDecodeUnmarshalerSlicePointerElementsError(t *testing.T) {
 	t.Parallel()
 
@@ -6299,9 +6279,7 @@ func TestDecodeUnmarshalerSlicePointerElementsError(t *testing.T) {
 	}
 }
 
-// Slices of pointers to such elements, and slices of a named slice type, keep
-// their results: each pointer is its own value, the named type is the one asked
-// for.
+// Slices of pointers to such elements and of a named slice type keep their results.
 func TestDecodeUnmarshalerSliceShapes(t *testing.T) {
 	t.Parallel()
 
@@ -6331,8 +6309,7 @@ func TestDecodeUnmarshalerSliceShapes(t *testing.T) {
 	}
 }
 
-// Replacing a slice leaves nothing of the old one, and does not write into its
-// backing array, which a caller may still hold.
+// Replacing a slice does not write into the old backing array, which a caller may still hold.
 func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
 	t.Parallel()
 
@@ -6353,11 +6330,8 @@ func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
 	}
 }
 
-// bigUnmarshaler is large enough that a slice of them sized by the number of
-// values a client sends would be a way to make the server reserve memory. Only
-// an element type with a converter of its own can be this large: the others
-// are builtin kinds. The tests register a converter that is never called, as
-// the unmarshaler is used instead.
+// bigUnmarshaler is large enough that sizing a slice of them by the client's
+// value count would reserve memory; tests register a converter for it, never called.
 type bigUnmarshaler [64 << 10]byte
 
 func (b *bigUnmarshaler) UnmarshalText(text []byte) error {
@@ -6368,11 +6342,8 @@ func (b *bigUnmarshaler) UnmarshalText(text []byte) error {
 	return nil
 }
 
-// A slice of unmarshalers claims memory for the values that are accepted, not
-// for the values that are sent: a request of empty values, or one whose first
-// value fails, must not reserve a slot apiece (2048 of them are 128 MiB here).
-// It reads the allocator's totals, so it does not run in parallel with the
-// tests that allocate.
+// A slice of unmarshalers claims memory for the values accepted, not sent: 2048
+// slots are 128 MiB here. It reads allocator totals, so it does not run in parallel.
 func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
 	type S struct {
 		Big []bigUnmarshaler `schema:"big"`
@@ -6410,8 +6381,7 @@ func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
 			t.Errorf("%s: Big = %v, want an empty non-nil slice", tc.name, s.Big)
 		}
 		if err != nil {
-			// The error must be the first value's, from the unmarshaler: any
-			// other would mean the values never reached it.
+			// The first value's error: any other means the values never reached the unmarshaler.
 			var me MultiError
 			if !errors.As(err, &me) {
 				t.Fatalf("%s: err = %v, want a MultiError", tc.name, err)
@@ -6424,8 +6394,7 @@ func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
 	}
 }
 
-// chunkUnmarshaler is 1 KiB, so the first slice holds four and a longer list
-// has to grow it, by doubling and never past the number of values.
+// chunkUnmarshaler is 1 KiB, so the first slice holds four and a longer list must grow it.
 type chunkUnmarshaler [1 << 10]byte
 
 func (c *chunkUnmarshaler) UnmarshalText(text []byte) error {
@@ -6433,8 +6402,7 @@ func (c *chunkUnmarshaler) UnmarshalText(text []byte) error {
 	return nil
 }
 
-// Growing the slice keeps the values already unmarshaled in order, skips or
-// zeroes the empty ones, and ends at the number of values that were kept.
+// Growing the slice keeps the values already unmarshaled, in order, and ends at the number kept.
 func TestDecodeUnmarshalerSliceGrows(t *testing.T) {
 	t.Parallel()
 
@@ -6473,8 +6441,6 @@ func TestDecodeUnmarshalerSliceGrows(t *testing.T) {
 	}
 }
 
-// nothing has no size, so a slice of it costs no memory however many values
-// there are, and its first slice is as long as the list.
 type nothing [0]byte
 
 func (*nothing) UnmarshalText([]byte) error { return nil }
@@ -6495,8 +6461,7 @@ func TestDecodeUnmarshalerSliceZeroSizeElements(t *testing.T) {
 	}
 }
 
-// Comma separated lists split alike on every path that splits them: the native
-// element types, the others, empty items and all.
+// Comma separated lists split alike on every path that splits them, empty items and all.
 func TestDecodeCommaListsSplitAlike(t *testing.T) {
 	t.Parallel()
 
@@ -6530,7 +6495,6 @@ func TestDecodeCommaListsSplitAlike(t *testing.T) {
 		if !reflect.DeepEqual(s.Ints, wantInts) || !reflect.DeepEqual(s.Int32, wantInt32) || !reflect.DeepEqual(s.U16, wantU16) {
 			t.Errorf("zeroEmpty=%v: Ints=%v Int32=%v U16=%v", zeroEmpty, s.Ints, s.Int32, s.U16)
 		}
-		// Strings are never split.
 		if !reflect.DeepEqual(s.Strs, []string{"a,b", ",c"}) {
 			t.Errorf("zeroEmpty=%v: Strs = %q", zeroEmpty, s.Strs)
 		}

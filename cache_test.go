@@ -568,7 +568,6 @@ func TestTypeCacheSlotsConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// caseMask upper-cases the letters of s whose position has its bit set in mask.
 func caseMask(s string, mask int) string {
 	b := []byte(s)
 	for i := range b {
@@ -579,10 +578,8 @@ func caseMask(s string, mask int) string {
 	return string(b)
 }
 
-// The cache is keyed by the path as sent, and "ITEMS.0001.value" is "items.1.value":
-// the client can spell one path as many ways as it likes. Every spelling goes
-// on decoding, but only the one the struct declares (and its lower case) is
-// kept, so the struct, not the client, decides how many paths the cache holds.
+// "ITEMS.0001.value" is "items.1.value": the client can spell one path many ways,
+// but only the spelling the struct declares (and its lower case) is kept.
 func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 	t.Parallel()
 
@@ -595,7 +592,6 @@ func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 	d := NewDecoder()
 	info := d.cache.get(reflect.TypeFor[S]())
 
-	// More spellings than the cache would hold, none longer than it keeps.
 	const pads, masks = 200, 128
 	if pads*masks <= maxFastPaths+maxSpillPaths {
 		t.Fatal("the test sends fewer spellings than the cache holds")
@@ -620,9 +616,7 @@ func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 	}
 }
 
-// Of the spellings of a path, the cache keeps the alias as declared and in
-// lower case, and the index without padding or sign; the others decode as well
-// but are parsed each time.
+// The cache keeps the canonical spellings of a path; others decode but are parsed each time.
 func TestPathCacheKeepsCanonicalSpellings(t *testing.T) {
 	t.Parallel()
 
@@ -662,7 +656,6 @@ func TestPathCacheKeepsCanonicalSpellings(t *testing.T) {
 			t.Errorf("%q kept = %v, want %v", tc.key, kept, tc.kept)
 		}
 	}
-	// Index 0 is canonical; "00" and "-0" are not.
 	for _, tc := range []struct {
 		key  string
 		kept bool
@@ -677,35 +670,29 @@ func TestPathCacheKeepsCanonicalSpellings(t *testing.T) {
 	}
 }
 
-// deepNode contains itself through a slice, so its paths have any depth, and a
-// deep path parses into parts worth many times its key.
+// deepNode contains itself through a slice, so its paths have any depth.
 type deepNode struct {
 	A []deepNode `schema:"a"`
 	V int        `schema:"vvvv"`
 }
 
-// deepPath is "a.0." repeated depth times and then the leaf, with the leaf's
-// index set so that the keys differ.
 func deepPath(depth, index int) string {
 	return strings.Repeat("a.0.", depth-1) + "a." + strconv.Itoa(index) + ".vvvv"
 }
 
-// A type that contains itself has paths of any depth, and the entry caps alone
-// would let a client pin a great deal of parsed parts through them. The cache
-// stops at what the kept paths weigh instead, long before the entry cap, and
-// every path still decodes.
+// A type that contains itself has paths of any depth, so the entry caps alone
+// would let a client pin much parsed state; the cache stops at what it weighs.
 func TestPathCacheIsBoundedByBytes(t *testing.T) {
 	t.Parallel()
 
 	d := NewDecoder()
 	info := d.cache.get(reflect.TypeFor[deepNode]())
 
-	// Deep paths of depths that fit maxCachedPathLen, each its own key.
 	const maxDepth = 60
 	if n := len(deepPath(maxDepth, maxParserIndex)); n > maxCachedPathLen {
 		t.Fatalf("test path is %d bytes, over the %d the cache keeps", n, maxCachedPathLen)
 	}
-	weight := func(depth int) int { // the most one entry weighs: its key, and the arrays behind a part and a hop per segment
+	weight := func(depth int) int {
 		arrays := 2 * (depth + 1) // append doubles the arrays, so they hold at most twice the segments
 		return len(deepPath(depth, maxParserIndex)) + arrays*int(unsafe.Sizeof(pathPart{})) + arrays*int(unsafe.Sizeof(pathHop{}))
 	}
@@ -739,13 +726,10 @@ func TestPathCacheIsBoundedByBytes(t *testing.T) {
 	if got := info.paths.bytes.Load(); got < maxPathCacheBytes || got > maxPathCacheBytes+int64(weight(maxDepth)) {
 		t.Fatalf("cache weighs %d bytes, want within one entry over %d", got, maxPathCacheBytes)
 	}
-	// Far fewer entries than the entry caps allow, and at least what the
-	// heaviest entries would fit.
 	if kept >= maxFastPaths+maxSpillPaths/4 || kept < maxPathCacheBytes/weight(maxDepth) {
 		t.Fatalf("cache kept %d deep paths, want between %d and %d", kept, maxPathCacheBytes/weight(maxDepth), maxFastPaths+maxSpillPaths/4)
 	}
-	// Past the bound a new path, deep or not, is still decoded and not kept.
-	// These have two nonzero indexes, which no path of the fill had.
+	// Past the bound a new path is decoded and not kept (two nonzero indexes: no fill key had them).
 	for _, key := range []string{"a.1.a.1.vvvv", strings.Repeat("a.0.", maxDepth-2) + "a.1.a.1.vvvv"} {
 		var s deepNode
 		if err := d.Decode(&s, map[string][]string{key: {"7"}}); err != nil {
@@ -757,15 +741,13 @@ func TestPathCacheIsBoundedByBytes(t *testing.T) {
 	}
 }
 
-// A key too long to be a path of the struct's is parsed but not kept.
 func TestPathCacheSkipsLongKeys(t *testing.T) {
 	t.Parallel()
 
 	d := NewDecoder()
 	info := d.cache.get(reflect.TypeFor[deepNode]())
 
-	// deepPath(depth, 0) is 4*depth+4 bytes, so these sit on either side of the
-	// limit, spelled as the struct declares them.
+	// deepPath(depth, 0) is 4*depth+4 bytes, so these sit either side of the limit.
 	long := deepPath(maxCachedPathLen/4, 0)
 	if len(long) <= maxCachedPathLen {
 		t.Fatalf("test key is %d bytes, want over %d", len(long), maxCachedPathLen)
@@ -778,7 +760,6 @@ func TestPathCacheSkipsLongKeys(t *testing.T) {
 		t.Fatalf("cache kept %d paths of a key of %d bytes", len(keys), len(long))
 	}
 
-	// A key at the limit is kept.
 	exact := deepPath(maxCachedPathLen/4-1, 0)
 	if len(exact) != maxCachedPathLen {
 		t.Fatalf("test key is %d bytes, want %d", len(exact), maxCachedPathLen)
@@ -808,7 +789,6 @@ func TestPathCacheClearReopensSpill(t *testing.T) {
 	}
 }
 
-// The spill stops at its cap whoever fills it, and every path still resolves.
 func TestPathCacheSpillStopsAtCap(t *testing.T) {
 	t.Parallel()
 
@@ -824,8 +804,7 @@ func TestPathCacheSpillStopsAtCap(t *testing.T) {
 	}
 }
 
-// A path through a map field named by its bare alias is the same for every key
-// the client puts after it, so it is shared rather than parsed for each.
+// A path through a map field's bare alias is the same for every key, so it is shared.
 func TestMapEntryPathIsShared(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
 	type S struct {
 		Attrs map[string]string `schema:"attrs"`
@@ -892,9 +871,7 @@ func TestUnknownPathDoesNotAllocate(t *testing.T) { //nolint:paralleltest // tes
 	}
 }
 
-// converter() answers from the slots of the registered types when it can, and
-// from the registry when a type shares a slot with one, so it has to agree with
-// the registry for every type however they fall.
+// converter() must agree with the registry for every type, however they fall into slots.
 func TestConverterRegistrySlots(t *testing.T) {
 	t.Parallel()
 
@@ -931,7 +908,6 @@ func TestConverterRegistrySlots(t *testing.T) {
 		t.Fatal("no unregistered type shares a slot with a registered one; the test checks nothing")
 	}
 
-	// Registering again replaces, and keeps the others.
 	c.registerConverter(reflect.Zero(registered[0]).Interface(), converterFor(100))
 	if conv := c.converter(registered[0]); conv == nil || conv("").Int() != 100 {
 		t.Fatal("re-registering did not replace the converter")
@@ -967,16 +943,13 @@ func TestConverterRegistryConcurrent(t *testing.T) {
 	wg.Wait()
 }
 
-// The converter lookup of a type nobody registered, which is the answer for
-// nearly every field that is not a plain scalar.
+// The converter lookup of a type nobody registered, which is nearly every non-scalar field.
 func BenchmarkConverterMiss(b *testing.B) {
 	c := newCache()
 	for _, typ := range slotTypes(3) {
 		c.registerConverter(reflect.Zero(typ).Interface(), func(string) reflect.Value { return reflect.Value{} })
 	}
-	// Whether the slots turn a type away depends on where the runtime put its
-	// descriptor, which no benchmark controls, so take the first of a few
-	// ordinary types that no registered type shares a slot with.
+	// Take the first of a few types that no registered type shares a slot with.
 	var typ reflect.Type
 	for _, candidate := range []reflect.Type{
 		reflect.TypeFor[*int](), reflect.TypeFor[*string](), reflect.TypeFor[[]string](),
