@@ -53,8 +53,9 @@ func newCache() *cache {
 type cache struct {
 	l sync.RWMutex // serializes configuration writes (tag, regconv)
 	m sync.Map     // map[reflect.Type]cacheEntry
-	// regconv is the registered converters, replaced whole (copy-on-write
-	// under l) so readers never see a map being written.
+	// regconv holds the registered converters as an immutable map published
+	// atomically: registerConverter replaces the whole map (copy-on-write
+	// under l), so readers never touch a map that is being written.
 	regconv atomic.Pointer[converterRegistry]
 	tag     string
 	// gen is bumped (under l) before m is cleared on configuration changes;
@@ -91,13 +92,9 @@ type cacheEntry struct {
 	gen  uint64
 }
 
-// converterRegistry is the registered converters, by type, never modified
-// once published.
 type converterRegistry struct {
 	m map[reflect.Type]Converter
-	// slots has bit typeSlot(t) set for every registered type: a clear bit
-	// settles the usual unregistered type without hashing it; a shared slot
-	// falls through to m.
+	// slots has bit typeSlot(t) set for every registered t: a clear bit skips the lookup in m.
 	slots uint64
 }
 
@@ -157,8 +154,6 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		return cached, nil
 	}
 
-	// A map entry's path is never cached, its key being the client's, but a
-	// field named by its bare alias has the same path for every key.
 	if rootInfo.hasMapFields {
 		if i := strings.IndexByte(p, '.'); i > 0 && i+1 < len(p) {
 			if f := rootInfo.get(p[:i]); f != nil && f.mapRoot != nil {
@@ -177,8 +172,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	var parts []pathPart
 	var hopBuf []pathHop
 	hopStart := 0
-	// Only a path spelled as the struct declares it (aliases as declared or
-	// in lower case, indexes without padding or sign) is cached.
+	// Only paths spelled as declared (alias or its lower case, plain indexes) are cached.
 	canonical := true
 	for keyStart := 0; ; {
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
@@ -192,8 +186,6 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			canonical = false
 		}
 		if parts == nil {
-			// Reserved once the first segment names a field, so an unknown key
-			// costs nothing.
 			segments := min(strings.Count(p, ".")+1, maxPathReserve)
 			parts = make([]pathPart, 0, segments)
 			hopBuf = make([]pathHop, 0, segments)
@@ -242,7 +234,6 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			if index64 > maxParserIndex {
 				return nil, errIndexTooLarge
 			}
-			// A sign or a leading zero is another spelling of the same index.
 			if c := segment[0]; c == '+' || c == '-' || (c == '0' && len(segment) > 1) {
 				canonical = false
 			}
@@ -300,7 +291,6 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		return parts, nil
 	}
 	// Detach the key: callers may pass strings aliasing reused request buffers.
-	// An entry weighs its key and the arrays behind its parts and hops.
 	cost := len(p) + cap(parts)*int(unsafe.Sizeof(pathPart{})) + cap(hopBuf)*int(unsafe.Sizeof(pathHop{}))
 	cached, _ := rootInfo.paths.loadOrStore(strings.Clone(p), parts, cost)
 	return cached, nil
@@ -311,18 +301,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 // structs stay well inside it.
 const maxFastPaths = 512
 
-// The cache is keyed by the path as sent, so it keeps only paths spelled as
-// the struct declares them (see parsePathInfo), and these bound what the kept
-// ones cost. Past any bound a path is parsed each time, as a map entry's is.
+// Bounds on the path cache; past any, a path is parsed each time instead of kept.
 const (
-	// maxSpillPaths caps the paths held past maxFastPaths: sixteen indexed
-	// paths in full, far more than a struct has.
-	maxSpillPaths = 16384
-	// maxCachedPathLen is the longest path kept; real paths are a few aliases
-	// and an index.
-	maxCachedPathLen = 256
-	// maxPathCacheBytes caps what the kept paths weigh: a type that contains
-	// itself has paths of any depth, each worth many parts.
+	maxSpillPaths     = 16384
+	maxCachedPathLen  = 256
 	maxPathCacheBytes = 8 << 20
 )
 
@@ -334,17 +316,16 @@ const (
 type pathCache struct {
 	fast atomic.Pointer[map[string][]pathPart]
 	// spill holds paths seen after fast was sealed, so a key space larger
-	// than maxFastPaths keeps its cache, up to maxSpillPaths of them.
+	// than maxFastPaths keeps its cache.
 	spill    sync.Map // map[string][]pathPart
 	spillLen atomic.Int64
-	// bytes is what the kept paths weigh, as charged by loadOrStore.
+	// bytes is what the kept paths weigh.
 	bytes  atomic.Int64
 	mu     sync.Mutex
 	sealed atomic.Bool
 }
 
-// full reports whether the cache takes no more paths; concurrent writers can
-// overshoot a bound by a few.
+// full reports whether a bound is reached; racing writers may overshoot it.
 func (c *pathCache) full() bool {
 	return c.bytes.Load() >= maxPathCacheBytes || (c.sealed.Load() && c.spillLen.Load() >= maxSpillPaths)
 }
@@ -364,8 +345,8 @@ func (c *pathCache) load(key string) ([]pathPart, bool) {
 	return nil, false
 }
 
-// loadOrStore caches parts under key, charging cost bytes, or returns what a
-// concurrent call cached there first.
+// loadOrStore caches parts under key, or returns what a concurrent call
+// cached there first.
 func (c *pathCache) loadOrStore(key string, parts []pathPart, cost int) ([]pathPart, bool) {
 	if !c.sealed.Load() {
 		c.mu.Lock()
@@ -877,8 +858,7 @@ type structInfo struct {
 	// hasIndexedSlice reports whether any field's paths carry a slice element
 	// index, and so may grow that slice while decoding.
 	hasIndexedSlice bool
-	// hasMapFields is whether some field has a mapRoot to hand out.
-	hasMapFields bool
+	hasMapFields    bool
 	// defaultFields are the fields the setDefaults walk has to visit: those
 	// with a default, and the structs and pointers to structs it descends
 	// into. The rest of the fields can never be affected by it.
@@ -1041,10 +1021,8 @@ type fieldInfo struct {
 	// decode fills a map value with, describing the map's value type as a
 	// field of its own. Nil for every other field.
 	mapValue []pathPart
-	// mapRoot is such a field's parsed path when named by its bare alias; it
-	// carries no key offset (see pathPart.keyStart), so every key shares it.
+	// mapRoot is the path of an entry named by the bare alias, the same for every key.
 	mapRoot []pathPart
-	// entries pools the values a map entry is decoded through (decodeMapEntry).
 	entries *sync.Pool
 }
 
@@ -1082,8 +1060,7 @@ type pathPart struct {
 	// terminal part through a map field names begins. Such a part is never
 	// cached, so the offset always refers to the path being decoded; an int32
 	// sits in elem's padding and leaves every other part the size it was.
-	// Zero, which no key starts at, marks a shared mapRoot part: the key
-	// follows the first separator.
+	// Zero marks a shared mapRoot part, whose key follows the first '.'.
 	keyStart int32
 }
 

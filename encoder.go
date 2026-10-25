@@ -41,9 +41,7 @@ type Encoder struct {
 	// the plan if it changed, so a build racing a reconfiguration cannot
 	// re-insert a stale plan after the clear.
 	encGen atomic.Uint64
-	// encSlots is a direct-mapped cache in front of encCache, indexed like
-	// cache.slots by the type descriptor's address, sparing each struct the
-	// interface hash. A collision or a stale entry falls through to encCache.
+	// encSlots is a direct-mapped cache in front of encCache, indexed like cache.slots.
 	encSlots [typeCacheSlots]atomic.Pointer[encPlan]
 }
 
@@ -55,8 +53,7 @@ type encPlan struct {
 	typ    reflect.Type
 	fields []encField
 	gen    uint64
-	// scratch is how many values encode can put in its shared scratch array:
-	// one per scratch-safe field and per field that encodes nil as "null".
+	// scratch is how many values encode can put in its shared scratch array.
 	scratch int
 	// freshKeys reports that encoding a value of this type into an empty map
 	// writes every key exactly once: no two fields share a name, and no field
@@ -144,8 +141,6 @@ func (e *Encoder) SetAliasTag(tag string) {
 	e.resetPlans()
 }
 
-// resetPlans drops every cached plan after a configuration change; the bumped
-// generation already turns the slots' entries away.
 func (e *Encoder) resetPlans() {
 	e.encGen.Add(1)
 	e.encCache.Clear()
@@ -228,16 +223,13 @@ func (e *Encoder) structInfo(t reflect.Type) *encPlan {
 	return p
 }
 
-// claimPlanSlot stores p in slot, which held cur, unless cur is the live plan
-// of another type: two types sharing a slot would otherwise evict each other
-// on every call. The loser finds its plan in encCache.
+// claimPlanSlot keeps another type's live plan in slot, so types sharing it don't evict each other.
 func claimPlanSlot(slot *atomic.Pointer[encPlan], cur, p *encPlan) {
 	if cur == nil || cur.gen < p.gen {
 		slot.CompareAndSwap(cur, p)
 	}
 }
 
-// scratchValues counts the fields that can put a value in the scratch array.
 func scratchValues(fields []encField) int {
 	n := 0
 	for i := range fields {

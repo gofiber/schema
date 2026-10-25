@@ -905,7 +905,6 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return d.decodeBuiltinSlice(v, t, path, values)
 		}
 
-		// Non-pointer elements that unmarshal themselves do so in place.
 		if m.IsValid && !isPtrElem {
 			return d.decodeUnmarshalerSlice(v, t, path, values)
 		}
@@ -974,13 +973,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
-// mapEntry is the key and value pair decodeMapEntry decodes an entry into;
-// the map copies both, so one pair serves entry after entry.
 type mapEntry struct {
 	key, val reflect.Value
 }
 
-// newMapEntryPool returns the pool of mapEntry values for the map type t.
 func newMapEntryPool(t reflect.Type) *sync.Pool {
 	return &sync.Pool{New: func() any {
 		return &mapEntry{key: reflect.New(t.Key()).Elem(), val: reflect.New(t.Elem()).Elem()}
@@ -1002,7 +998,6 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 	}
 	keyStart := int(part.keyStart)
 	if keyStart == 0 {
-		// A shared mapRoot part carries no offset: the key follows the alias.
 		keyStart = strings.IndexByte(path, '.') + 1
 	}
 	e, _ := f.entries.Get().(*mapEntry)
@@ -1015,8 +1010,7 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 		e.key.SetString(strings.Clone(path[keyStart:]))
 		v.SetMapIndex(e.key, e.val)
 	}
-	// The map holds copies: zeroing readies the pair for the next entry and
-	// keeps the request's data out of the pool. A panic never returns the pair.
+	// The map holds copies; zero the pair so the pool keeps none of the request's data.
 	e.val.SetZero()
 	e.key.SetZero()
 	f.entries.Put(e)
@@ -1041,7 +1035,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 				items = append(items, reflect.Zero(t.Elem()))
 			}
 		} else if m.IsValid {
-			// Only pointer elements get here; each is the new value itself.
+			// Only pointer elements get here, so u itself is the element.
 			u := reflect.New(elemT)
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 			if err := um.UnmarshalText([]byte(value)); err != nil {
@@ -1107,19 +1101,14 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 	return append(items, item)
 }
 
-// unmarshalerSliceBudget is how many bytes of elements the first slice of
-// decodeUnmarshalerSlice holds; the client chooses the count of values, so
-// the slice grows as they are accepted rather than being sized by it.
+// unmarshalerSliceBudget bounds the first allocation: the client chooses how many values arrive.
 const unmarshalerSliceBudget = 4 << 10
 
-// decodeUnmarshalerSlice decodes values into the slice field v of type t, whose
-// non-pointer elements implement encoding.TextUnmarshaler through their
-// address, by unmarshaling each into its slot of a detached slice, assigned to
-// v only when every value unmarshaled. An empty value is skipped unless
-// ZeroEmpty is set. Nothing is allocated until a value needs a slot.
+// decodeUnmarshalerSlice unmarshals each value into an element of a detached slice,
+// set on v only if all succeed; empty values are skipped unless ZeroEmpty is set.
 func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
-	var sl reflect.Value // the zero Value until a value needs a slot
-	room, i := 0, 0      // slots sl has, and slots used
+	var sl reflect.Value
+	room, i := 0, 0
 	for key, value := range values {
 		if value == "" && !d.zeroEmpty {
 			continue
@@ -1150,9 +1139,7 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 	return nil
 }
 
-// growUnmarshalerSlice returns a slice holding sl's elements with room for
-// more: at most unmarshalerSliceBudget bytes to start, then twice sl, never
-// past limit.
+// growUnmarshalerSlice returns sl with more room: the budget at first, then doubled, up to limit.
 func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
 	var n int
 	if sl.IsValid() {
