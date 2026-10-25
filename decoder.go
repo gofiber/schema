@@ -905,8 +905,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return d.decodeBuiltinSlice(v, t, path, values)
 		}
 
-		// Elements that unmarshal themselves, and are not pointers, are
-		// unmarshaled where they will live.
+		// Non-pointer elements that unmarshal themselves do so in place.
 		if m.IsValid && !isPtrElem {
 			return d.decodeUnmarshalerSlice(v, t, path, values)
 		}
@@ -975,10 +974,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
-// mapEntry is the pair of values decodeMapEntry builds a map entry from: a
-// zero value of the map's value type to decode into, and a string-kinded one
-// to hold the key. Both are copied into the map, so one pair serves entry
-// after entry instead of two reflect.New and a boxed key apiece.
+// mapEntry is the key and value pair decodeMapEntry decodes an entry into;
+// the map copies both, so one pair serves entry after entry.
 type mapEntry struct {
 	key, val reflect.Value
 }
@@ -1005,8 +1002,7 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 	}
 	keyStart := int(part.keyStart)
 	if keyStart == 0 {
-		// The shared part of a map field named by its bare alias, which cannot
-		// carry the offset: the key is whatever follows the alias.
+		// A shared mapRoot part carries no offset: the key follows the alias.
 		keyStart = strings.IndexByte(path, '.') + 1
 	}
 	e, _ := f.entries.Get().(*mapEntry)
@@ -1015,15 +1011,12 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(v.Type()))
 		}
-		// The key may alias the caller's buffer, so it is cloned before the map
-		// keeps it.
+		// The key may alias the caller's buffer.
 		e.key.SetString(strings.Clone(path[keyStart:]))
 		v.SetMapIndex(e.key, e.val)
 	}
-	// The map holds its own copy of both. Zeroing them readies the pair for the
-	// next entry, which must decode into a fresh value, and keeps the pool from
-	// holding on to the request's data. A decode that panics never returns the
-	// pair, so a half-filled one is not reused.
+	// The map holds copies: zeroing readies the pair for the next entry and
+	// keeps the request's data out of the pool. A panic never returns the pair.
 	e.val.SetZero()
 	e.key.SetZero()
 	f.entries.Put(e)
@@ -1032,8 +1025,7 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
 // to round-trip through a reflect.Value: a custom converter, or pointer
-// elements. It is split out so that decode, which runs once per source key,
-// carries no defer of its own.
+// elements. Split out so that decode carries no defer of its own.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
 	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
 	items := (*itemsBuf)[:0]
@@ -1049,8 +1041,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 				items = append(items, reflect.Zero(t.Elem()))
 			}
 		} else if m.IsValid {
-			// Only pointer elements get here (see decodeUnmarshalerSlice), and
-			// each is the new value itself.
+			// Only pointer elements get here; each is the new value itself.
 			u := reflect.New(elemT)
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 			if err := um.UnmarshalText([]byte(value)); err != nil {
@@ -1116,24 +1107,16 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 	return append(items, item)
 }
 
-// unmarshalerSliceBudget is how many bytes of elements decodeUnmarshalerSlice
-// reserves for its first slice. The client chooses how many values to send and
-// the type chooses how large an element is, so the slice is not sized by the
-// first alone: it starts here and doubles as values are accepted.
+// unmarshalerSliceBudget is how many bytes of elements the first slice of
+// decodeUnmarshalerSlice holds; the client chooses the count of values, so
+// the slice grows as they are accepted rather than being sized by it.
 const unmarshalerSliceBudget = 4 << 10
 
-// decodeUnmarshalerSlice decodes values into the slice field v of type t,
-// whose elements are not pointers and implement encoding.TextUnmarshaler
-// through their address, by unmarshaling each straight into its slot of the
-// slice being built. decodeBoxedSlice would unmarshal into a value of its own
-// per element and copy it over, which costs an allocation apiece. As there,
-// the slice is built detached and only assigned to v when every value
-// unmarshaled, and an empty value is skipped unless ZeroEmpty is set.
-//
-// Nothing is allocated until a value needs a slot, so a request of empty values
-// or of a first value that fails claims next to nothing, as it does in
-// decodeBoxedSlice, and what a request does claim stays proportional to the
-// values it gets accepted (see growUnmarshalerSlice).
+// decodeUnmarshalerSlice decodes values into the slice field v of type t, whose
+// non-pointer elements implement encoding.TextUnmarshaler through their
+// address, by unmarshaling each into its slot of a detached slice, assigned to
+// v only when every value unmarshaled. An empty value is skipped unless
+// ZeroEmpty is set. Nothing is allocated until a value needs a slot.
 func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
 	var sl reflect.Value // the zero Value until a value needs a slot
 	room, i := 0, 0      // slots sl has, and slots used
@@ -1167,10 +1150,9 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 	return nil
 }
 
-// growUnmarshalerSlice returns a slice of type t with room for more elements
-// than sl, which is full, and holding the ones it holds: a first slice of at
-// most unmarshalerSliceBudget bytes if sl is the zero Value, otherwise twice as
-// long as sl. It is never longer than limit, the most that could be needed.
+// growUnmarshalerSlice returns a slice holding sl's elements with room for
+// more: at most unmarshalerSliceBudget bytes to start, then twice sl, never
+// past limit.
 func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
 	var n int
 	if sl.IsValid() {

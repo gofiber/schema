@@ -42,11 +42,8 @@ type Encoder struct {
 	// re-insert a stale plan after the clear.
 	encGen atomic.Uint64
 	// encSlots is a direct-mapped cache in front of encCache, indexed like
-	// cache.slots by the address of the type's descriptor. encCache hashes the
-	// type as an interface, which a small struct's encode paid for noticeably,
-	// and again for every struct nested in it. Entries are encCache's own,
-	// generation included, so a collision or a stale entry only falls through
-	// to it.
+	// cache.slots by the type descriptor's address, sparing each struct the
+	// interface hash. A collision or a stale entry falls through to encCache.
 	encSlots [typeCacheSlots]atomic.Pointer[encPlan]
 }
 
@@ -58,10 +55,8 @@ type encPlan struct {
 	typ    reflect.Type
 	fields []encField
 	gen    uint64
-	// scratch is how many values encoding a value of this type can put in
-	// encode's shared scratch array: at most one per scratch-safe field, and
-	// one per field that can encode as "null". The array is sized to it
-	// instead of to every field, string fields included, that never use it.
+	// scratch is how many values encode can put in its shared scratch array:
+	// one per scratch-safe field and per field that encodes nil as "null".
 	scratch int
 	// freshKeys reports that encoding a value of this type into an empty map
 	// writes every key exactly once: no two fields share a name, and no field
@@ -149,9 +144,8 @@ func (e *Encoder) SetAliasTag(tag string) {
 	e.resetPlans()
 }
 
-// resetPlans drops every cached plan after a configuration change. The
-// generation goes first: it already turns the slots' entries away, and
-// dropping them lets their plans go.
+// resetPlans drops every cached plan after a configuration change; the bumped
+// generation already turns the slots' entries away.
 func (e *Encoder) resetPlans() {
 	e.encGen.Add(1)
 	e.encCache.Clear()
@@ -234,21 +228,16 @@ func (e *Encoder) structInfo(t reflect.Type) *encPlan {
 	return p
 }
 
-// claimPlanSlot stores p in slot, which held cur when structInfo read it,
-// unless cur is the live plan of another type: two types sharing a slot would
-// otherwise take it from each other on every call, and each store would
-// invalidate the slots' cache line on every core reading it. A later type that
-// loses the slot finds its plan in encCache, as every type did before the
-// slots.
+// claimPlanSlot stores p in slot, which held cur, unless cur is the live plan
+// of another type: two types sharing a slot would otherwise evict each other
+// on every call. The loser finds its plan in encCache.
 func claimPlanSlot(slot *atomic.Pointer[encPlan], cur, p *encPlan) {
 	if cur == nil || cur.gen < p.gen {
 		slot.CompareAndSwap(cur, p)
 	}
 }
 
-// scratchValues returns how many values encoding a value with these fields
-// can put in the shared scratch array: the scratch-safe fields, and the ones
-// that encode a nil pointer as "null".
+// scratchValues counts the fields that can put a value in the scratch array.
 func scratchValues(fields []encField) int {
 	n := 0
 	for i := range fields {
