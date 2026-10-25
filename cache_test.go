@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	utils "github.com/gofiber/utils/v2"
 	utilstrings "github.com/gofiber/utils/v2/strings"
@@ -579,8 +580,9 @@ func caseMask(s string, mask int) string {
 }
 
 // The cache is keyed by the path as sent, and "ITEMS.0001.value" is "items.1.value":
-// the client can spell one path as many ways as it likes, so the cache has to
-// stop taking them, while every spelling goes on decoding.
+// the client can spell one path as many ways as it likes. Every spelling goes
+// on decoding, but only the one the struct declares (and its lower case) is
+// kept, so the struct, not the client, decides how many paths the cache holds.
 func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 	t.Parallel()
 
@@ -593,7 +595,7 @@ func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 	d := NewDecoder()
 	info := d.cache.get(reflect.TypeFor[S]())
 
-	// More spellings than the cache holds, none longer than it keeps.
+	// More spellings than the cache would hold, none longer than it keeps.
 	const pads, masks = 200, 128
 	if pads*masks <= maxFastPaths+maxSpillPaths {
 		t.Fatal("the test sends fewer spellings than the cache holds")
@@ -610,11 +612,148 @@ func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 			}
 		}
 	}
-	if got := len(cachedPathKeys(&info.paths)); got < maxFastPaths || got > maxFastPaths+maxSpillPaths {
-		t.Fatalf("cache holds %d paths, want between %d and %d", got, maxFastPaths, maxFastPaths+maxSpillPaths)
+	if keys := cachedPathKeys(&info.paths); len(keys) != 1 || keys[0] != "items.1.value" {
+		t.Fatalf("cache holds %q, want only the declared spelling", keys)
+	}
+	if info.paths.full() {
+		t.Fatal("one path filled the cache")
+	}
+}
+
+// Of the spellings of a path, the cache keeps the alias as declared and in
+// lower case, and the index without padding or sign; the others decode as well
+// but are parsed each time.
+func TestPathCacheKeepsCanonicalSpellings(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"Value"`
+	}
+	type S struct {
+		Items []Item `schema:"Items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	for _, tc := range []struct {
+		key  string
+		kept bool
+	}{
+		{"Items.1.Value", true},
+		{"items.1.value", true},
+		{"Items.1.value", true},
+		{"items.10.Value", true},
+		{"ITEMS.1.Value", false},
+		{"Items.1.VALUE", false},
+		{"iTems.1.Value", false},
+		{"Items.01.Value", false},
+		{"Items.+1.Value", false},
+		{"Items.00.Value", false},
+		{"Items.-0.Value", false},
+	} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{tc.key: {"x"}}); err != nil {
+			t.Fatalf("%q: %v", tc.key, err)
+		}
+		if n := len(s.Items); n == 0 || s.Items[n-1].Value != "x" {
+			t.Fatalf("%q decoded to %+v", tc.key, s.Items)
+		}
+		if _, kept := info.paths.load(tc.key); kept != tc.kept {
+			t.Errorf("%q kept = %v, want %v", tc.key, kept, tc.kept)
+		}
+	}
+	// Index 0 is canonical; "00" and "-0" are not.
+	for _, tc := range []struct {
+		key  string
+		kept bool
+	}{{"items.0.value", true}, {"items.00.value", false}} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{tc.key: {"x"}}); err != nil {
+			t.Fatalf("%q: %v", tc.key, err)
+		}
+		if _, kept := info.paths.load(tc.key); kept != tc.kept {
+			t.Errorf("%q kept = %v, want %v", tc.key, kept, tc.kept)
+		}
+	}
+}
+
+// deepNode contains itself through a slice, so its paths have any depth, and a
+// deep path parses into parts worth many times its key.
+type deepNode struct {
+	A []deepNode `schema:"a"`
+	V int        `schema:"vvvv"`
+}
+
+// deepPath is "a.0." repeated depth times and then the leaf, with the leaf's
+// index set so that the keys differ.
+func deepPath(depth, index int) string {
+	return strings.Repeat("a.0.", depth-1) + "a." + strconv.Itoa(index) + ".vvvv"
+}
+
+// A type that contains itself has paths of any depth, and the entry caps alone
+// would let a client pin a great deal of parsed parts through them. The cache
+// stops at what the kept paths weigh instead, long before the entry cap, and
+// every path still decodes.
+func TestPathCacheIsBoundedByBytes(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[deepNode]())
+
+	// Deep paths of depths that fit maxCachedPathLen, each its own key.
+	const maxDepth = 60
+	if n := len(deepPath(maxDepth, maxParserIndex)); n > maxCachedPathLen {
+		t.Fatalf("test path is %d bytes, over the %d the cache keeps", n, maxCachedPathLen)
+	}
+	weight := func(depth int) int { // the most one entry weighs: its key, and the arrays behind a part and a hop per segment
+		arrays := 2 * (depth + 1) // append doubles the arrays, so they hold at most twice the segments
+		return len(deepPath(depth, maxParserIndex)) + arrays*int(unsafe.Sizeof(pathPart{})) + arrays*int(unsafe.Sizeof(pathHop{}))
+	}
+	kept, sent := 0, 0
+	for depth := maxDepth; depth >= 2 && !info.paths.full(); depth-- {
+		for index := 0; index <= maxParserIndex && !info.paths.full(); index++ {
+			key := deepPath(depth, index)
+			var s deepNode
+			if err := d.Decode(&s, map[string][]string{key: {"7"}}); err != nil {
+				t.Fatalf("%q: %v", key, err)
+			}
+			n := &s
+			for range depth - 1 {
+				n = &n.A[0]
+			}
+			if len(n.A) != index+1 || n.A[index].V != 7 {
+				t.Fatalf("%q decoded wrong", key)
+			}
+			sent++
+			if _, ok := info.paths.load(key); ok {
+				kept++
+			}
+		}
 	}
 	if !info.paths.full() {
-		t.Fatal("the cache should have filled")
+		t.Fatalf("%d deep paths did not fill the cache", sent)
+	}
+	if kept != sent {
+		t.Fatalf("kept %d of %d paths sent before the cache filled", kept, sent)
+	}
+	if got := info.paths.bytes.Load(); got < maxPathCacheBytes || got > maxPathCacheBytes+int64(weight(maxDepth)) {
+		t.Fatalf("cache weighs %d bytes, want within one entry over %d", got, maxPathCacheBytes)
+	}
+	// Far fewer entries than the entry caps allow, and at least what the
+	// heaviest entries would fit.
+	if kept >= maxFastPaths+maxSpillPaths/4 || kept < maxPathCacheBytes/weight(maxDepth) {
+		t.Fatalf("cache kept %d deep paths, want between %d and %d", kept, maxPathCacheBytes/weight(maxDepth), maxFastPaths+maxSpillPaths/4)
+	}
+	// Past the bound a new path, deep or not, is still decoded and not kept.
+	// These have two nonzero indexes, which no path of the fill had.
+	for _, key := range []string{"a.1.a.1.vvvv", strings.Repeat("a.0.", maxDepth-2) + "a.1.a.1.vvvv"} {
+		var s deepNode
+		if err := d.Decode(&s, map[string][]string{key: {"7"}}); err != nil {
+			t.Fatalf("%q after the cache filled: %v", key, err)
+		}
+		if _, ok := info.paths.load(key); ok {
+			t.Fatalf("%q was kept by a full cache", key)
+		}
 	}
 }
 
@@ -622,33 +761,29 @@ func TestPathCacheIsBoundedBySpellings(t *testing.T) {
 func TestPathCacheSkipsLongKeys(t *testing.T) {
 	t.Parallel()
 
-	type Item struct {
-		Value string `schema:"value"`
-	}
-	type S struct {
-		Items []Item `schema:"items"`
-	}
 	d := NewDecoder()
-	info := d.cache.get(reflect.TypeFor[S]())
+	info := d.cache.get(reflect.TypeFor[deepNode]())
 
-	long := "items." + strings.Repeat("0", maxCachedPathLen) + "1.value"
-	var s S
-	if err := d.Decode(&s, map[string][]string{long: {"x"}}); err != nil {
-		t.Fatal(err)
+	// deepPath(depth, 0) is 4*depth+4 bytes, so these sit on either side of the
+	// limit, spelled as the struct declares them.
+	long := deepPath(maxCachedPathLen/4, 0)
+	if len(long) <= maxCachedPathLen {
+		t.Fatalf("test key is %d bytes, want over %d", len(long), maxCachedPathLen)
 	}
-	if len(s.Items) != 2 || s.Items[1].Value != "x" {
-		t.Fatalf("decoded to %+v", s.Items)
+	var s deepNode
+	if err := d.Decode(&s, map[string][]string{long: {"1"}}); err != nil {
+		t.Fatal(err)
 	}
 	if keys := cachedPathKeys(&info.paths); len(keys) != 0 {
 		t.Fatalf("cache kept %d paths of a key of %d bytes", len(keys), len(long))
 	}
 
 	// A key at the limit is kept.
-	exact := "items." + strings.Repeat("0", maxCachedPathLen-len("items.1.value")) + "1.value"
+	exact := deepPath(maxCachedPathLen/4-1, 0)
 	if len(exact) != maxCachedPathLen {
 		t.Fatalf("test key is %d bytes, want %d", len(exact), maxCachedPathLen)
 	}
-	if err := d.Decode(&s, map[string][]string{exact: {"y"}}); err != nil {
+	if err := d.Decode(&s, map[string][]string{exact: {"1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if keys := cachedPathKeys(&info.paths); len(keys) != 1 {
@@ -662,7 +797,7 @@ func TestPathCacheClearReopensSpill(t *testing.T) {
 
 	var c pathCache
 	for i := range maxFastPaths + 8 {
-		c.loadOrStore(strconv.Itoa(i), nil)
+		c.loadOrStore(strconv.Itoa(i), nil, 0)
 	}
 	if !c.sealed.Load() || c.spillLen.Load() != 8 {
 		t.Fatalf("sealed=%v spillLen=%d, want sealed with 8 spilled", c.sealed.Load(), c.spillLen.Load())
@@ -679,7 +814,7 @@ func TestPathCacheSpillStopsAtCap(t *testing.T) {
 
 	var c pathCache
 	for i := range maxFastPaths + maxSpillPaths {
-		c.loadOrStore(strconv.Itoa(i), nil)
+		c.loadOrStore(strconv.Itoa(i), nil, 0)
 	}
 	if !c.full() {
 		t.Fatalf("cache of %d spilled paths is not full", c.spillLen.Load())

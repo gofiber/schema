@@ -184,6 +184,11 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	var parts []pathPart
 	var hopBuf []pathHop
 	hopStart := 0
+	// canonical is whether p spells the path as the struct declares it: each
+	// alias as declared or in lower case, each index without padding or sign.
+	// Only such a path is cached; the others, which the client can vary at
+	// will, are parsed each time they come.
+	canonical := true
 	for keyStart := 0; ; {
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
 		if err != nil {
@@ -191,6 +196,9 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		}
 		if field = struc.get(segment); field == nil {
 			return nil, errInvalidPath
+		}
+		if segment != field.alias && segment != field.aliasLower {
+			canonical = false
 		}
 		if parts == nil {
 			// Reserved once the first segment names a field, not before: a key
@@ -243,6 +251,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			if index64 > maxParserIndex {
 				return nil, errIndexTooLarge
 			}
+			// A sign or a leading zero is another spelling of the same index.
+			if c := segment[0]; c == '+' || c == '-' || (c == '0' && len(segment) > 1) {
+				canonical = false
+			}
 			hops := hopBuf[hopStart:len(hopBuf):len(hopBuf)]
 			hopStart = len(hopBuf)
 			parts = append(parts, pathPart{
@@ -293,11 +305,14 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		elem:      len(hops) == 0,
 	})
 
-	if len(p) > maxCachedPathLen || rootInfo.paths.full() {
+	if !canonical || len(p) > maxCachedPathLen || rootInfo.paths.full() {
 		return parts, nil
 	}
 	// Detach the key: callers may pass strings aliasing reused request buffers.
-	cached, _ := rootInfo.paths.loadOrStore(strings.Clone(p), parts)
+	// The entry weighs its key and the arrays behind its parts and hops, which
+	// append may have grown past what they hold.
+	cost := len(p) + cap(parts)*int(unsafe.Sizeof(pathPart{})) + cap(hopBuf)*int(unsafe.Sizeof(pathHop{}))
+	cached, _ := rootInfo.paths.loadOrStore(strings.Clone(p), parts, cost)
 	return cached, nil
 }
 
@@ -310,8 +325,11 @@ const maxFastPaths = 512
 // it: a path with an index parses the same in any letter case and with any
 // amount of zero padding on the index ("ITEMS.0001.value" is "items.1.value"),
 // so one path has as many keys as the client cares to make, each kept for the
-// life of the decoder. These bound what that can cost. Past either, a path is
-// parsed again each time it comes, as the path of a map entry is.
+// life of the decoder. The cache therefore keeps a path only when it is spelled
+// as the struct declares it (see parsePathInfo), which leaves the struct, not
+// the client, to decide how many keys there are, and these bound what the keys
+// it keeps can cost. Past any of them, a path is parsed again each time it
+// comes, as the path of a map entry is.
 const (
 	// maxSpillPaths caps the paths the cache holds past maxFastPaths. A path
 	// with an index has up to maxParserIndex+1 keys, so the cap holds sixteen
@@ -320,6 +338,11 @@ const (
 	// maxCachedPathLen is the longest path the cache will keep. Real paths are
 	// a few aliases and an index.
 	maxCachedPathLen = 256
+	// maxPathCacheBytes caps what the kept paths and their parsed parts weigh.
+	// A type that contains itself through a slice has paths of any depth, and
+	// a deep one parses into parts worth many times its key, so the entry caps
+	// alone would let one struct type pin far more than its keys suggest.
+	maxPathCacheBytes = 8 << 20
 )
 
 // pathCache caches parsed paths for one struct type, keyed by the raw source
@@ -333,14 +356,17 @@ type pathCache struct {
 	// than maxFastPaths keeps its cache, up to maxSpillPaths of them.
 	spill    sync.Map // map[string][]pathPart
 	spillLen atomic.Int64
-	mu       sync.Mutex
-	sealed   atomic.Bool
+	// bytes is what the kept paths weigh: their keys and their parsed parts,
+	// as charged by loadOrStore. Bounded by maxPathCacheBytes.
+	bytes  atomic.Int64
+	mu     sync.Mutex
+	sealed atomic.Bool
 }
 
 // full reports whether the cache takes no more paths. Concurrent writers can
-// carry it a few paths past the bound before they notice.
+// carry it a few paths past a bound before they notice.
 func (c *pathCache) full() bool {
-	return c.sealed.Load() && c.spillLen.Load() >= maxSpillPaths
+	return c.bytes.Load() >= maxPathCacheBytes || (c.sealed.Load() && c.spillLen.Load() >= maxSpillPaths)
 }
 
 func (c *pathCache) load(key string) ([]pathPart, bool) {
@@ -359,8 +385,9 @@ func (c *pathCache) load(key string) ([]pathPart, bool) {
 }
 
 // loadOrStore caches parts under key, or returns what a concurrent call
-// cached there first.
-func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool) {
+// cached there first. cost is what the entry weighs, charged against
+// maxPathCacheBytes when it is kept.
+func (c *pathCache) loadOrStore(key string, parts []pathPart, cost int) ([]pathPart, bool) {
 	if !c.sealed.Load() {
 		c.mu.Lock()
 		old := c.fast.Load()
@@ -380,6 +407,7 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 			}
 			next[key] = parts
 			c.fast.Store(&next)
+			c.bytes.Add(int64(cost))
 			c.mu.Unlock()
 			return parts, false
 		}
@@ -389,6 +417,7 @@ func (c *pathCache) loadOrStore(key string, parts []pathPart) ([]pathPart, bool)
 	v, loaded := c.spill.LoadOrStore(key, parts)
 	if !loaded {
 		c.spillLen.Add(1)
+		c.bytes.Add(int64(cost))
 	}
 	return v.([]pathPart), loaded
 }
@@ -402,6 +431,7 @@ func (c *pathCache) clear() {
 		c.spillLen.Store(0)
 		c.sealed.Store(false)
 	}
+	c.bytes.Store(0)
 	c.mu.Unlock()
 }
 
