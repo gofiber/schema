@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -6349,6 +6350,136 @@ func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
 	}
 	if !old[0] || !old[1] {
 		t.Fatalf("the old backing array was written to: %v", old[:2])
+	}
+}
+
+// bigUnmarshaler is large enough that a slice of them sized by the number of
+// values a client sends would be a way to make the server reserve memory. Only
+// an element type with a converter of its own can be this large: the others
+// are builtin kinds. The tests register a converter that is never called, as
+// the unmarshaler is used instead.
+type bigUnmarshaler [64 << 10]byte
+
+func (b *bigUnmarshaler) UnmarshalText(text []byte) error {
+	if string(text) == "bad" {
+		return errors.New("bad")
+	}
+	b[0] = text[0]
+	return nil
+}
+
+// A slice of unmarshalers claims memory for the values that are accepted, not
+// for the values that are sent: a request of empty values, or one whose first
+// value fails, must not reserve a slot apiece (2048 of them are 128 MiB here).
+// It reads the allocator's totals, so it does not run in parallel with the
+// tests that allocate.
+func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
+	type S struct {
+		Big []bigUnmarshaler `schema:"big"`
+	}
+	const n = 2048
+	empty := make([]string, n)
+	invalid := make([]string, n)
+	for i := range invalid {
+		invalid[i] = "bad"
+	}
+	d := NewDecoder()
+	d.RegisterConverter(bigUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+	for _, tc := range []struct {
+		name    string
+		values  []string
+		wantErr bool
+	}{
+		{"empty values", empty, false},
+		{"first value fails", invalid, true},
+	} {
+		src := map[string][]string{"big": tc.values}
+		var s S
+		var err error
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		err = d.Decode(&s, src)
+		runtime.ReadMemStats(&after)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, want an error: %v", tc.name, err, tc.wantErr)
+		}
+		if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+			t.Errorf("%s: %d values allocated %d bytes, want well under a megabyte", tc.name, n, got)
+		}
+		if err == nil && (s.Big == nil || len(s.Big) != 0) {
+			t.Errorf("%s: Big = %v, want an empty non-nil slice", tc.name, s.Big)
+		}
+	}
+}
+
+// chunkUnmarshaler is 1 KiB, so the first slice holds four and a longer list
+// has to grow it, by doubling and never past the number of values.
+type chunkUnmarshaler [1 << 10]byte
+
+func (c *chunkUnmarshaler) UnmarshalText(text []byte) error {
+	c[0] = text[0]
+	return nil
+}
+
+// Growing the slice keeps the values already unmarshaled in order, skips or
+// zeroes the empty ones, and ends at the number of values that were kept.
+func TestDecodeUnmarshalerSliceGrows(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		C []chunkUnmarshaler `schema:"c"`
+	}
+	for _, tc := range []struct {
+		name      string
+		zeroEmpty bool
+		in        []string
+		want      string
+	}{
+		{"within the first slice", false, []string{"a", "b"}, "ab"},
+		{"exactly the first slice", false, []string{"a", "b", "c", "d"}, "abcd"},
+		{"past the first slice", false, []string{"a", "b", "c", "d", "e"}, "abcde"},
+		{"past two doublings", false, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}, "abcdefghi"},
+		{"empty values skipped", false, []string{"a", "", "b", "", "", "c", "d", "e", "f", "g"}, "abcdefg"},
+		{"empty values kept", true, []string{"a", "", "b", "c", "d", "", "e"}, "a\x00bcd\x00e"},
+		{"only the empty value", true, []string{""}, "\x00"},
+	} {
+		d := NewDecoder()
+		d.RegisterConverter(chunkUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+		d.ZeroEmpty(tc.zeroEmpty)
+		var s S
+		if err := d.Decode(&s, map[string][]string{"c": tc.in}); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		got := make([]byte, len(s.C))
+		for i := range s.C {
+			got[i] = s.C[i][0]
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: first bytes = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// nothing has no size, so a slice of it costs no memory however many values
+// there are, and its first slice is as long as the list.
+type nothing [0]byte
+
+func (*nothing) UnmarshalText([]byte) error { return nil }
+
+func TestDecodeUnmarshalerSliceZeroSizeElements(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		N []nothing `schema:"n"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(nothing{}, func(string) reflect.Value { return reflect.Value{} })
+	if err := d.Decode(&s, map[string][]string{"n": {"x", "", "y", "z"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.N) != 3 {
+		t.Errorf("N = %v, want 3 elements", s.N)
 	}
 }
 

@@ -1116,6 +1116,12 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 	return append(items, item)
 }
 
+// unmarshalerSliceBudget is how many bytes of elements decodeUnmarshalerSlice
+// reserves for its first slice. The client chooses how many values to send and
+// the type chooses how large an element is, so the slice is not sized by the
+// first alone: it starts here and doubles as values are accepted.
+const unmarshalerSliceBudget = 4 << 10
+
 // decodeUnmarshalerSlice decodes values into the slice field v of type t,
 // whose elements are not pointers and implement encoding.TextUnmarshaler
 // through their address, by unmarshaling each straight into its slot of the
@@ -1123,32 +1129,63 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 // per element and copy it over, which costs an allocation apiece. As there,
 // the slice is built detached and only assigned to v when every value
 // unmarshaled, and an empty value is skipped unless ZeroEmpty is set.
+//
+// Nothing is allocated until a value needs a slot, so a request of empty values
+// or of a first value that fails claims next to nothing, as it does in
+// decodeBoxedSlice, and what a request does claim stays proportional to the
+// values it gets accepted (see growUnmarshalerSlice).
 func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
-	sl := reflect.MakeSlice(t, len(values), len(values))
-	i := 0
+	var sl reflect.Value // the zero Value until a value needs a slot
+	room, i := 0, 0      // slots sl has, and slots used
 	for key, value := range values {
-		if value == "" {
-			if d.zeroEmpty {
-				i++ // slot stays zero
-			}
+		if value == "" && !d.zeroEmpty {
 			continue
 		}
-		um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](sl.Index(i).Addr())
-		if err := um.UnmarshalText([]byte(value)); err != nil {
-			return ConversionError{
-				Key:   path,
-				Type:  t,
-				Index: key,
-				Err:   err,
+		if i == room {
+			sl = growUnmarshalerSlice(sl, t, len(values))
+			room = sl.Len()
+		}
+		if value != "" { // an empty value kept for ZeroEmpty leaves its slot zero
+			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](sl.Index(i).Addr())
+			if err := um.UnmarshalText([]byte(value)); err != nil {
+				return ConversionError{
+					Key:   path,
+					Type:  t,
+					Index: key,
+					Err:   err,
+				}
 			}
 		}
 		i++
 	}
-	if i < len(values) {
+	if room == 0 {
+		sl = reflect.MakeSlice(t, 0, 0)
+	} else if i < room {
 		sl = sl.Slice(0, i)
 	}
 	v.Set(sl)
 	return nil
+}
+
+// growUnmarshalerSlice returns a slice of type t with room for more elements
+// than sl, which is full, and holding the ones it holds: a first slice of at
+// most unmarshalerSliceBudget bytes if sl is the zero Value, otherwise twice as
+// long as sl. It is never longer than limit, the most that could be needed.
+func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
+	var n int
+	if sl.IsValid() {
+		n = 2 * sl.Len()
+	} else if size := int(t.Elem().Size()); size == 0 {
+		n = limit
+	} else {
+		n = max(1, unmarshalerSliceBudget/size)
+	}
+	n = min(n, limit)
+	grown := reflect.MakeSlice(t, n, n)
+	if sl.IsValid() {
+		reflect.Copy(grown, sl)
+	}
+	return grown
 }
 
 // decodeBuiltinSlice decodes values into the slice field v of type t whose
