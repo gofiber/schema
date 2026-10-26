@@ -155,6 +155,26 @@ func TestFoldASCIILower(t *testing.T) {
 	}
 }
 
+// hasASCIIUpper decides whether the required check folds a key, so it has to
+// agree with the folder at every length: a key has an uppercase letter
+// exactly when folding changes it.
+func TestHasASCIIUpper(t *testing.T) {
+	t.Parallel()
+
+	for n := 0; n <= maxDirectKeyLen; n++ {
+		for off := range 256 {
+			in := make([]byte, n)
+			for i := range in {
+				in[i] = byte((off + i*7) % 256)
+			}
+			src := string(in)
+			if got, want := hasASCIIUpper(src), utilstrings.ToLower(src) != src; got != want {
+				t.Fatalf("hasASCIIUpper(%q) = %v, want %v", src, got, want)
+			}
+		}
+	}
+}
+
 // A mixed-case path the direct map cannot answer walks the generic parser,
 // which folds every segment before its field lookup; that must not allocate.
 func BenchmarkParsePathCacheMissMixedCase(b *testing.B) {

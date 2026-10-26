@@ -30,13 +30,14 @@ type source struct {
 }
 
 // lookup returns the values of key as far as the required-key and default
-// checks read them, which is whether there are any and what the first one is:
-// all of them from a map, and the first alone from pairs, which saves
-// gathering them. It reports whether src has the key.
+// checks read them, which is whether there are any and what the last one is,
+// the one a scalar field decodes: all of them from a map, and the last alone
+// from pairs, which saves gathering them. It reports whether src has the key.
 func (src *source) lookup(key string) ([]string, bool) {
 	if src.pairs != nil {
 		if i := src.pairs.find(key); i >= 0 {
-			return src.pairs.values[i : i+1 : i+1], true
+			l := src.pairs.last[i]
+			return src.pairs.values[l : l+1 : l+1], true
 		}
 		return nil, false
 	}

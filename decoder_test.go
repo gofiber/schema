@@ -2782,6 +2782,155 @@ func TestDefaultValuesAreIgnoredIfValuesAreProvided(t *testing.T) {
 	}
 }
 
+// The required check matches keys the way the decoder does: case-insensitively,
+// and judging the last of several values, the one a scalar field decodes. Each
+// row runs through Decode and DecodeValues.
+func TestRequiredMatchesDecoding(t *testing.T) {
+	t.Parallel()
+
+	type phone struct {
+		Number string `schema:"number"`
+	}
+	type form struct {
+		X     string `schema:"x,required"`
+		Phone phone  `schema:"phone,required"`
+	}
+	type pair struct{ key, value string }
+
+	tests := []struct {
+		name    string
+		pairs   []pair
+		want    form
+		missing string // the error, "" for none
+	}{
+		{
+			name:  "field key in another case",
+			pairs: []pair{{"X", "v"}, {"phone.number", "1"}},
+			want:  form{X: "v", Phone: phone{Number: "1"}},
+		},
+		{
+			name:  "nested key in another case",
+			pairs: []pair{{"x", "v"}, {"PHONE.number", "1"}},
+			want:  form{X: "v", Phone: phone{Number: "1"}},
+		},
+		{
+			name:  "nested key in mixed case throughout",
+			pairs: []pair{{"x", "v"}, {"Phone.Number", "1"}},
+			want:  form{X: "v", Phone: phone{Number: "1"}},
+		},
+		{
+			name:    "field key in another case with an empty value",
+			pairs:   []pair{{"X", ""}, {"phone.number", "1"}},
+			want:    form{Phone: phone{Number: "1"}},
+			missing: "x is empty",
+		},
+		{
+			name:  "repeated value, last one set",
+			pairs: []pair{{"x", ""}, {"x", "set"}, {"phone.number", "1"}},
+			want:  form{X: "set", Phone: phone{Number: "1"}},
+		},
+		{
+			name:    "repeated value, last one empty",
+			pairs:   []pair{{"x", "set"}, {"x", ""}, {"phone.number", "1"}},
+			want:    form{Phone: phone{Number: "1"}},
+			missing: "x is empty",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := map[string][]string{}
+			keys := make([]string, 0, len(tc.pairs))
+			values := make([]string, 0, len(tc.pairs))
+			for _, p := range tc.pairs {
+				src[p.key] = append(src[p.key], p.value)
+				keys = append(keys, p.key)
+				values = append(values, p.value)
+			}
+
+			check := func(t *testing.T, got form, err error) {
+				t.Helper()
+				switch {
+				case tc.missing == "" && err != nil:
+					t.Fatalf("unexpected error: %v", err)
+				case tc.missing != "" && (err == nil || err.Error() != tc.missing):
+					t.Fatalf("got error %v, want %q", err, tc.missing)
+				}
+				if got != tc.want {
+					t.Fatalf("decoded %+v, want %+v", got, tc.want)
+				}
+			}
+
+			t.Run("Decode", func(t *testing.T) {
+				t.Parallel()
+				var got form
+				err := NewDecoder().Decode(&got, src)
+				check(t, got, err)
+			})
+			t.Run("DecodeValues", func(t *testing.T) {
+				t.Parallel()
+				var got form
+				err := NewDecoder().DecodeValues(&got, keys, values)
+				check(t, got, err)
+			})
+		})
+	}
+}
+
+// Without a name in the tag the alias is the Go field name, so the index the
+// required check folds keys into has to be lowercase too.
+func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
+	t.Parallel()
+
+	type address struct {
+		City string
+	}
+	type form struct {
+		Name    string  `schema:",required"`
+		Address address `schema:",required"`
+	}
+	want := form{Name: "Ada", Address: address{City: "London"}}
+	keys := []string{"name", "address.city"}
+	values := []string{"Ada", "London"}
+
+	var got form
+	if err := NewDecoder().Decode(&got, map[string][]string{"name": {"Ada"}, "address.city": {"London"}}); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got != want {
+		t.Fatalf("Decode: got %+v, want %+v", got, want)
+	}
+	got = form{}
+	if err := NewDecoder().DecodeValues(&got, keys, values); err != nil {
+		t.Fatalf("DecodeValues: %v", err)
+	}
+	if got != want {
+		t.Fatalf("DecodeValues: got %+v, want %+v", got, want)
+	}
+}
+
+// A required key too long for the stack buffer is folded on the heap.
+func TestRequiredLongKeyMatchesAnyCase(t *testing.T) {
+	t.Parallel()
+
+	const long = "averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure"
+	if len(long) <= maxDirectKeyLen {
+		t.Fatalf("alias is %d bytes, must exceed %d for this test", len(long), maxDirectKeyLen)
+	}
+	type S struct {
+		V string `schema:"averyveryverylongfieldaliasthatexceedssixtyfourbytesinlengthforsure,required"`
+	}
+	var s S
+	if err := NewDecoder().Decode(&s, map[string][]string{strings.ToUpper(long): {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if s.V != "x" {
+		t.Fatalf("got %q, want %q", s.V, "x")
+	}
+}
+
 func TestRequiredFieldsCannotHaveDefaults(t *testing.T) {
 	type D struct {
 		S string  `schema:"s,required,default:test1"`
@@ -3860,8 +4009,9 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 }
 
 // referenceCheckRequired is the pre-rewrite required-field check: a linear
-// scan of the whole source map per group and field path. The bitset and
-// prefix index that replaced it must agree with it on every input.
+// scan of the whole source map per group and field path, with keys compared
+// case-insensitively as the decoder compares them. The bitset and prefix
+// index that replaced it must agree with it on every input.
 func referenceCheckRequired(info *structInfo, src map[string][]string) map[string]bool {
 	missing := map[string]bool{}
 	for _, group := range info.requiredGroups {
@@ -3869,16 +4019,16 @@ func referenceCheckRequired(info *structInfo, src map[string][]string) map[strin
 	scan:
 		for _, f := range group.fields {
 			for i, path := range f.searchPaths {
-				if v, ok := src[path]; ok && !isEmpty(f.typ, v) {
-					empty = false
-					break scan
-				}
 				pathDot := f.searchPathDots[i]
 				for key, val := range src {
+					if strings.EqualFold(key, path) && !isEmpty(f.typ, val) {
+						empty = false
+						break scan
+					}
 					if len(val) == 0 {
 						continue
 					}
-					if strings.HasPrefix(key, pathDot) && !isEmpty(f.typ, val) {
+					if len(key) >= len(pathDot) && strings.EqualFold(key[:len(pathDot)], pathDot) && !isEmpty(f.typ, val) {
 						empty = false
 						break scan
 					}
@@ -3929,8 +4079,10 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 		"mid", "mid.m", "mid.l", "mid.l.x", "mid.l.y",
 		"one", "one.m", "one.l.x", "two.m", "two.l.x",
 		"ab", "midx", "l.", "one.l", "unrelated", "a.b.c",
+		// the same keys in other cases, which the decoder resolves too
+		"A", "B", "Free", "X", "M", "L.X", "MID", "Mid.M", "MID.L.X", "One.L.x", "TWO.m",
 	}
-	values := [][]string{nil, {}, {""}, {"v"}, {"", "v"}}
+	values := [][]string{nil, {}, {""}, {"v"}, {"", "v"}, {"v", ""}}
 
 	d := NewDecoder()
 	r := rand.New(rand.NewPCG(11, 13))

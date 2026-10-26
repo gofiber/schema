@@ -337,6 +337,22 @@ func (c *pathCache) clear() {
 	c.mu.Unlock()
 }
 
+// hasASCIIUpper reports whether s has an ASCII uppercase letter.
+func hasASCIIUpper(s string) bool {
+	i := 0
+	for ; i+swar.WordLen <= len(s); i += swar.WordLen {
+		if swar.MatchRangeMask(swar.Load8(s, i), 'A', 'Z') != 0 {
+			return true
+		}
+	}
+	for ; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
 // foldASCIILower writes the ASCII-lowercased form of s into buf and reports
 // whether any byte changed. Folding into a caller-owned stack buffer lets the
 // case-insensitive map probes below skip the allocation utilstrings.ToLower
@@ -508,6 +524,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
 	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
+	info.foldedRequiredPaths, info.foldedRequiredPrefixes, info.requiredMixedCase = buildFoldedRequiredIndex(info.requiredGroups)
 	info.direct = c.buildDirectPaths(info)
 	info.directIndex = newFoldIndex(info.direct)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
@@ -781,6 +798,14 @@ type structInfo struct {
 	// a nested-key prefix to the groups a key under it can satisfy.
 	requiredGroups   []requiredGroup
 	requiredPrefixes map[string][]requiredPrefix
+	// foldedRequiredPaths and foldedRequiredPrefixes index the groups by the
+	// lowercased paths and nested-key prefixes that can satisfy them, for
+	// the keys that arrive in another case; requiredMixedCase reports
+	// whether any of those paths was not lowercase, as an untagged field's
+	// is, so that a lowercase key can match only through them.
+	foldedRequiredPaths    map[string][]requiredPrefix
+	foldedRequiredPrefixes map[string][]requiredPrefix
+	requiredMixedCase      bool
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
@@ -890,6 +915,50 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 		}
 	}
 	return prefixes
+}
+
+// buildFoldedRequiredIndex indexes the groups by the lowercased paths that
+// can satisfy them directly ("d" for required key "d") and by the lowercased
+// nested-key prefixes that can satisfy them ("d."), and reports whether any
+// path was not lowercase already.
+func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[string][]requiredPrefix, mixedCase bool) {
+	if len(groups) == 0 {
+		return nil, nil, false
+	}
+	paths = make(map[string][]requiredPrefix)
+	prefixes = make(map[string][]requiredPrefix)
+	for gi := range groups {
+		for _, f := range groups[gi].fields {
+			for _, path := range f.searchPaths {
+				lower := utilstrings.ToLower(path)
+				mixedCase = mixedCase || lower != path
+				addRequiredOwner(paths, lower, gi, f.typ)
+			}
+			typ := f.typ
+			if f.mapValue != nil {
+				// As in buildRequiredPrefixes: a key under a map field
+				// gives one entry.
+				typ = typ.Elem()
+			}
+			for _, dot := range f.searchPathDots {
+				addRequiredOwner(prefixes, utilstrings.ToLower(dot), gi, typ)
+			}
+		}
+	}
+	return paths, prefixes, mixedCase
+}
+
+// addRequiredOwner records that a key can satisfy group gi with a value typ
+// judges non-empty, once per (group, type): several fields of a group can
+// reach the same key.
+func addRequiredOwner(index map[string][]requiredPrefix, key string, gi int, typ reflect.Type) {
+	owners := index[key]
+	for _, o := range owners {
+		if o.group == gi && o.typ == typ {
+			return
+		}
+	}
+	index[key] = append(owners, requiredPrefix{group: gi, typ: typ})
 }
 
 func containsAlias(infos []*structInfo, alias string) bool {

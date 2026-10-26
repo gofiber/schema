@@ -224,6 +224,9 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, values, errs, pending)
 		}
 	}
+	if pending > 0 {
+		pending = markProvidedFolded(rootInfo, src, satisfied, pending)
+	}
 	if rootInfo.needsDefaultsWalk {
 		errs = mergeErrors(errs, d.setDefaults(t, v, src, ""))
 	}
@@ -456,11 +459,13 @@ func keyProvided(src *source, prefix, name string) bool {
 // follows only performs the per-request emptiness checks against src.
 //
 // A group is satisfied by a value under one of its own paths, or by any
-// nested key below one of them ("d.e" satisfies required "d"). Direct paths
-// are looked up first, since they settle almost every group; what is left is
-// answered by walking the dotted prefixes of each source key. Decode runs
-// those three steps around its own loop over src; checkRequired composes them
-// for a standalone check.
+// nested key below one of them ("d.e" satisfies required "d"), with keys
+// matched case-insensitively as the decoder matches them. Direct paths are
+// looked up first, since they settle almost every group; what is left is
+// answered by walking the dotted prefixes of each source key, and what is
+// still left after that by the keys in another case. Decode runs those steps
+// around its own loop over src; checkRequired composes them for a standalone
+// check.
 
 // requiredBitWords sizes the inline satisfied-group bitset: 256 required
 // keys, past which it is allocated.
@@ -512,6 +517,83 @@ func markProvidedByNestedKey(info *structInfo, key string, off int, val []string
 	}
 }
 
+// markProvidedFolded settles what the exact lookups left pending by matching
+// src's keys case-insensitively, as the decoder resolves its fields, and
+// returns the new pending count. It runs once, after the decode loop, so a
+// request that matches its fields' case pays nothing for it.
+func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pending int) int {
+	if p := src.pairs; p != nil {
+		var scratch [8]string
+		for i, key := range p.keys {
+			if !p.first(i) || !mayMatchFolded(info, key) {
+				continue
+			}
+			if pending = markProvidedByFoldedKey(info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
+				break
+			}
+		}
+		return pending
+	}
+	for key, val := range src.m {
+		if len(val) == 0 || !mayMatchFolded(info, key) {
+			continue
+		}
+		if pending = markProvidedByFoldedKey(info, key, val, satisfied, pending); pending == 0 {
+			break
+		}
+	}
+	return pending
+}
+
+// mayMatchFolded reports whether key can match a required path its exact
+// lookup missed: only a key with an uppercase letter folds to another key,
+// unless a path has one itself.
+func mayMatchFolded(info *structInfo, key string) bool {
+	return info.requiredMixedCase || hasASCIIUpper(key)
+}
+
+// markProvidedByFoldedKey lowercases key, in a stack buffer when it fits,
+// and marks every required group it names as a path of its own or through
+// its dotted prefixes that val is non-empty for. It returns the new pending
+// count.
+func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
+	var buf [maxDirectKeyLen]byte
+	var folded []byte
+	if len(key) <= maxDirectKeyLen {
+		folded = buf[:len(key)]
+	} else {
+		folded = make([]byte, len(key))
+	}
+	foldASCIILower(folded, key)
+	// The buffer outlives every lookup made through it, and nothing keeps it.
+	lower := unsafe.String(unsafe.SliceData(folded), len(folded))
+	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
+	for off := 0; pending > 0; {
+		i := strings.IndexByte(lower[off:], '.')
+		if i < 0 {
+			break
+		}
+		off += i + 1
+		pending = markProvided(info.foldedRequiredPrefixes[lower[:off]], val, satisfied, pending)
+	}
+	return pending
+}
+
+// markProvided marks the groups of owners that val is non-empty for and
+// returns the new pending count.
+func markProvided(owners []requiredPrefix, val []string, satisfied []uint64, pending int) int {
+	for _, p := range owners {
+		if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
+			continue
+		}
+		if !isEmpty(p.typ, val) {
+			satisfied[p.group>>6] |= 1 << uint(p.group&63)
+			pending--
+		}
+	}
+	return pending
+}
+
 // missingRequired reports the required keys nothing in src answered.
 func missingRequired(groups []requiredGroup, satisfied []uint64, pending int) MultiError {
 	if pending == 0 {
@@ -542,6 +624,9 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 				break
 			}
 		}
+	}
+	if pending > 0 {
+		pending = markProvidedFolded(info, &s, satisfied, pending)
 	}
 	return missingRequired(info.requiredGroups, satisfied, pending)
 }
@@ -598,7 +683,8 @@ func directlyProvided(fields []fieldWithPrefix, src *source) bool {
 	return false
 }
 
-// isEmpty returns true if value is empty for specific type
+// isEmpty returns true if value is empty for specific type. A scalar field
+// decodes the last of several values, so that is the one judged.
 func isEmpty(t reflect.Type, value []string) bool {
 	if len(value) == 0 {
 		return true
@@ -608,7 +694,7 @@ func isEmpty(t reflect.Type, value []string) bool {
 		intType, int8Type, int16Type, int32Type, int64Type,
 		stringType,
 		uintType, uint8Type, uint16Type, uint32Type, uint64Type:
-		return len(value[0]) == 0
+		return len(value[len(value)-1]) == 0
 	}
 	return false
 }
