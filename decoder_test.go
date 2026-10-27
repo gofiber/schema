@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -2879,6 +2880,72 @@ func TestRequiredMatchesDecoding(t *testing.T) {
 	}
 }
 
+// The decoder ignores the bare key of an entry-by-entry map field or a slice
+// of structs, which need a key or an element index after them, so that key
+// cannot satisfy them as required either, in any case.
+func TestRequiredBareKeyNeedsADecodablePath(t *testing.T) {
+	t.Parallel()
+
+	type item struct {
+		X string `schema:"x"`
+	}
+	type form struct {
+		M     map[string]string `schema:"M,required"`
+		Items []item            `schema:"items,required"`
+	}
+
+	tests := []struct {
+		name    string
+		keys    []string
+		missing string
+	}{
+		{name: "bare keys", keys: []string{"M", "items"}, missing: "M is empty; items is empty"},
+		{name: "bare keys in another case", keys: []string{"m", "ITEMS"}, missing: "M is empty; items is empty"},
+		{name: "nested keys", keys: []string{"M.k", "items.0.x"}},
+		{name: "nested keys in another case", keys: []string{"m.k", "ITEMS.0.X"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := map[string][]string{}
+			values := make([]string, len(tc.keys))
+			for i, k := range tc.keys {
+				src[k] = []string{"v"}
+				values[i] = "v"
+			}
+			check := func(t *testing.T, err error) {
+				t.Helper()
+				if tc.missing == "" {
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					return
+				}
+				var errs MultiError
+				if !errors.As(err, &errs) {
+					t.Fatalf("got %v, want missing %q", err, tc.missing)
+				}
+				got := make([]string, 0, len(errs))
+				for k := range errs {
+					got = append(got, k+" is empty")
+				}
+				slices.Sort(got)
+				if strings.Join(got, "; ") != tc.missing {
+					t.Fatalf("got missing %v, want %q", got, tc.missing)
+				}
+			}
+
+			d := NewDecoder()
+			d.IgnoreUnknownKeys(true)
+			var got form
+			check(t, d.Decode(&got, src))
+			got = form{}
+			check(t, d.DecodeValues(&got, tc.keys, values))
+		})
+	}
+}
+
 // Without a name in the tag the alias is the Go field name, so the index the
 // required check folds keys into has to be lowercase too.
 func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
@@ -4018,16 +4085,17 @@ func referenceCheckRequired(info *structInfo, src map[string][]string) map[strin
 		empty := true
 	scan:
 		for _, f := range group.fields {
-			for i, path := range f.searchPaths {
-				pathDot := f.searchPathDots[i]
-				for key, val := range src {
+			for key, val := range src {
+				for _, path := range f.searchPaths {
 					if strings.EqualFold(key, path) && !isEmpty(f.typ, val) {
 						empty = false
 						break scan
 					}
-					if len(val) == 0 {
-						continue
-					}
+				}
+				if len(val) == 0 {
+					continue
+				}
+				for _, pathDot := range f.searchPathDots {
 					if len(key) >= len(pathDot) && strings.EqualFold(key[:len(pathDot)], pathDot) && !isEmpty(f.typ, val) {
 						empty = false
 						break scan

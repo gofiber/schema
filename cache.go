@@ -337,22 +337,6 @@ func (c *pathCache) clear() {
 	c.mu.Unlock()
 }
 
-// hasASCIIUpper reports whether s has an ASCII uppercase letter.
-func hasASCIIUpper(s string) bool {
-	i := 0
-	for ; i+swar.WordLen <= len(s); i += swar.WordLen {
-		if swar.MatchRangeMask(swar.Load8(s, i), 'A', 'Z') != 0 {
-			return true
-		}
-	}
-	for ; i < len(s); i++ {
-		if c := s[i]; c >= 'A' && c <= 'Z' {
-			return true
-		}
-	}
-	return false
-}
-
 // foldASCIILower writes the ASCII-lowercased form of s into buf and reports
 // whether any byte changed. Folding into a caller-owned stack buffer lets the
 // case-insensitive map probes below skip the allocation utilstrings.ToLower
@@ -585,11 +569,18 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 
 // directEligible reports whether f can serve as a direct-path terminal: it is
 // its alias's first-wins winner, the alias has no dot, and a bare alias is a
-// valid path (slice-of-structs fields require a following slice index).
+// valid path.
 func directEligible(info *structInfo, f *fieldInfo) bool {
 	if info.fieldsByName[f.aliasLower] != f || strings.IndexByte(f.aliasLower, '.') >= 0 {
 		return false
 	}
+	return f.endsPath()
+}
+
+// endsPath reports whether a path may end at f: a slice of structs needs an
+// element index after it, and an entry-by-entry map field a key, so parsePath
+// rejects a path that stops at either.
+func (f *fieldInfo) endsPath() bool {
 	return !f.takesIndex() && f.mapValue == nil
 }
 
@@ -801,8 +792,9 @@ type structInfo struct {
 	// foldedRequiredPaths and foldedRequiredPrefixes index the groups by the
 	// lowercased paths and nested-key prefixes that can satisfy them, for
 	// the keys that arrive in another case; requiredMixedCase reports
-	// whether any of those paths was not lowercase, as an untagged field's
-	// is, so that a lowercase key can match only through them.
+	// whether any of those paths or prefixes was not lowercase, as an
+	// untagged field's is, so that a lowercase key can match only through
+	// them.
 	foldedRequiredPaths    map[string][]requiredPrefix
 	foldedRequiredPrefixes map[string][]requiredPrefix
 	requiredMixedCase      bool
@@ -920,7 +912,7 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 // buildFoldedRequiredIndex indexes the groups by the lowercased paths that
 // can satisfy them directly ("d" for required key "d") and by the lowercased
 // nested-key prefixes that can satisfy them ("d."), and reports whether any
-// path was not lowercase already.
+// path or prefix was not lowercase already.
 func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[string][]requiredPrefix, mixedCase bool) {
 	if len(groups) == 0 {
 		return nil, nil, false
@@ -941,7 +933,9 @@ func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[strin
 				typ = typ.Elem()
 			}
 			for _, dot := range f.searchPathDots {
-				addRequiredOwner(prefixes, utilstrings.ToLower(dot), gi, typ)
+				lower := utilstrings.ToLower(dot)
+				mixedCase = mixedCase || lower != dot
+				addRequiredOwner(prefixes, lower, gi, typ)
 			}
 		}
 	}

@@ -525,7 +525,7 @@ func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pendi
 	if p := src.pairs; p != nil {
 		var scratch [8]string
 		for i, key := range p.keys {
-			if !p.first(i) || !mayMatchFolded(info, key) {
+			if !p.first(i) {
 				continue
 			}
 			if pending = markProvidedByFoldedKey(info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
@@ -535,7 +535,7 @@ func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pendi
 		return pending
 	}
 	for key, val := range src.m {
-		if len(val) == 0 || !mayMatchFolded(info, key) {
+		if len(val) == 0 {
 			continue
 		}
 		if pending = markProvidedByFoldedKey(info, key, val, satisfied, pending); pending == 0 {
@@ -545,17 +545,11 @@ func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pendi
 	return pending
 }
 
-// mayMatchFolded reports whether key can match a required path its exact
-// lookup missed: only a key with an uppercase letter folds to another key,
-// unless a path has one itself.
-func mayMatchFolded(info *structInfo, key string) bool {
-	return info.requiredMixedCase || hasASCIIUpper(key)
-}
-
 // markProvidedByFoldedKey lowercases key, in a stack buffer when it fits,
 // and marks every required group it names as a path of its own or through
 // its dotted prefixes that val is non-empty for. It returns the new pending
-// count.
+// count. A key that was lowercase already was looked up exactly, so it is
+// skipped unless a required path has an uppercase letter itself.
 func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
 	var buf [maxDirectKeyLen]byte
 	var folded []byte
@@ -564,9 +558,11 @@ func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfi
 	} else {
 		folded = make([]byte, len(key))
 	}
-	foldASCIILower(folded, key)
+	if !foldASCIILower(folded, key) && !info.requiredMixedCase {
+		return pending
+	}
 	// The buffer outlives every lookup made through it, and nothing keeps it.
-	lower := unsafe.String(unsafe.SliceData(folded), len(folded))
+	lower := utils.UnsafeString(folded)
 	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
 	for off := 0; pending > 0; {
 		i := strings.IndexByte(lower[off:], '.')
@@ -580,7 +576,9 @@ func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfi
 }
 
 // markProvided marks the groups of owners that val is non-empty for and
-// returns the new pending count.
+// returns the new pending count. satisfied is a bitset over the required
+// groups, one bit per group index: group g is bit g&63 of word g>>6. A group
+// already marked is skipped, so pending only counts each group once.
 func markProvided(owners []requiredPrefix, val []string, satisfied []uint64, pending int) int {
 	for _, p := range owners {
 		if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
@@ -649,9 +647,10 @@ type fieldWithPrefix struct {
 	*fieldInfo
 	prefix string
 	// searchPaths lists the src keys this required field answers to, and
-	// searchPathDots the corresponding nested-key prefixes; both are
-	// precomputed at cache-build time so per-request checks allocate
-	// nothing.
+	// searchPathDots the nested-key prefixes; both are precomputed at
+	// cache-build time so per-request checks allocate nothing. A field no
+	// path may end at has no searchPaths: the decoder ignores its bare key,
+	// so only a nested key can satisfy it.
 	searchPaths    []string
 	searchPathDots []string
 }
@@ -661,6 +660,9 @@ func newFieldWithPrefix(f *fieldInfo, prefix string) fieldWithPrefix {
 	dots := make([]string, len(paths))
 	for i, p := range paths {
 		dots[i] = p + "."
+	}
+	if !f.endsPath() {
+		paths = nil
 	}
 	return fieldWithPrefix{
 		fieldInfo:      f,
