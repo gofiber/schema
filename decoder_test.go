@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"mime/multipart"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -5836,6 +5837,666 @@ func BenchmarkMapFieldDecode(b *testing.B) {
 		var f Filter
 		if err := decoder.Decode(&f, data); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
+	type S struct {
+		Flags []rudeBool `schema:"flags"`
+	}
+	data := map[string][]string{"flags": {"Yup", "Nope", "Yup", "Yup", "Nope", "Yup"}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Keys that name no field, with and without a separator, under IgnoreUnknownKeys.
+func BenchmarkUnknownKeysDecode(b *testing.B) {
+	type S struct {
+		Name string `schema:"name"`
+		Age  int    `schema:"age"`
+	}
+	data := map[string][]string{
+		"name":       {"n"},
+		"age":        {"3"},
+		"utm.source": {"x"},
+		"filter.a.b": {"y"},
+		"trace":      {"z"},
+	}
+	decoder := NewDecoder()
+	decoder.IgnoreUnknownKeys(true)
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMapFieldManyEntriesDecode(b *testing.B) {
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	data := make(map[string][]string, 16)
+	for i := range 16 {
+		data["attributes.key"+strconv.Itoa(i)] = []string{"value" + strconv.Itoa(i)}
+	}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Comma separated lists, as in ?ids=1,2,3.
+func BenchmarkCommaListDecode(b *testing.B) {
+	type S struct {
+		IDs  []int     `schema:"ids"`
+		Tags []string  `schema:"tags"`
+		Fs   []float64 `schema:"fs"`
+	}
+	ids := make([]string, 48)
+	fs := make([]string, 24)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i * 7)
+	}
+	for i := range fs {
+		fs[i] = strconv.Itoa(i) + ".5"
+	}
+	data := map[string][]string{
+		"ids":  {strings.Join(ids, ",")},
+		"tags": {"a,b,c,d,e,f,g,h"},
+		"fs":   {strings.Join(fs, ",")},
+	}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Comma separated lists into element types the native slice path does not cover.
+func BenchmarkCommaListNamedDecode(b *testing.B) {
+	type S struct {
+		A []int32  `schema:"a"`
+		B []uint16 `schema:"b"`
+	}
+	a := make([]string, 40)
+	for i := range a {
+		a[i] = strconv.Itoa(i * 11)
+	}
+	data := map[string][]string{"a": {strings.Join(a, ",")}, "b": {strings.Join(a[:20], ",")}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// The same struct decoded with and without an unrelated converter registered.
+func benchConverterLookup(b *testing.B, register bool) {
+	type Inner struct {
+		V string `schema:"v"`
+	}
+	type S struct {
+		A *int     `schema:"a"`
+		B *string  `schema:"b"`
+		C []string `schema:"c"`
+		D []int    `schema:"d"`
+		E Inner    `schema:"e"`
+		F *bool    `schema:"f"`
+	}
+	data := map[string][]string{
+		"a": {"1"}, "b": {"x"}, "c": {"p", "q"}, "d": {"1", "2"}, "e.v": {"z"}, "f": {"true"},
+	}
+	decoder := NewDecoder()
+	if register {
+		decoder.RegisterConverter(struct{ unrelated int }{}, func(string) reflect.Value { return reflect.Value{} })
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkConverterLookupNone(b *testing.B)       { benchConverterLookup(b, false) }
+func BenchmarkConverterLookupRegistered(b *testing.B) { benchConverterLookup(b, true) }
+
+// A map field promoted from an embedded struct is reached by its own alias and
+// through the embedded field's, each by a path of its own.
+func TestDecodeMapFieldEmbedded(t *testing.T) {
+	t.Parallel()
+
+	type Base struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	type ByValue struct {
+		Base
+		Name string `schema:"name"`
+	}
+	type ByPointer struct {
+		*Base
+		Name string `schema:"name"`
+	}
+	want := map[string]string{"a": "1", "b": "2"}
+	src := map[string][]string{"attributes.a": {"1"}, "Base.attributes.b": {"2"}, "name": {"n"}}
+
+	var v ByValue
+	if err := NewDecoder().Decode(&v, src); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(v.Attributes, want) || v.Name != "n" {
+		t.Errorf("by value: %+v", v)
+	}
+
+	var p ByPointer
+	if err := NewDecoder().Decode(&p, src); err != nil {
+		t.Fatal(err)
+	}
+	if p.Base == nil || !reflect.DeepEqual(p.Attributes, want) || p.Name != "n" {
+		t.Errorf("by pointer: %+v", p)
+	}
+}
+
+// What follows a map field's alias is its key as sent; an alias alone is no entry.
+func TestDecodeMapFieldKeyForms(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+	}
+	for _, tc := range []struct {
+		key  string
+		want map[string]string // nil: the key is rejected
+	}{
+		{"attributes.a", map[string]string{"a": "v"}},
+		{"ATTRIBUTES.A", map[string]string{"A": "v"}},
+		{"Attributes.a.b.c", map[string]string{"a.b.c": "v"}},
+		{"attributes..", map[string]string{".": "v"}},
+		{"attributes.a b", map[string]string{"a b": "v"}},
+		{"attributes.é", map[string]string{"é": "v"}},
+		{"attributes.", nil},
+		{"attributes", nil},
+		{".a", nil},
+		{"attribute.a", nil},
+	} {
+		var s S
+		err := NewDecoder().Decode(&s, map[string][]string{tc.key: {"v"}})
+		if tc.want == nil {
+			if err == nil || s.Attributes != nil {
+				t.Errorf("%q: err = %v, Attributes = %v; want an error and no map", tc.key, err, s.Attributes)
+			}
+			continue
+		}
+		if err != nil || !reflect.DeepEqual(s.Attributes, tc.want) {
+			t.Errorf("%q: Attributes = %v, err = %v; want %v", tc.key, s.Attributes, err, tc.want)
+		}
+	}
+}
+
+// Entries are built in pooled values; nothing of one may show in another (its
+// value, a pointer it allocated, a failed entry). Many rounds vary the order.
+func TestDecodeMapFieldEntriesDoNotCarryOver(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ptrs  map[string]*int     `schema:"ptrs"`
+		Lists map[string][]string `schema:"lists"`
+		Nums  map[string]int      `schema:"nums"`
+	}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		src := map[string][]string{
+			"ptrs.a": {"1"}, "ptrs.b": {""}, "ptrs.c": {"3"},
+			"lists.x": {"p", "q"}, "lists.y": {""}, "lists.z": {"r"},
+			"nums.ok": {"5"}, "nums.empty": {""}, "nums.bad": {"abc"},
+		}
+		var first S
+		firstErr := d.Decode(&first, src)
+		var me MultiError
+		if !errors.As(firstErr, &me) || len(me) != 1 || me["nums.bad"] == nil {
+			t.Fatalf("zeroEmpty=%v: err = %v, want only nums.bad to fail", zeroEmpty, firstErr)
+		}
+		for round := range 200 {
+			var s S
+			err := d.Decode(&s, src)
+			if !reflect.DeepEqual(err, firstErr) || !reflect.DeepEqual(s, first) {
+				t.Fatalf("zeroEmpty=%v round %d: got %+v, %v; want %+v, %v", zeroEmpty, round, s, err, first, firstErr)
+			}
+			delete(src, "nums.bad")
+			var ok S
+			if err := d.Decode(&ok, src); err != nil {
+				t.Fatalf("zeroEmpty=%v round %d: %v", zeroEmpty, round, err)
+			}
+			if _, has := ok.Nums["bad"]; has || ok.Nums["ok"] != 5 {
+				t.Fatalf("zeroEmpty=%v round %d: Nums = %v", zeroEmpty, round, ok.Nums)
+			}
+			src["nums.bad"] = []string{"abc"}
+		}
+	}
+}
+
+// Pointers and slices an entry holds are its own: the next entry must not write through them.
+func TestDecodeMapFieldEntriesAreIndependent(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ptrs  map[string]*int     `schema:"ptrs"`
+		Lists map[string][]string `schema:"lists"`
+	}
+	d := NewDecoder()
+	for range 100 {
+		var s S
+		src := map[string][]string{
+			"ptrs.a": {"1"}, "ptrs.b": {"2"}, "ptrs.c": {"3"},
+			"lists.x": {"p"}, "lists.y": {"q", "r"}, "lists.z": {"s"},
+		}
+		if err := d.Decode(&s, src); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.Ptrs) != 3 || *s.Ptrs["a"] != 1 || *s.Ptrs["b"] != 2 || *s.Ptrs["c"] != 3 {
+			t.Fatalf("Ptrs = %v", s.Ptrs)
+		}
+		if s.Ptrs["a"] == s.Ptrs["b"] || s.Ptrs["b"] == s.Ptrs["c"] {
+			t.Fatal("two entries share one pointer")
+		}
+		if !reflect.DeepEqual(s.Lists, map[string][]string{"x": {"p"}, "y": {"q", "r"}, "z": {"s"}}) {
+			t.Fatalf("Lists = %v", s.Lists)
+		}
+	}
+}
+
+func TestDecodeMapFieldNamedTypes(t *testing.T) {
+	t.Parallel()
+
+	type Key string
+	type Attrs map[Key]mapValueUnmarshaler
+	var s struct {
+		Attributes Attrs `schema:"attributes"`
+	}
+	if err := NewDecoder().Decode(&s, map[string][]string{"attributes.a": {"x"}, "attributes.b": {"y"}}); err != nil {
+		t.Fatal(err)
+	}
+	if want := (Attrs{"a": "X", "b": "Y"}); !reflect.DeepEqual(s.Attributes, want) {
+		t.Fatalf("Attributes = %v, want %v", s.Attributes, want)
+	}
+}
+
+// Goroutines decoding map fields through one decoder share its pools; results must not mix.
+func TestDecodeMapFieldConcurrent(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]string `schema:"attributes"`
+		Counts     map[string]int    `schema:"counts"`
+	}
+	d := NewDecoder()
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			for n := range 300 {
+				key := strconv.Itoa(g*1000 + n)
+				var s S
+				err := d.Decode(&s, map[string][]string{"attributes." + key: {key}, "counts." + key: {strconv.Itoa(n)}})
+				if err != nil || len(s.Attributes) != 1 || len(s.Counts) != 1 || s.Attributes[key] != key || s.Counts[key] != n {
+					t.Errorf("goroutine %d round %d: %+v, %v", g, n, s, err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
+}
+
+// A panic in a map entry's decode is recovered like any other and leaves the pool usable.
+func TestDecodeMapFieldConverterPanic(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Attributes map[string]time.Duration `schema:"attributes"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(time.Duration(0), func(value string) reflect.Value {
+		if value == "boom" {
+			panic("converter blew up")
+		}
+		return reflect.ValueOf(time.Second)
+	})
+	var s S
+	if err := d.Decode(&s, map[string][]string{"attributes.a": {"boom"}}); err == nil || !strings.Contains(err.Error(), "converter blew up") {
+		t.Fatalf("err = %v, want the panic as an error", err)
+	}
+	var ok S
+	if err := d.Decode(&ok, map[string][]string{"attributes.a": {"1s"}}); err != nil || ok.Attributes["a"] != time.Second {
+		t.Fatalf("decode after the panic: %v, %v", ok.Attributes, err)
+	}
+}
+
+// Elements that unmarshal themselves keep their order; an empty value is skipped
+// unless ZeroEmpty is set, and a slice with nothing left is empty, not nil.
+func TestDecodeUnmarshalerSlice(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	for _, tc := range []struct {
+		name      string
+		zeroEmpty bool
+		in        []string
+		want      []rudeBool
+	}{
+		{"values", false, []string{"Yup", "Nope", "yup"}, []rudeBool{true, false, true}},
+		{"empty skipped", false, []string{"Yup", "", "Yup"}, []rudeBool{true, true}},
+		{"empty zeroed", true, []string{"Yup", "", "Yup"}, []rudeBool{true, false, true}},
+		{"leading and trailing empty", true, []string{"", "Yup", ""}, []rudeBool{false, true, false}},
+		{"only empty, skipped", false, []string{""}, []rudeBool{}},
+		{"only empty, zeroed", true, []string{"", ""}, []rudeBool{false, false}},
+		{"no values", false, []string{}, []rudeBool{}},
+	} {
+		d := NewDecoder()
+		d.ZeroEmpty(tc.zeroEmpty)
+		var s S
+		if err := d.Decode(&s, map[string][]string{"b": tc.in}); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if !reflect.DeepEqual(s.B, tc.want) {
+			t.Errorf("%s: B = %#v, want %#v", tc.name, s.B, tc.want)
+		}
+	}
+}
+
+// A value that does not unmarshal fails the field with its index, the slice's type
+// and the unmarshaler's error, and leaves the field as it was.
+func TestDecodeUnmarshalerSliceError(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	s := S{B: []rudeBool{true, true, true}}
+	err := NewDecoder().Decode(&s, map[string][]string{"b": {"Yup", "maybe", "Nope"}})
+	var me MultiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want a MultiError", err)
+	}
+	ce, ok := me["b"].(ConversionError)
+	if !ok {
+		t.Fatalf("me[b] = %#v, want a ConversionError", me["b"])
+	}
+	if ce.Key != "b" || ce.Index != 1 || ce.Type != reflect.TypeFor[[]rudeBool]() || ce.Err == nil {
+		t.Errorf("ConversionError = %#v", ce)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{true, true, true}) {
+		t.Errorf("B = %v after a failed decode, want it untouched", s.B)
+	}
+}
+
+// The same failure on a slice of pointers, which has a path of its own.
+func TestDecodeUnmarshalerSlicePointerElementsError(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []*rudeBool `schema:"b"`
+	}
+	keep := []*rudeBool{new(rudeBool)}
+	s := S{B: keep}
+	err := NewDecoder().Decode(&s, map[string][]string{"b": {"Yup", "maybe", "Nope"}})
+	var me MultiError
+	if !errors.As(err, &me) {
+		t.Fatalf("err = %v, want a MultiError", err)
+	}
+	ce, ok := me["b"].(ConversionError)
+	if !ok {
+		t.Fatalf("me[b] = %#v, want a ConversionError", me["b"])
+	}
+	if ce.Key != "b" || ce.Index != 1 || ce.Type != reflect.TypeFor[[]*rudeBool]() || ce.Err == nil {
+		t.Errorf("ConversionError = %#v", ce)
+	}
+	if len(s.B) != 1 || s.B[0] != keep[0] {
+		t.Errorf("B = %v after a failed decode, want it untouched", s.B)
+	}
+}
+
+// Slices of pointers to such elements and of a named slice type keep their results.
+func TestDecodeUnmarshalerSliceShapes(t *testing.T) {
+	t.Parallel()
+
+	type Flags []rudeBool
+	var s struct {
+		Ptrs  []*rudeBool `schema:"ptrs"`
+		Named Flags       `schema:"named"`
+		Whole *[]rudeBool `schema:"whole"`
+	}
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"ptrs": {"Yup", "Nope", "Yup"}, "named": {"Nope", "Yup"}, "whole": {"Yup"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Ptrs) != 3 || *s.Ptrs[0] != true || *s.Ptrs[1] != false || *s.Ptrs[2] != true {
+		t.Errorf("Ptrs = %v", s.Ptrs)
+	}
+	if s.Ptrs[0] == s.Ptrs[2] {
+		t.Error("two elements share one pointer")
+	}
+	if !reflect.DeepEqual(s.Named, Flags{false, true}) {
+		t.Errorf("Named = %#v", s.Named)
+	}
+	if s.Whole == nil || !reflect.DeepEqual(*s.Whole, []rudeBool{true}) {
+		t.Errorf("Whole = %v", s.Whole)
+	}
+}
+
+// Replacing a slice does not write into the old backing array, which a caller may still hold.
+func TestDecodeUnmarshalerSliceDoesNotReuseTheOldArray(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		B []rudeBool `schema:"b"`
+	}
+	old := make([]rudeBool, 2, 8)
+	old[0], old[1] = true, true
+	s := S{B: old}
+	if err := NewDecoder().Decode(&s, map[string][]string{"b": {"Nope"}}); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(s.B, []rudeBool{false}) {
+		t.Fatalf("B = %v", s.B)
+	}
+	if !old[0] || !old[1] {
+		t.Fatalf("the old backing array was written to: %v", old[:2])
+	}
+}
+
+// bigUnmarshaler is large enough that sizing a slice of them by the client's
+// value count would reserve memory; tests register a converter for it, never called.
+type bigUnmarshaler [64 << 10]byte
+
+func (b *bigUnmarshaler) UnmarshalText(text []byte) error {
+	if string(text) == "bad" {
+		return errors.New("bad")
+	}
+	b[0] = text[0]
+	return nil
+}
+
+// A slice of unmarshalers claims memory for the values accepted, not sent: 2048
+// slots are 128 MiB here. It reads allocator totals, so it does not run in parallel.
+func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
+	type S struct {
+		Big []bigUnmarshaler `schema:"big"`
+	}
+	const n = 2048
+	empty := make([]string, n)
+	invalid := make([]string, n)
+	for i := range invalid {
+		invalid[i] = "bad"
+	}
+	d := NewDecoder()
+	d.RegisterConverter(bigUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+	for _, tc := range []struct {
+		name    string
+		values  []string
+		wantErr bool
+	}{
+		{"empty values", empty, false},
+		{"first value fails", invalid, true},
+	} {
+		src := map[string][]string{"big": tc.values}
+		var s S
+		var err error
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		err = d.Decode(&s, src)
+		runtime.ReadMemStats(&after)
+		if (err != nil) != tc.wantErr {
+			t.Fatalf("%s: err = %v, want an error: %v", tc.name, err, tc.wantErr)
+		}
+		if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+			t.Errorf("%s: %d values allocated %d bytes, want well under a megabyte", tc.name, n, got)
+		}
+		if err == nil && (s.Big == nil || len(s.Big) != 0) {
+			t.Errorf("%s: Big = %v, want an empty non-nil slice", tc.name, s.Big)
+		}
+		if err != nil {
+			// The first value's error: any other means the values never reached the unmarshaler.
+			var me MultiError
+			if !errors.As(err, &me) {
+				t.Fatalf("%s: err = %v, want a MultiError", tc.name, err)
+			}
+			ce, ok := me["big"].(ConversionError)
+			if !ok || ce.Index != 0 || ce.Type != reflect.TypeFor[[]bigUnmarshaler]() || ce.Err == nil {
+				t.Errorf("%s: me[big] = %#v, want the first value's ConversionError", tc.name, me["big"])
+			}
+		}
+	}
+}
+
+// chunkUnmarshaler is 1 KiB, so the first slice holds four and a longer list must grow it.
+type chunkUnmarshaler [1 << 10]byte
+
+func (c *chunkUnmarshaler) UnmarshalText(text []byte) error {
+	c[0] = text[0]
+	return nil
+}
+
+// Growing the slice keeps the values already unmarshaled, in order, and ends at the number kept.
+func TestDecodeUnmarshalerSliceGrows(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		C []chunkUnmarshaler `schema:"c"`
+	}
+	for _, tc := range []struct {
+		name      string
+		zeroEmpty bool
+		in        []string
+		want      string
+	}{
+		{"within the first slice", false, []string{"a", "b"}, "ab"},
+		{"exactly the first slice", false, []string{"a", "b", "c", "d"}, "abcd"},
+		{"past the first slice", false, []string{"a", "b", "c", "d", "e"}, "abcde"},
+		{"past two doublings", false, []string{"a", "b", "c", "d", "e", "f", "g", "h", "i"}, "abcdefghi"},
+		{"empty values skipped", false, []string{"a", "", "b", "", "", "c", "d", "e", "f", "g"}, "abcdefg"},
+		{"empty values kept", true, []string{"a", "", "b", "c", "d", "", "e"}, "a\x00bcd\x00e"},
+		{"only the empty value", true, []string{""}, "\x00"},
+	} {
+		d := NewDecoder()
+		d.RegisterConverter(chunkUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+		d.ZeroEmpty(tc.zeroEmpty)
+		var s S
+		if err := d.Decode(&s, map[string][]string{"c": tc.in}); err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		got := make([]byte, len(s.C))
+		for i := range s.C {
+			got[i] = s.C[i][0]
+		}
+		if string(got) != tc.want {
+			t.Errorf("%s: first bytes = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+type nothing [0]byte
+
+func (*nothing) UnmarshalText([]byte) error { return nil }
+
+func TestDecodeUnmarshalerSliceZeroSizeElements(t *testing.T) {
+	t.Parallel()
+
+	var s struct {
+		N []nothing `schema:"n"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(nothing{}, func(string) reflect.Value { return reflect.Value{} })
+	if err := d.Decode(&s, map[string][]string{"n": {"x", "", "y", "z"}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.N) != 3 {
+		t.Errorf("N = %v, want 3 elements", s.N)
+	}
+}
+
+// Comma separated lists split alike on every path that splits them, empty items and all.
+func TestDecodeCommaListsSplitAlike(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Ints  []int    `schema:"ints"`
+		Int32 []int32  `schema:"int32"`
+		U16   []uint16 `schema:"u16"`
+		Strs  []string `schema:"strs"`
+	}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		var s S
+		err := d.Decode(&s, map[string][]string{
+			"ints":  {"1,2", ",3,,4,", "5"},
+			"int32": {"1,2", ",3,,4,", "5"},
+			"u16":   {",", "6"},
+			"strs":  {"a,b", ",c"},
+		})
+		if err != nil {
+			t.Fatalf("zeroEmpty=%v: %v", zeroEmpty, err)
+		}
+		wantInts := []int{1, 2, 3, 4, 5}
+		wantInt32 := []int32{1, 2, 3, 4, 5}
+		wantU16 := []uint16{6}
+		if zeroEmpty {
+			wantInts = []int{1, 2, 0, 3, 0, 4, 0, 5}
+			wantInt32 = []int32{1, 2, 0, 3, 0, 4, 0, 5}
+			wantU16 = []uint16{0, 0, 6}
+		}
+		if !reflect.DeepEqual(s.Ints, wantInts) || !reflect.DeepEqual(s.Int32, wantInt32) || !reflect.DeepEqual(s.U16, wantU16) {
+			t.Errorf("zeroEmpty=%v: Ints=%v Int32=%v U16=%v", zeroEmpty, s.Ints, s.Int32, s.U16)
+		}
+		if !reflect.DeepEqual(s.Strs, []string{"a,b", ",c"}) {
+			t.Errorf("zeroEmpty=%v: Strs = %q", zeroEmpty, s.Strs)
 		}
 	}
 }
