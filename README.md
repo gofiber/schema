@@ -116,7 +116,7 @@ err := decoder.DecodeValues(&person, keys, values)
 
 ## Limits
 
-Keys usually come from a client, so the decoder bounds what they can make it allocate: a key may name at most 64 fields, a slice index may be at most 1000 (or `MaxSize`, if lower), and the slices one call grows inside slice elements, below a nested field, in promoted slice fields or in slice fields of a struct that embeds an exported pointer share 8 MiB. A key past a limit is not decoded and is reported under its own name in the returned `MultiError`, also when `IgnoreUnknownKeys` is set.
+Keys usually come from a client, so the decoder bounds what they can make it allocate: a key may name at most 64 fields, and a slice index may be at most 1000 (or `MaxSize`, if lower). One call may also allocate at most 8 MiB in all for the values behind nil pointers on its keys' paths and for the slices it grows, counting the capacity each growth reserves. Maps and file fields are not counted, nor are the slice fields declared on the destination struct itself unless the struct embeds an exported pointer or the call grew eight other slices at a key's first index before them. The first eight slices a call grows at a key's first index grow geometrically, any other slice to exactly the index plus one. A key past a limit is not decoded and is reported under its own name in the returned `MultiError`, also when `IgnoreUnknownKeys` is set.
 
 ## Setting Defaults
 
