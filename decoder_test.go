@@ -2784,9 +2784,7 @@ func TestDefaultValuesAreIgnoredIfValuesAreProvided(t *testing.T) {
 	}
 }
 
-// The required check matches keys the way the decoder does: case-insensitively,
-// and judging the last of several values, the one a scalar field decodes. Each
-// row runs through Decode and DecodeValues.
+// The required check matches keys as the decoder does: in any case, judging the last value.
 func TestRequiredMatchesDecoding(t *testing.T) {
 	t.Parallel()
 
@@ -2881,9 +2879,7 @@ func TestRequiredMatchesDecoding(t *testing.T) {
 	}
 }
 
-// The decoder ignores the bare key of an entry-by-entry map field or a slice
-// of structs, which need a key or an element index after them, and a nested
-// key it cannot parse, so neither can satisfy them as required, in any case.
+// A key the decoder ignores, bare or unparsable, satisfies no required field.
 func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	t.Parallel()
 
@@ -2949,8 +2945,7 @@ func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	}
 }
 
-// Without a name in the tag the alias is the Go field name, so the index the
-// required check folds keys into has to be lowercase too.
+// An untagged field's alias is its Go name, which the folded index must lowercase.
 func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
 	t.Parallel()
 
@@ -4079,9 +4074,9 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 }
 
 // referenceCheckRequired is the pre-rewrite required-field check: a linear
-// scan of the whole source map per group and field path, with keys compared
-// case-insensitively as the decoder compares them. The bitset and prefix
-// index that replaced it must agree with it on every input.
+// scan of the whole source map per group and field path, keys compared in
+// any case. The bitset and prefix index that replaced it must agree with it on
+// every input.
 func referenceCheckRequired(c *cache, info *structInfo, src map[string][]string) map[string]bool {
 	missing := map[string]bool{}
 	for _, group := range info.requiredGroups {
@@ -4153,7 +4148,7 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 		"mid", "mid.m", "mid.l", "mid.l.x", "mid.l.y",
 		"one", "one.m", "one.l.x", "two.m", "two.l.x",
 		"ab", "midx", "l.", "one.l", "unrelated", "a.b.c",
-		// the same keys in other cases, which the decoder resolves too
+		// other cases
 		"A", "B", "Free", "X", "M", "L.X", "MID", "Mid.M", "MID.L.X", "One.L.x", "TWO.m",
 	}
 	values := [][]string{nil, {}, {""}, {"v"}, {"", "v"}, {"v", ""}}

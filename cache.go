@@ -641,9 +641,7 @@ func directEligible(info *structInfo, f *fieldInfo) bool {
 	return f.endsPath()
 }
 
-// endsPath reports whether a path may end at f: a slice of structs needs an
-// element index after it, and an entry-by-entry map field a key, so parsePath
-// rejects a path that stops at either.
+// endsPath reports whether a path may end at f: a slice of structs needs an index after it, a map field a key.
 func (f *fieldInfo) endsPath() bool {
 	return !f.takesIndex() && f.mapValue == nil
 }
@@ -854,12 +852,8 @@ type structInfo struct {
 	// a nested-key prefix to the groups a key under it can satisfy.
 	requiredGroups   []requiredGroup
 	requiredPrefixes map[string][]requiredPrefix
-	// foldedRequiredPaths and foldedRequiredPrefixes index the groups by the
-	// lowercased paths and nested-key prefixes that can satisfy them, for
-	// the keys that arrive in another case; requiredMixedCase reports
-	// whether any of those paths or prefixes was not lowercase, as an
-	// untagged field's is, so that a lowercase key can match only through
-	// them.
+	// The required paths and prefixes lowercased, for keys in another case;
+	// requiredMixedCase is set if any of them was not lowercase.
 	foldedRequiredPaths    map[string][]requiredPrefix
 	foldedRequiredPrefixes map[string][]requiredPrefix
 	requiredMixedCase      bool
@@ -975,10 +969,7 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 	return prefixes
 }
 
-// buildFoldedRequiredIndex indexes the groups by the lowercased paths that
-// can satisfy them directly ("d" for required key "d") and by the lowercased
-// nested-key prefixes that can satisfy them ("d."), and reports whether any
-// path or prefix was not lowercase already.
+// buildFoldedRequiredIndex indexes the groups by their lowercased paths and nested-key prefixes.
 func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[string][]requiredPrefix, mixedCase bool) {
 	if len(groups) == 0 {
 		return nil, nil, false
@@ -994,8 +985,6 @@ func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[strin
 			}
 			typ := f.typ
 			if f.mapValue != nil {
-				// As in buildRequiredPrefixes: a key under a map field
-				// gives one entry.
 				typ = typ.Elem()
 			}
 			for _, dot := range f.searchPathDots {
@@ -1008,9 +997,7 @@ func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[strin
 	return paths, prefixes, mixedCase
 }
 
-// addRequiredOwner records that a key can satisfy group gi with a value typ
-// judges non-empty, once per (group, type): several fields of a group can
-// reach the same key.
+// addRequiredOwner adds group gi to index[key], once per field type.
 func addRequiredOwner(index map[string][]requiredPrefix, key string, gi int, typ reflect.Type) {
 	owners := index[key]
 	for _, o := range owners {

@@ -459,13 +459,11 @@ func keyProvided(src *source, prefix, name string) bool {
 // follows only performs the per-request emptiness checks against src.
 //
 // A group is satisfied by a value under one of its own paths, or by any
-// nested key below one of them ("d.e" satisfies required "d"), with keys
-// matched case-insensitively as the decoder matches them. Direct paths are
-// looked up first, since they settle almost every group; what is left is
-// answered by walking the dotted prefixes of each source key, and what is
-// still left after that by the keys in another case. Decode runs those steps
-// around its own loop over src; checkRequired composes them for a standalone
-// check.
+// nested key below one of them ("d.e" satisfies required "d"). Direct paths
+// are looked up first, since they settle almost every group; what is left is
+// answered by walking the dotted prefixes of each source key, then by the keys
+// in another case. Decode runs those steps around its own loop over src;
+// checkRequired composes them for a standalone check.
 
 // requiredBitWords sizes the inline satisfied-group bitset: 256 required
 // keys, past which it is allocated.
@@ -497,10 +495,8 @@ func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) 
 // markProvidedByNestedKey walks the dotted prefixes of key from off, marking
 // every required group they name that val is non-empty for, and returns the
 // new pending count. Callers test for a dotted, non-empty key themselves, so
-// the keys that can answer nothing do not pay for a call. A key the decoder
-// cannot decode, such as "items.x" for a slice of structs, satisfies nothing:
-// with c set it is parsed the first time it names a group, and without it the
-// caller has parsed it already.
+// the keys that can answer nothing do not pay for a call. Only a key the
+// decoder can parse counts: c parses it, or nil if the caller already has.
 func markProvidedByNestedKey(c *cache, info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
 	for {
 		if owners := info.requiredPrefixes[key[:off]]; len(owners) > 0 {
@@ -520,10 +516,7 @@ func markProvidedByNestedKey(c *cache, info *structInfo, key string, off int, va
 	}
 }
 
-// markProvidedFolded settles what the exact lookups left pending by matching
-// src's keys case-insensitively, as the decoder resolves its fields, and
-// returns the new pending count. It runs once, after the decode loop, so a
-// request that matches its fields' case pays nothing for it.
+// markProvidedFolded matches src's keys case-insensitively against the groups still pending.
 func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uint64, pending int) int {
 	if p := src.pairs; p != nil {
 		var scratch [8]string
@@ -548,12 +541,8 @@ func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uin
 	return pending
 }
 
-// markProvidedByFoldedKey lowercases key, in a stack buffer when it fits,
-// and marks every required group it names as a path of its own or through
-// its dotted prefixes that val is non-empty for, the latter only if c can
-// parse it, as for markProvidedByNestedKey. It returns the new pending count.
-// A key that was lowercase already was looked up exactly, so it is skipped
-// unless a required path has an uppercase letter itself.
+// markProvidedByFoldedKey marks the groups key names in lower case; a lowercase
+// key was looked up exactly, so it is skipped unless a required path is not.
 func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
 	var buf [maxDirectKeyLen]byte
 	var folded []byte
@@ -565,7 +554,6 @@ func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []strin
 	if !foldASCIILower(folded, key) && !info.requiredMixedCase {
 		return pending
 	}
-	// The buffer outlives every lookup made through it, and nothing keeps it.
 	lower := utils.UnsafeString(folded)
 	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
 	for off := 0; pending > 0; {
@@ -587,10 +575,7 @@ func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []strin
 	return pending
 }
 
-// markProvided marks the groups of owners that val is non-empty for and
-// returns the new pending count. satisfied is a bitset over the required
-// groups, one bit per group index: group g is bit g&63 of word g>>6. A group
-// already marked is skipped, so pending only counts each group once.
+// markProvided marks the owners' groups that val is non-empty for; group g is bit g&63 of satisfied[g>>6].
 func markProvided(owners []requiredPrefix, val []string, satisfied []uint64, pending int) int {
 	for _, p := range owners {
 		if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
@@ -630,7 +615,7 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 			if i < 0 || len(val) == 0 {
 				continue
 			}
-			if pending = markProvidedByNestedKey(d.cache,info, key, i+1, val, satisfied, pending); pending == 0 {
+			if pending = markProvidedByNestedKey(d.cache, info, key, i+1, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}
@@ -659,10 +644,9 @@ type fieldWithPrefix struct {
 	*fieldInfo
 	prefix string
 	// searchPaths lists the src keys this required field answers to, and
-	// searchPathDots the nested-key prefixes; both are precomputed at
-	// cache-build time so per-request checks allocate nothing. A field no
-	// path may end at has no searchPaths: the decoder ignores its bare key,
-	// so only a nested key can satisfy it.
+	// searchPathDots the corresponding nested-key prefixes; both are
+	// precomputed at cache-build time so per-request checks allocate
+	// nothing. A field no path may end at has no searchPaths.
 	searchPaths    []string
 	searchPathDots []string
 }
@@ -697,8 +681,7 @@ func directlyProvided(fields []fieldWithPrefix, src *source) bool {
 	return false
 }
 
-// isEmpty returns true if value is empty for specific type. A scalar field
-// decodes the last of several values, so that is the one judged.
+// isEmpty returns true if value is empty for specific type, judging the last value as a scalar decodes it.
 func isEmpty(t reflect.Type, value []string) bool {
 	if len(value) == 0 {
 		return true
