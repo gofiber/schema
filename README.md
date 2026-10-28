@@ -114,6 +114,10 @@ err := decoder.DecodeValues(&person, keys, values)
 
 `values[i]` is a value of the key `keys[i]`, and a key given more than once has all of its values in the order given, as it would in the map. The two slices must be the same length.
 
+## Limits
+
+Keys usually come from a client, so the decoder bounds what they can make it allocate: a key may name at most 64 fields, a slice index may be at most 1000 (or `MaxSize`, if lower), and the slices one call grows inside slice elements, below a nested field, in promoted slice fields or in slice fields of a struct that embeds an exported pointer share 8 MiB. A key past a limit is not decoded and is reported under its own name in the returned `MultiError`, also when `IgnoreUnknownKeys` is set.
+
 ## Setting Defaults
 
 It is possible to set default values when encoding/decoding by using the `default` tag option. The value of `default` is applied when a field has a zero value, a pointer has a nil value, or a slice is empty.
