@@ -3789,6 +3789,47 @@ func TestDecodeNestedSliceLimit(t *testing.T) {
 	}
 }
 
+func TestDecodeNestedSliceLimitThroughPointers(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		Name string `schema:"name"`
+		Note string
+		N    int
+	}
+	type tree struct {
+		Left  *tree  `schema:"l"`
+		Right *tree  `schema:"r"`
+		Items []item `schema:"items"`
+	}
+	// Every key reaches the slice of another node at its first index.
+	fit := maxNestedSliceBytes / ((maxParserIndex + 1) * int(reflect.TypeFor[item]().Size()))
+	keys, values := make([]string, fit+1), make([]string, fit+1)
+	for i := range keys {
+		var b strings.Builder
+		for j := range 10 {
+			b.WriteString([2]string{"l.", "r."}[i>>j&1])
+		}
+		keys[i] = b.String() + "items." + strconv.Itoa(maxParserIndex) + ".name"
+		values[i] = "x"
+	}
+	d := NewDecoder()
+	if err := d.DecodeValues(new(tree), keys[:fit], values[:fit]); err != nil {
+		t.Fatalf("%d keys: %v", fit, err)
+	}
+	err := d.DecodeValues(new(tree), keys, values)
+	if want := (MultiError{keys[fit]: errTooManyElements}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
+	}
+	// Such a slice filled in ascending order is reallocated per key but counts its elements once.
+	keys, values = make([]string, maxParserIndex+1), make([]string, maxParserIndex+1)
+	for i := range keys {
+		keys[i], values[i] = "l.items."+strconv.Itoa(i)+".name", "x"
+	}
+	if err := d.DecodeValues(new(tree), keys, values); err != nil {
+		t.Fatalf("ascending fill: %v", err)
+	}
+}
+
 type TreeNode[T any] struct {
 	Parent *T `schema:"parent"`
 }

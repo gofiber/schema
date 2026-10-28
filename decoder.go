@@ -21,8 +21,8 @@ import (
 
 const (
 	defaultMaxSize = 16000
-	// maxNestedSliceBytes bounds what slices below a key's first index may allocate in one call:
-	// keys grow such a slice per parent element, so no per-slice limit bounds their total.
+	// maxNestedSliceBytes bounds what untracked slices may allocate in one call: keys grow such a
+	// slice per parent element or pointer path, so no per-slice limit bounds their total.
 	maxNestedSliceBytes = 8 << 20
 )
 
@@ -749,7 +749,7 @@ type growTracker struct {
 	fields [4]int
 	caps   [4]int
 	n      int
-	nested int // bytes the call allocated for slices below a key's first index
+	nested int // bytes the call allocated for slices it does not track
 }
 
 // reserved returns the capacity this call gave the slice at struct field
@@ -857,13 +857,17 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				// Otherwise grow into a fresh backing array: extending within
 				// the existing capacity would write into memory the caller
 				// may still share through another slice aliasing it.
-				if nested {
-					// Checked before adding, so the count cannot wrap and a refused key costs nothing.
-					sz := int(t.Elem().Size())
-					if sz != 0 && n > (maxNestedSliceBytes-grow.nested)/sz {
+				if owner < 0 {
+					// A first index counts its new elements, a nested one every reallocation. Checked
+					// before adding, so the count cannot wrap and a refused key costs nothing.
+					add, sz := n, int(t.Elem().Size())
+					if !nested {
+						add -= v.Len()
+					}
+					if sz != 0 && add > (maxNestedSliceBytes-grow.nested)/sz {
 						return errTooManyElements
 					}
-					grow.nested += n * sz
+					grow.nested += add * sz
 				}
 				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
 				if v.Len() > 0 {
