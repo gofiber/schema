@@ -21,8 +21,8 @@ import (
 
 const (
 	defaultMaxSize = 16000
-	// maxNestedSliceBytes bounds what untracked slices may allocate in one call: keys grow such a
-	// slice per parent element or pointer path, so no per-slice limit bounds their total.
+	// maxNestedSliceBytes bounds what one call reserves for slices below the destination's own fields:
+	// keys grow such a slice per parent element or pointer path, so no per-slice limit bounds their total.
 	maxNestedSliceBytes = 8 << 20
 )
 
@@ -738,43 +738,33 @@ func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
 	return v
 }
 
-// growTracker remembers which of the destination struct's slice fields a
-// Decode call has already reallocated, and how much room it reserved in each.
-// Fields are keyed by their index in that struct, which is what pathPart's
-// soleIndex carries: only a slice reached by one hop can be tracked, since a
-// deeper path reaches a slice inside some element, which the field alone
-// cannot tell apart from the same field in another. Fields past the four
-// entries keep growing exactly.
+// growTracker remembers the backing arrays a Decode call allocated for the
+// slices at a key's first index, so they can grow geometrically, and what the
+// call counted toward maxNestedSliceBytes. Arrays past the eight entries grow
+// exactly.
 type growTracker struct {
-	fields [4]int
-	caps   [4]int
+	arrays [8]unsafe.Pointer
 	n      int
-	nested int // bytes the call allocated for slices it does not track
+	nested int
 }
 
-// reserved returns the capacity this call gave the slice at struct field
-// index i, or 0 if it has not reallocated it.
-func (g *growTracker) reserved(i int) int {
-	for j := 0; j < g.n; j++ {
-		if g.fields[j] == i {
-			return g.caps[j]
+// slot returns the entry of the array p if this call allocated it, else the
+// next free entry, or -1 when every entry is taken.
+func (g *growTracker) slot(p unsafe.Pointer) int {
+	for i := range g.n {
+		if g.arrays[i] == p {
+			return i
 		}
 	}
-	return 0
+	if g.n == len(g.arrays) {
+		return -1
+	}
+	return g.n
 }
 
-func (g *growTracker) record(i, c int) {
-	for j := 0; j < g.n; j++ {
-		if g.fields[j] == i {
-			g.caps[j] = c
-			return
-		}
-	}
-	if g.n < len(g.fields) {
-		g.fields[g.n] = i
-		g.caps[g.n] = c
-		g.n++
-	}
+func (g *growTracker) record(i int, p unsafe.Pointer) {
+	g.arrays[i] = p
+	g.n = max(g.n, i+1)
 }
 
 // decode fills a struct field using a parsed path. nested is set below a key's
@@ -847,36 +837,36 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			// Indices arrive in map order, so a slice is typically grown
 			// several times per call. Extending one this call allocated is
 			// free: the room past its length is ours and freshly zeroed.
-			owner := -1
+			slot, root := -1, false
 			if !nested {
-				owner = parts[0].soleIndex
+				slot, root = grow.slot(v.UnsafePointer()), parts[0].soleIndex >= 0
 			}
-			if owner >= 0 && n <= v.Cap() && grow.reserved(owner) >= n {
+			ours := slot >= 0 && slot < grow.n
+			if ours && n <= v.Cap() {
 				v.SetLen(n)
 			} else {
 				// Otherwise grow into a fresh backing array: extending within
 				// the existing capacity would write into memory the caller
-				// may still share through another slice aliasing it.
-				if owner < 0 {
-					// A first index counts its new elements, a nested one every reallocation. Checked
-					// before adding, so the count cannot wrap and a refused key costs nothing.
-					add, sz := n, int(t.Elem().Size())
-					if !nested {
-						add -= v.Len()
-					}
-					if sz != 0 && add > (maxNestedSliceBytes-grow.nested)/sz {
+				// may still share through another slice aliasing it. A root
+				// field reserves room from its first growth, other slices from their second.
+				c := d.growCap(n, slot >= 0 && (root || ours))
+				// Only a tracked slice field of the destination struct is left to its index limit.
+				if slot < 0 || !root {
+					// Checked before adding, so the count cannot wrap and a refused key costs nothing.
+					sz := int(t.Elem().Size())
+					if sz != 0 && c > (maxNestedSliceBytes-grow.nested)/sz {
 						return errTooManyElements
 					}
-					grow.nested += add * sz
+					grow.nested += c * sz
 				}
-				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
+				value := reflect.MakeSlice(t, n, c)
 				if v.Len() > 0 {
 					// Resize it.
 					reflect.Copy(value, v)
 				}
 				v.Set(value)
-				if owner >= 0 {
-					grow.record(owner, value.Cap())
+				if slot >= 0 {
+					grow.record(slot, value.UnsafePointer())
 				}
 			}
 		}

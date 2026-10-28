@@ -3833,13 +3833,55 @@ func TestDecodeNestedSliceLimitThroughPointers(t *testing.T) {
 	if want := (MultiError{keys[fit]: errTooManyElements}); !reflect.DeepEqual(err, want) {
 		t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
 	}
-	// Such a slice filled in ascending order is reallocated per key but counts its elements once.
+	// Such a slice filled in ascending order grows geometrically, so it fits as well.
 	keys, values = make([]string, maxParserIndex+1), make([]string, maxParserIndex+1)
 	for i := range keys {
 		keys[i], values[i] = "l.items."+strconv.Itoa(i)+".name", "x"
 	}
 	if err := d.DecodeValues(new(tree), keys, values); err != nil {
 		t.Fatalf("ascending fill: %v", err)
+	}
+}
+
+func TestDecodeFirstIndexGrowsGeometrically(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		Name string `schema:"name"`
+		Note string
+		N    int
+	}
+	type tree struct {
+		Left  *tree  `schema:"l"`
+		Right *tree  `schema:"r"`
+		Items []item `schema:"items"`
+	}
+	keys, values := make([]string, maxParserIndex+1), make([]string, maxParserIndex+1)
+	for i := range keys {
+		keys[i], values[i] = "l.items."+strconv.Itoa(i)+".name", "x"
+	}
+	var dst tree
+	if err := NewDecoder().DecodeValues(&dst, keys, values); err != nil {
+		t.Fatal(err)
+	}
+	if got := dst.Left.Items; len(got) != len(keys) || cap(got) == len(got) {
+		t.Fatalf("len %d, cap %d: want room reserved ahead", len(got), cap(got))
+	}
+	// Once every tracked entry is taken, each reallocation counts toward the budget.
+	keys, values = nil, nil
+	for _, p := range []string{"l.", "r.", "l.l.", "l.r.", "r.l.", "r.r.", "l.l.l.", "l.l.r."} {
+		keys, values = append(keys, p+"items.0.name"), append(values, "x")
+	}
+	size := int(reflect.TypeFor[item]().Size())
+	used, refused := len(keys)*size, 0
+	for ; used+(refused+1)*size <= maxNestedSliceBytes; refused++ {
+		used += (refused + 1) * size
+	}
+	for i := range refused + 1 {
+		keys, values = append(keys, "r.r.r.items."+strconv.Itoa(i)+".name"), append(values, "x")
+	}
+	err := NewDecoder().DecodeValues(new(tree), keys, values)
+	if want := (MultiError{keys[len(keys)-1]: errTooManyElements}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
 	}
 }
 
