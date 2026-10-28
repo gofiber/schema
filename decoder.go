@@ -21,16 +21,16 @@ import (
 
 const (
 	defaultMaxSize = 16000
-	// maxNestedSliceBytes bounds what one call reserves for slices below the destination's own fields:
-	// keys grow such a slice per parent element or pointer path, so no per-slice limit bounds their total.
-	maxNestedSliceBytes = 8 << 20
+	// maxAllocBytes bounds the slices and pointer targets one call allocates besides the destination's own
+	// slice fields: keys reach new ones per parent element or pointer path, so no per-field limit bounds them.
+	maxAllocBytes = 8 << 20
 )
 
 // errNotPointerToStruct is returned by Decode for invalid destinations;
 // hoisted so the check does not allocate on every call.
 var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
 
-var errTooManyElements = errors.New("schema: keys index too many nested slice elements")
+var errAllocLimit = errors.New("schema: keys allocate past the per-call limit")
 
 // fileKeyValues stands in for the value of a multipart file's key in the
 // decode view. Nothing writes through a source map's values and the map it
@@ -337,7 +337,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 	}
 
 	for _, f := range struc.defaultFields {
-		vCurrent := walkIndexChain(v, f.index)
+		vCurrent, _ := walkIndexChain(v, f.index, nil) // nothing to refuse without a tracker
 		if !vCurrent.IsValid() {
 			// Unreachable behind an unsettable nil embedded pointer.
 			continue
@@ -690,16 +690,19 @@ func isMultipartField(typ reflect.Type) bool {
 // allocating the embedded pointers promoted fields need on the way. It
 // returns the zero Value when an unsettable nil embedded pointer blocks the
 // walk.
-func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
+func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value, error) {
+	var err error
 	for _, hop := range hops {
 		// A previous hop may have been blocked by an unsettable nil
 		// embedded pointer; the field is unreachable then.
 		if !v.IsValid() {
-			return v
+			return v, nil
 		}
 		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
-				v.Set(reflect.New(v.Type().Elem()))
+				if err = grow.alloc(v, v.Type().Elem()); err != nil {
+					return v, err
+				}
 			}
 			v = v.Elem()
 		}
@@ -707,13 +710,20 @@ func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
 		// Allocate embedded anonymous pointers required for promoted fields.
 		for _, idx := range hop.ensure {
 			if f := v.Field(idx); f.IsNil() {
-				f.Set(reflect.New(f.Type().Elem()))
+				if err = grow.alloc(f, f.Type().Elem()); err != nil {
+					return v, err
+				}
 			}
 		}
 
-		v = walkIndexChain(v, hop.index)
+		// A field of v itself needs none of the chain's pointer handling.
+		if len(hop.index) == 1 {
+			v = v.Field(hop.index[0])
+		} else if v, err = walkIndexChain(v, hop.index, grow); err != nil {
+			return v, err
+		}
 	}
-	return v
+	return v, nil
 }
 
 // walkIndexChain walks v along a struct field index chain. Chains longer
@@ -722,30 +732,53 @@ func walkHops(v reflect.Value, hops []pathHop) reflect.Value {
 // when the chain is blocked by a nil pointer that cannot be set (an
 // unexported embedded pointer), which callers treat as an unreachable
 // field.
-func walkIndexChain(v reflect.Value, chain []int) reflect.Value {
+func walkIndexChain(v reflect.Value, chain []int, grow *growTracker) (reflect.Value, error) {
 	for j, fi := range chain {
 		if j > 0 && v.Kind() == reflect.Pointer {
 			if v.IsNil() {
 				if !v.CanSet() {
-					return reflect.Value{}
+					return reflect.Value{}, nil
 				}
-				v.Set(reflect.New(v.Type().Elem()))
+				if err := grow.alloc(v, v.Type().Elem()); err != nil {
+					return v, err
+				}
 			}
 			v = v.Elem()
 		}
 		v = v.Field(fi)
 	}
-	return v
+	return v, nil
 }
 
 // growTracker remembers the backing arrays a Decode call allocated for the
 // slices at a key's first index, so they can grow geometrically, and what the
-// call counted toward maxNestedSliceBytes. Arrays past the eight entries grow
+// call counted toward maxAllocBytes. Arrays past the eight entries grow
 // exactly.
 type growTracker struct {
 	arrays [8]unsafe.Pointer
 	n      int
-	nested int
+	used   int
+}
+
+// charge counts n values of size sz toward maxAllocBytes. Checked before
+// adding, so the count cannot wrap and what is refused costs nothing.
+func (g *growTracker) charge(n int, sz uintptr) error {
+	if s := int(sz); s != 0 && n > (maxAllocBytes-g.used)/s {
+		return errAllocLimit
+	}
+	g.used += n * int(sz)
+	return nil
+}
+
+// alloc points the nil pointer v at a new t, counted unless g is nil.
+func (g *growTracker) alloc(v reflect.Value, t reflect.Type) error {
+	if g != nil {
+		if err := g.charge(1, t.Size()); err != nil {
+			return err
+		}
+	}
+	v.Set(reflect.New(t))
+	return nil
 }
 
 // slot returns the entry of the array p if this call allocated it, else the
@@ -774,9 +807,12 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	// one hop into a field of v, which needs none of the loop's bookkeeping.
 	if idx := parts[0].soleIndex; idx >= 0 && v.Kind() == reflect.Struct {
 		v = v.Field(idx)
-	} else if v = walkHops(v, parts[0].hops); !v.IsValid() {
-		// Unreachable behind an unsettable nil embedded pointer.
-		return nil
+	} else {
+		var err error
+		if v, err = walkHops(v, parts[0].hops, grow); err != nil || !v.IsValid() {
+			// Past the budget, or unreachable behind an unsettable nil embedded pointer.
+			return err
+		}
 	}
 
 	// Don't even bother for unexported fields.
@@ -821,7 +857,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 		if v.IsNil() {
-			v.Set(reflect.New(t))
+			if err := grow.alloc(v, t); err != nil {
+				return err
+			}
 		}
 		v = v.Elem()
 	}
@@ -852,12 +890,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				c := d.growCap(n, slot >= 0 && (root || ours))
 				// Only a tracked slice field of the destination struct is left to its index limit.
 				if slot < 0 || !root {
-					// Checked before adding, so the count cannot wrap and a refused key costs nothing.
-					sz := int(t.Elem().Size())
-					if sz != 0 && c > (maxNestedSliceBytes-grow.nested)/sz {
-						return errTooManyElements
+					if err := grow.charge(c, t.Elem().Size()); err != nil {
+						return err
 					}
-					grow.nested += c * sz
 				}
 				value := reflect.MakeSlice(t, n, c)
 				if v.Len() > 0 {
