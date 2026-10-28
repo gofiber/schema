@@ -2881,9 +2881,9 @@ func TestRequiredMatchesDecoding(t *testing.T) {
 }
 
 // The decoder ignores the bare key of an entry-by-entry map field or a slice
-// of structs, which need a key or an element index after them, so that key
-// cannot satisfy them as required either, in any case.
-func TestRequiredBareKeyNeedsADecodablePath(t *testing.T) {
+// of structs, which need a key or an element index after them, and a nested
+// key it cannot parse, so neither can satisfy them as required, in any case.
+func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	t.Parallel()
 
 	type item struct {
@@ -2903,6 +2903,8 @@ func TestRequiredBareKeyNeedsADecodablePath(t *testing.T) {
 		{name: "bare keys in another case", keys: []string{"m", "ITEMS"}, missing: "M is empty; items is empty"},
 		{name: "nested keys", keys: []string{"M.k", "items.0.x"}},
 		{name: "nested keys in another case", keys: []string{"m.k", "ITEMS.0.X"}},
+		{name: "nested keys the decoder drops", keys: []string{"M.k", "items.x", "items.0.y"}, missing: "items is empty"},
+		{name: "nested keys the decoder drops in another case", keys: []string{"m.k", "ITEMS.x", "Items.0.Y"}, missing: "items is empty"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -4079,7 +4081,7 @@ func BenchmarkCheckRequiredFields(b *testing.B) {
 // scan of the whole source map per group and field path, with keys compared
 // case-insensitively as the decoder compares them. The bitset and prefix
 // index that replaced it must agree with it on every input.
-func referenceCheckRequired(info *structInfo, src map[string][]string) map[string]bool {
+func referenceCheckRequired(c *cache, info *structInfo, src map[string][]string) map[string]bool {
 	missing := map[string]bool{}
 	for _, group := range info.requiredGroups {
 		empty := true
@@ -4093,6 +4095,9 @@ func referenceCheckRequired(info *structInfo, src map[string][]string) map[strin
 					}
 				}
 				if len(val) == 0 {
+					continue
+				}
+				if _, err := c.parsePathInfo(key, info); err != nil {
 					continue
 				}
 				for _, pathDot := range f.searchPathDots {
@@ -4166,7 +4171,7 @@ func TestCheckRequiredMatchesReference(t *testing.T) {
 					src[k] = values[len(values)-1]
 				}
 			}
-			want := referenceCheckRequired(info, src)
+			want := referenceCheckRequired(d.cache, info, src)
 			got := map[string]bool{}
 			for key := range d.checkRequired(info, src) {
 				got[key] = true

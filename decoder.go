@@ -225,7 +225,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if pending > 0 {
-		pending = markProvidedFolded(rootInfo, src, satisfied, pending)
+		pending = markProvidedFolded(d.cache, rootInfo, src, satisfied, pending)
 	}
 	if rootInfo.needsDefaultsWalk {
 		errs = mergeErrors(errs, d.setDefaults(t, v, src, ""))
@@ -244,12 +244,12 @@ func (d *Decoder) decodeKey(
 	v reflect.Value, rootInfo *structInfo, files map[string][]*multipart.FileHeader, grow *growTracker,
 	satisfied []uint64, path string, values []string, errs MultiError, pending int,
 ) (MultiError, int) {
-	if pending > 0 {
-		if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
-			pending = markProvidedByNestedKey(rootInfo, path, i+1, values, satisfied, pending)
-		}
-	}
 	if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
+		if pending > 0 {
+			if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
+				pending = markProvidedByNestedKey(nil, rootInfo, path, i+1, values, satisfied, pending)
+			}
+		}
 		var filesSlice []*multipart.FileHeader
 		if files != nil {
 			filesSlice = files[path]
@@ -497,17 +497,20 @@ func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) 
 // markProvidedByNestedKey walks the dotted prefixes of key from off, marking
 // every required group they name that val is non-empty for, and returns the
 // new pending count. Callers test for a dotted, non-empty key themselves, so
-// the keys that can answer nothing do not pay for a call.
-func markProvidedByNestedKey(info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
+// the keys that can answer nothing do not pay for a call. A key the decoder
+// cannot decode, such as "items.x" for a slice of structs, satisfies nothing:
+// with c set it is parsed the first time it names a group, and without it the
+// caller has parsed it already.
+func markProvidedByNestedKey(c *cache, info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
 	for {
-		for _, p := range info.requiredPrefixes[key[:off]] {
-			if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
-				continue
+		if owners := info.requiredPrefixes[key[:off]]; len(owners) > 0 {
+			if c != nil {
+				if _, err := c.parsePathInfo(key, info); err != nil {
+					return pending
+				}
+				c = nil
 			}
-			if !isEmpty(p.typ, val) {
-				satisfied[p.group>>6] |= 1 << uint(p.group&63)
-				pending--
-			}
+			pending = markProvided(owners, val, satisfied, pending)
 		}
 		i := strings.IndexByte(key[off:], '.')
 		if i < 0 {
@@ -521,14 +524,14 @@ func markProvidedByNestedKey(info *structInfo, key string, off int, val []string
 // src's keys case-insensitively, as the decoder resolves its fields, and
 // returns the new pending count. It runs once, after the decode loop, so a
 // request that matches its fields' case pays nothing for it.
-func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pending int) int {
+func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uint64, pending int) int {
 	if p := src.pairs; p != nil {
 		var scratch [8]string
 		for i, key := range p.keys {
 			if !p.first(i) {
 				continue
 			}
-			if pending = markProvidedByFoldedKey(info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
+			if pending = markProvidedByFoldedKey(c, info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
 				break
 			}
 		}
@@ -538,7 +541,7 @@ func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pendi
 		if len(val) == 0 {
 			continue
 		}
-		if pending = markProvidedByFoldedKey(info, key, val, satisfied, pending); pending == 0 {
+		if pending = markProvidedByFoldedKey(c, info, key, val, satisfied, pending); pending == 0 {
 			break
 		}
 	}
@@ -547,10 +550,11 @@ func markProvidedFolded(info *structInfo, src *source, satisfied []uint64, pendi
 
 // markProvidedByFoldedKey lowercases key, in a stack buffer when it fits,
 // and marks every required group it names as a path of its own or through
-// its dotted prefixes that val is non-empty for. It returns the new pending
-// count. A key that was lowercase already was looked up exactly, so it is
-// skipped unless a required path has an uppercase letter itself.
-func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
+// its dotted prefixes that val is non-empty for, the latter only if c can
+// parse it, as for markProvidedByNestedKey. It returns the new pending count.
+// A key that was lowercase already was looked up exactly, so it is skipped
+// unless a required path has an uppercase letter itself.
+func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
 	var buf [maxDirectKeyLen]byte
 	var folded []byte
 	if len(key) <= maxDirectKeyLen {
@@ -570,7 +574,15 @@ func markProvidedByFoldedKey(info *structInfo, key string, val []string, satisfi
 			break
 		}
 		off += i + 1
-		pending = markProvided(info.foldedRequiredPrefixes[lower[:off]], val, satisfied, pending)
+		if owners := info.foldedRequiredPrefixes[lower[:off]]; len(owners) > 0 {
+			if c != nil {
+				if _, err := c.parsePathInfo(key, info); err != nil {
+					return pending
+				}
+				c = nil
+			}
+			pending = markProvided(owners, val, satisfied, pending)
+		}
 	}
 	return pending
 }
@@ -618,13 +630,13 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 			if i < 0 || len(val) == 0 {
 				continue
 			}
-			if pending = markProvidedByNestedKey(info, key, i+1, val, satisfied, pending); pending == 0 {
+			if pending = markProvidedByNestedKey(d.cache,info, key, i+1, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}
 	}
 	if pending > 0 {
-		pending = markProvidedFolded(info, &s, satisfied, pending)
+		pending = markProvidedFolded(d.cache, info, &s, satisfied, pending)
 	}
 	return missingRequired(info.requiredGroups, satisfied, pending)
 }
