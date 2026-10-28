@@ -3732,6 +3732,38 @@ func TestDecodeIndexExceedsParserLimit(t *testing.T) {
 	}
 }
 
+func TestDecodePathDepthLimit(t *testing.T) {
+	t.Parallel()
+	type node struct {
+		Name     string `schema:"name"`
+		Children []node `schema:"children"`
+	}
+	type comment struct {
+		Parent *comment `schema:"parent"`
+		Text   string   `schema:"text,default:none"`
+	}
+	tests := []struct {
+		dst          func() any
+		level, field string
+	}{
+		{func() any { return new(node) }, "children.0.", "name"},
+		{func() any { return new(comment) }, "parent.", "text"},
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	for _, tt := range tests {
+		key := strings.Repeat(tt.level, maxPathDepth-1) + tt.field
+		if err := d.Decode(tt.dst(), map[string][]string{key: {"x"}}); err != nil {
+			t.Fatalf("%d fields: %v", maxPathDepth, err)
+		}
+		key = tt.level + key
+		err := d.Decode(tt.dst(), map[string][]string{key: {"x"}})
+		if want := (MultiError{key: errPathTooDeep}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%d fields: got %v, want %v", maxPathDepth+1, err, want)
+		}
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{

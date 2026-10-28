@@ -254,10 +254,9 @@ func (d *Decoder) decodeKey(
 		if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
 			errs = appendError(errs, path, err)
 		}
-		// A key that names no field is by far the most common failure,
-		// and parsePathInfo returns that sentinel unwrapped, so the
-		// pointer compare keeps errors.Is off the per-key path.
-	} else if err != errInvalidPath && errors.Is(err, errIndexTooLarge) { //nolint:errorlint // see above
+		// A key that names no field is by far the most common failure, and
+		// parsePathInfo returns its sentinels unwrapped; the others are limits.
+	} else if err != errInvalidPath { //nolint:errorlint // see above
 		errs = appendError(errs, path, err)
 	} else if !d.ignoreUnknownKeys {
 		errs = appendError(errs, path, UnknownKeyError{Key: path})

@@ -36,9 +36,14 @@ const maxDirectPaths = 512
 // reservation still works, and real paths are a few segments deep.
 const maxPathReserve = 16
 
+// maxPathDepth caps the fields one path names: decoding recurses per level,
+// and a type that contains itself puts no other bound on the depth.
+const maxPathDepth = 64
+
 var (
 	errInvalidPath   = errors.New("schema: invalid path")
 	errIndexTooLarge = errors.New("schema: index exceeds parser limit")
+	errPathTooDeep   = errors.New("schema: path exceeds depth limit")
 )
 
 // newCache returns a new cache.
@@ -174,7 +179,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	hopStart := 0
 	// Only paths spelled as declared (alias or its lower case, plain indexes) are cached.
 	canonical := true
-	for keyStart := 0; ; {
+	for keyStart, depth := 0, 0; ; depth++ {
+		if depth == maxPathDepth {
+			return nil, errPathTooDeep
+		}
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
 		if err != nil {
 			return nil, errInvalidPath
