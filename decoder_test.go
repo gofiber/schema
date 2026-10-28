@@ -3787,6 +3787,19 @@ func TestDecodeNestedSliceLimit(t *testing.T) {
 	if want := (MultiError{keys[fit]: errTooManyElements}); !reflect.DeepEqual(err, want) {
 		t.Fatalf("%d keys: got %v, want %v", fit+2, err, want)
 	}
+	// Inside a slice element every reallocation counts, so an ascending fill stops early.
+	size, used, refused := int(reflect.TypeFor[node]().Size()), 0, 0
+	for ; used+(refused+1)*size <= maxNestedSliceBytes; refused++ {
+		used += (refused + 1) * size
+	}
+	keys, values = make([]string, refused+1), make([]string, refused+1)
+	for i := range keys {
+		keys[i], values[i] = "children.0.children."+strconv.Itoa(i)+".name", "x"
+	}
+	err = NewDecoder().DecodeValues(new(node), keys, values)
+	if want := (MultiError{keys[refused]: errTooManyElements}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("ascending fill: got %v, want %v", err, want)
+	}
 }
 
 func TestDecodeNestedSliceLimitThroughPointers(t *testing.T) {
