@@ -564,9 +564,6 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	for _, f := range info.fields {
-		if f.takesIndex() {
-			info.hasIndexedSlice = true
-		}
 		if k := f.typ.Kind(); f.def != nil || k == reflect.Struct ||
 			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct) {
 			info.defaultFields = append(info.defaultFields, f)
@@ -866,11 +863,8 @@ type structInfo struct {
 	directIndex foldIndex
 	// paths caches parsed paths rooted at this struct type; keys are cloned
 	// so they never alias reused request buffers.
-	paths pathCache
-	// hasIndexedSlice reports whether any field's paths carry a slice element
-	// index, and so may grow that slice while decoding.
-	hasIndexedSlice bool
-	hasMapFields    bool
+	paths        pathCache
+	hasMapFields bool
 	// defaultFields are the fields the setDefaults walk has to visit: those
 	// with a default, and the structs and pointers to structs it descends
 	// into. The rest of the fields can never be affected by it.

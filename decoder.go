@@ -21,11 +21,16 @@ import (
 
 const (
 	defaultMaxSize = 16000
+	// maxNestedSliceBytes bounds what slices below a key's first index may allocate in one call:
+	// keys grow such a slice per parent element, so no per-slice limit bounds their total.
+	maxNestedSliceBytes = 8 << 20
 )
 
 // errNotPointerToStruct is returned by Decode for invalid destinations;
 // hoisted so the check does not allocate on every call.
 var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
+
+var errTooManyElements = errors.New("schema: keys index too many nested slice elements")
 
 // fileKeyValues stands in for the value of a multipart file's key in the
 // decode view. Nothing writes through a source map's values and the map it
@@ -201,12 +206,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		var requiredBits [requiredBitWords]uint64
 		satisfied, pending = markProvidedDirectly(rootInfo.requiredGroups, src, requiredBits[:])
 	}
-	// Only a struct whose paths carry an index can grow anything.
-	var grow *growTracker
-	if rootInfo.hasIndexedSlice {
-		var tracker growTracker
-		grow = &tracker
-	}
+	var grow growTracker
 	// The state decodeKey carries from key to key is kept in variables of
 	// its own rather than a struct: the compiler would let the stack values
 	// above escape along with the errors a struct holding both returns.
@@ -216,12 +216,12 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		var scratch [8]string
 		for i, path := range p.keys {
 			if p.first(i) {
-				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, p.group(i, scratch[:0]), errs, pending)
+				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, path, p.group(i, scratch[:0]), errs, pending)
 			}
 		}
 	} else {
 		for path, values := range src.m {
-			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, values, errs, pending)
+			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, path, values, errs, pending)
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
@@ -251,7 +251,7 @@ func (d *Decoder) decodeKey(
 		if files != nil {
 			filesSlice = files[path]
 		}
-		if err = d.decode(v, path, parts, values, filesSlice, grow); err != nil {
+		if err = d.decode(v, path, parts, values, filesSlice, grow, false); err != nil {
 			errs = appendError(errs, path, err)
 		}
 		// A key that names no field is by far the most common failure, and
@@ -749,6 +749,7 @@ type growTracker struct {
 	fields [4]int
 	caps   [4]int
 	n      int
+	nested int // bytes the call allocated for slices below a key's first index
 }
 
 // reserved returns the capacity this call gave the slice at struct field
@@ -776,9 +777,9 @@ func (g *growTracker) record(i, c int) {
 	}
 }
 
-// decode fills a struct field using a parsed path. grow is non-nil only for
-// the outermost call, the one place slice growth can be tracked.
-func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader, grow *growTracker) error {
+// decode fills a struct field using a parsed path. nested is set below a key's
+// first index; the outermost call is the one place slice growth can be tracked.
+func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values []string, files []*multipart.FileHeader, grow *growTracker, nested bool) error {
 	// Get the field walking the struct fields by index. Almost every path is
 	// one hop into a field of v, which needs none of the loop's bookkeeping.
 	if idx := parts[0].soleIndex; idx >= 0 && v.Kind() == reflect.Struct {
@@ -847,7 +848,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			// several times per call. Extending one this call allocated is
 			// free: the room past its length is ours and freshly zeroed.
 			owner := -1
-			if grow != nil {
+			if !nested {
 				owner = parts[0].soleIndex
 			}
 			if owner >= 0 && n <= v.Cap() && grow.reserved(owner) >= n {
@@ -856,6 +857,11 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				// Otherwise grow into a fresh backing array: extending within
 				// the existing capacity would write into memory the caller
 				// may still share through another slice aliasing it.
+				if nested {
+					if grow.nested += n * int(t.Elem().Size()); grow.nested > maxNestedSliceBytes {
+						return errTooManyElements
+					}
+				}
 				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
 				if v.Len() > 0 {
 					// Resize it.
@@ -867,7 +873,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 			}
 		}
-		return d.decode(v.Index(idx), path, parts[1:], values, files, nil)
+		return d.decode(v.Index(idx), path, parts[1:], values, files, grow, true)
 	}
 
 	// Get the converter early in case there is one for a slice type.
@@ -1002,7 +1008,7 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 		keyStart = strings.IndexByte(path, '.') + 1
 	}
 	e, _ := f.entries.Get().(*mapEntry)
-	err := d.decode(e.val, path, f.mapValue, values, nil, nil)
+	err := d.decode(e.val, path, f.mapValue, values, nil, nil, false)
 	if err == nil {
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(v.Type()))

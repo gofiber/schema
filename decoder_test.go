@@ -3764,6 +3764,29 @@ func TestDecodePathDepthLimit(t *testing.T) {
 	}
 }
 
+func TestDecodeNestedSliceLimit(t *testing.T) {
+	t.Parallel()
+	type node struct {
+		Name     string `schema:"name"`
+		Children []node `schema:"children"`
+	}
+	// Each key grows one slice of maxParserIndex+1 nodes below its first index.
+	fit := maxNestedSliceBytes / ((maxParserIndex + 1) * int(reflect.TypeFor[node]().Size()))
+	keys, values := make([]string, fit+1), make([]string, fit+1)
+	for i := range keys {
+		keys[i] = "children." + strconv.Itoa(i) + ".children." + strconv.Itoa(maxParserIndex) + ".name"
+		values[i] = "x"
+	}
+	d := NewDecoder()
+	if err := d.DecodeValues(new(node), keys[:fit], values[:fit]); err != nil {
+		t.Fatalf("%d keys: %v", fit, err)
+	}
+	err := d.DecodeValues(new(node), keys, values)
+	if want := (MultiError{keys[fit]: errTooManyElements}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
+	}
+}
+
 func TestRequiredCheckLinearInKeyLength(t *testing.T) {
 	t.Parallel()
 	// Nine required keys: a map of at most eight compares long keys by length without hashing them.
