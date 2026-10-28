@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	utils "github.com/gofiber/utils/v2"
 	utilstrings "github.com/gofiber/utils/v2/strings"
@@ -565,4 +566,407 @@ func TestTypeCacheSlotsConcurrent(t *testing.T) {
 		}
 	})
 	wg.Wait()
+}
+
+func caseMask(s string, mask int) string {
+	b := []byte(s)
+	for i := range b {
+		if mask&(1<<i) != 0 && b[i] >= 'a' && b[i] <= 'z' {
+			b[i] -= 'a' - 'A'
+		}
+	}
+	return string(b)
+}
+
+// "ITEMS.0001.value" is "items.1.value": the client can spell one path many ways,
+// but only the spelling the struct declares (and its lower case) is kept.
+func TestPathCacheIsBoundedBySpellings(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	const pads, masks = 200, 128
+	if pads*masks <= maxFastPaths+maxSpillPaths {
+		t.Fatal("the test sends fewer spellings than the cache holds")
+	}
+	for pad := range pads {
+		for mask := range masks {
+			key := caseMask("items", mask) + "." + strings.Repeat("0", pad) + "1." + caseMask("value", mask>>5)
+			var s S
+			if err := d.Decode(&s, map[string][]string{key: {"x"}}); err != nil {
+				t.Fatalf("%q: %v", key, err)
+			}
+			if len(s.Items) != 2 || s.Items[1].Value != "x" {
+				t.Fatalf("%q decoded to %+v", key, s.Items)
+			}
+		}
+	}
+	if keys := cachedPathKeys(&info.paths); len(keys) != 1 || keys[0] != "items.1.value" {
+		t.Fatalf("cache holds %q, want only the declared spelling", keys)
+	}
+	if info.paths.full() {
+		t.Fatal("one path filled the cache")
+	}
+}
+
+// The cache keeps the canonical spellings of a path; others decode but are parsed each time.
+func TestPathCacheKeepsCanonicalSpellings(t *testing.T) {
+	t.Parallel()
+
+	type Item struct {
+		Value string `schema:"Value"`
+	}
+	type S struct {
+		Items []Item `schema:"Items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	for _, tc := range []struct {
+		key  string
+		kept bool
+	}{
+		{"Items.1.Value", true},
+		{"items.1.value", true},
+		{"Items.1.value", true},
+		{"items.10.Value", true},
+		{"ITEMS.1.Value", false},
+		{"Items.1.VALUE", false},
+		{"iTems.1.Value", false},
+		{"Items.01.Value", false},
+		{"Items.+1.Value", false},
+		{"Items.00.Value", false},
+		{"Items.-0.Value", false},
+	} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{tc.key: {"x"}}); err != nil {
+			t.Fatalf("%q: %v", tc.key, err)
+		}
+		if n := len(s.Items); n == 0 || s.Items[n-1].Value != "x" {
+			t.Fatalf("%q decoded to %+v", tc.key, s.Items)
+		}
+		if _, kept := info.paths.load(tc.key); kept != tc.kept {
+			t.Errorf("%q kept = %v, want %v", tc.key, kept, tc.kept)
+		}
+	}
+	for _, tc := range []struct {
+		key  string
+		kept bool
+	}{{"items.0.value", true}, {"items.00.value", false}} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{tc.key: {"x"}}); err != nil {
+			t.Fatalf("%q: %v", tc.key, err)
+		}
+		if _, kept := info.paths.load(tc.key); kept != tc.kept {
+			t.Errorf("%q kept = %v, want %v", tc.key, kept, tc.kept)
+		}
+	}
+}
+
+// deepNode contains itself through a slice, so its paths have any depth.
+type deepNode struct {
+	A []deepNode `schema:"a"`
+	V int        `schema:"vvvv"`
+}
+
+func deepPath(depth, index int) string {
+	return strings.Repeat("a.0.", depth-1) + "a." + strconv.Itoa(index) + ".vvvv"
+}
+
+// A type that contains itself has paths of any depth, so the entry caps alone
+// would let a client pin much parsed state; the cache stops at what it weighs.
+func TestPathCacheIsBoundedByBytes(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[deepNode]())
+
+	const maxDepth = 60
+	if n := len(deepPath(maxDepth, maxParserIndex)); n > maxCachedPathLen {
+		t.Fatalf("test path is %d bytes, over the %d the cache keeps", n, maxCachedPathLen)
+	}
+	weight := func(depth int) int {
+		arrays := 2 * (depth + 1) // append doubles the arrays, so they hold at most twice the segments
+		return len(deepPath(depth, maxParserIndex)) + arrays*int(unsafe.Sizeof(pathPart{})) + arrays*int(unsafe.Sizeof(pathHop{}))
+	}
+	kept, sent := 0, 0
+	for depth := maxDepth; depth >= 2 && !info.paths.full(); depth-- {
+		for index := 0; index <= maxParserIndex && !info.paths.full(); index++ {
+			key := deepPath(depth, index)
+			var s deepNode
+			if err := d.Decode(&s, map[string][]string{key: {"7"}}); err != nil {
+				t.Fatalf("%q: %v", key, err)
+			}
+			n := &s
+			for range depth - 1 {
+				n = &n.A[0]
+			}
+			if len(n.A) != index+1 || n.A[index].V != 7 {
+				t.Fatalf("%q decoded wrong", key)
+			}
+			sent++
+			if _, ok := info.paths.load(key); ok {
+				kept++
+			}
+		}
+	}
+	if !info.paths.full() {
+		t.Fatalf("%d deep paths did not fill the cache", sent)
+	}
+	if kept != sent {
+		t.Fatalf("kept %d of %d paths sent before the cache filled", kept, sent)
+	}
+	if got := info.paths.bytes.Load(); got < maxPathCacheBytes || got > maxPathCacheBytes+int64(weight(maxDepth)) {
+		t.Fatalf("cache weighs %d bytes, want within one entry over %d", got, maxPathCacheBytes)
+	}
+	if kept >= maxFastPaths+maxSpillPaths/4 || kept < maxPathCacheBytes/weight(maxDepth) {
+		t.Fatalf("cache kept %d deep paths, want between %d and %d", kept, maxPathCacheBytes/weight(maxDepth), maxFastPaths+maxSpillPaths/4)
+	}
+	// Past the bound a new path is decoded and not kept (two nonzero indexes: no fill key had them).
+	for _, key := range []string{"a.1.a.1.vvvv", strings.Repeat("a.0.", maxDepth-2) + "a.1.a.1.vvvv"} {
+		var s deepNode
+		if err := d.Decode(&s, map[string][]string{key: {"7"}}); err != nil {
+			t.Fatalf("%q after the cache filled: %v", key, err)
+		}
+		if _, ok := info.paths.load(key); ok {
+			t.Fatalf("%q was kept by a full cache", key)
+		}
+	}
+}
+
+func TestPathCacheSkipsLongKeys(t *testing.T) {
+	t.Parallel()
+
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[deepNode]())
+
+	// deepPath(depth, 0) is 4*depth+4 bytes, so these sit either side of the limit.
+	long := deepPath(maxCachedPathLen/4, 0)
+	if len(long) <= maxCachedPathLen {
+		t.Fatalf("test key is %d bytes, want over %d", len(long), maxCachedPathLen)
+	}
+	var s deepNode
+	if err := d.Decode(&s, map[string][]string{long: {"1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if keys := cachedPathKeys(&info.paths); len(keys) != 0 {
+		t.Fatalf("cache kept %d paths of a key of %d bytes", len(keys), len(long))
+	}
+
+	exact := deepPath(maxCachedPathLen/4-1, 0)
+	if len(exact) != maxCachedPathLen {
+		t.Fatalf("test key is %d bytes, want %d", len(exact), maxCachedPathLen)
+	}
+	if err := d.Decode(&s, map[string][]string{exact: {"1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if keys := cachedPathKeys(&info.paths); len(keys) != 1 {
+		t.Fatalf("cache holds %d paths, want the one at the limit", len(keys))
+	}
+}
+
+// Clearing the cache lets it take paths again, spill included.
+func TestPathCacheClearReopensSpill(t *testing.T) {
+	t.Parallel()
+
+	var c pathCache
+	for i := range maxFastPaths + 8 {
+		c.loadOrStore(strconv.Itoa(i), nil, 0)
+	}
+	if !c.sealed.Load() || c.spillLen.Load() != 8 {
+		t.Fatalf("sealed=%v spillLen=%d, want sealed with 8 spilled", c.sealed.Load(), c.spillLen.Load())
+	}
+	c.clear()
+	if c.sealed.Load() || c.spillLen.Load() != 0 || c.full() {
+		t.Fatalf("clear left sealed=%v spillLen=%d full=%v", c.sealed.Load(), c.spillLen.Load(), c.full())
+	}
+}
+
+func TestPathCacheSpillStopsAtCap(t *testing.T) {
+	t.Parallel()
+
+	var c pathCache
+	for i := range maxFastPaths + maxSpillPaths {
+		c.loadOrStore(strconv.Itoa(i), nil, 0)
+	}
+	if !c.full() {
+		t.Fatalf("cache of %d spilled paths is not full", c.spillLen.Load())
+	}
+	if got := len(cachedPathKeys(&c)); got != maxFastPaths+maxSpillPaths {
+		t.Fatalf("cache holds %d paths, want %d", got, maxFastPaths+maxSpillPaths)
+	}
+}
+
+// A path through a map field's bare alias is the same for every key, so it is shared.
+func TestMapEntryPathIsShared(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type S struct {
+		Attrs map[string]string `schema:"attrs"`
+		Other map[string]int    `schema:"other"`
+		Name  string            `schema:"name"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	parse := func(key string) []pathPart {
+		t.Helper()
+		parts, err := d.cache.parsePathInfo(key, info)
+		if err != nil {
+			t.Fatalf("parsePathInfo(%q): %v", key, err)
+		}
+		return parts
+	}
+	a, b, c, o := parse("attrs.a"), parse("ATTRS.b.c"), parse("attrs.zzzzzz"), parse("other.x")
+	if &a[0] != &b[0] || &a[0] != &c[0] {
+		t.Error("the keys of one map field do not share a path")
+	}
+	if &a[0] == &o[0] || a[0].field == o[0].field {
+		t.Error("two map fields share a path")
+	}
+	if a[0].keyStart != 0 || a[0].field.mapValue == nil {
+		t.Errorf("shared path: keyStart=%d, mapValue=%v; want 0 and a map field", a[0].keyStart, a[0].field.mapValue)
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _, _ = d.cache.parsePathInfo("attrs.colour", info) }); allocs != 0 {
+		t.Errorf("parsePathInfo of a map entry allocated %v times", allocs)
+	}
+	if got := len(cachedPathKeys(&info.paths)); got != 0 {
+		t.Errorf("the cache kept %d map entry paths", got)
+	}
+
+	// Not a map entry: a bare alias, a missing key, a field that is not a map.
+	for _, key := range []string{"attrs", "attrs.", ".a", "name.x"} {
+		if parts, err := d.cache.parsePathInfo(key, info); err == nil {
+			if parts[0].field.mapValue != nil {
+				t.Errorf("parsePathInfo(%q) named a map entry", key)
+			}
+		}
+	}
+}
+
+// A key that names no field is rejected before the parser reserves anything.
+func TestUnknownPathDoesNotAllocate(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type Item struct {
+		Value string `schema:"value"`
+	}
+	type S struct {
+		Name  string `schema:"name"`
+		Items []Item `schema:"items"`
+	}
+	d := NewDecoder()
+	info := d.cache.get(reflect.TypeFor[S]())
+
+	for _, key := range []string{"nope.x", "utm.source.medium", "NOPE.0.value", "nope.", "a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t"} {
+		if _, err := d.cache.parsePathInfo(key, info); err != errInvalidPath { //nolint:errorlint // the sentinel itself, as decodeKey compares it
+			t.Errorf("parsePathInfo(%q) = %v, want errInvalidPath", key, err)
+		}
+		if allocs := testing.AllocsPerRun(100, func() { _, _ = d.cache.parsePathInfo(key, info) }); allocs != 0 {
+			t.Errorf("parsePathInfo(%q) allocated %v times", key, allocs)
+		}
+	}
+}
+
+// converter() must agree with the registry for every type, however they fall into slots.
+func TestConverterRegistrySlots(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	if c.converter(reflect.TypeFor[int]()) != nil {
+		t.Fatal("an empty registry returned a converter")
+	}
+
+	types := slotTypes(3 * typeCacheSlots)
+	registered, others := types[:typeCacheSlots/2], types[typeCacheSlots/2:]
+	converterFor := func(i int) Converter {
+		return func(string) reflect.Value { return reflect.ValueOf(i) }
+	}
+	for i, typ := range registered {
+		c.registerConverter(reflect.Zero(typ).Interface(), converterFor(i))
+	}
+
+	for i, typ := range registered {
+		conv := c.converter(typ)
+		if conv == nil || conv("").Int() != int64(i) {
+			t.Fatalf("registered type %d: got the wrong converter", i)
+		}
+	}
+	collisions := 0
+	for i, typ := range others {
+		if c.converter(typ) != nil {
+			t.Fatalf("type %d was never registered but has a converter", i)
+		}
+		if c.regconv.Load().slots&(1<<typeSlot(typ)) != 0 {
+			collisions++
+		}
+	}
+	if collisions == 0 {
+		t.Fatal("no unregistered type shares a slot with a registered one; the test checks nothing")
+	}
+
+	c.registerConverter(reflect.Zero(registered[0]).Interface(), converterFor(100))
+	if conv := c.converter(registered[0]); conv == nil || conv("").Int() != 100 {
+		t.Fatal("re-registering did not replace the converter")
+	}
+	if conv := c.converter(registered[1]); conv == nil || conv("").Int() != 1 {
+		t.Fatal("re-registering lost another converter")
+	}
+}
+
+// Converters registered while others are looked up never show a half-built registry.
+func TestConverterRegistryConcurrent(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	types := slotTypes(2 * typeCacheSlots)
+	var wg sync.WaitGroup
+	for g := range 4 {
+		wg.Go(func() {
+			for n := range 500 {
+				typ := types[(g*13+n)%len(types)]
+				if conv := c.converter(typ); conv != nil && conv("").Int() != int64(slices.Index(types, typ)) {
+					t.Errorf("type %d: got the converter of another type", slices.Index(types, typ))
+					return
+				}
+			}
+		})
+	}
+	wg.Go(func() {
+		for i, typ := range types {
+			c.registerConverter(reflect.Zero(typ).Interface(), func(string) reflect.Value { return reflect.ValueOf(i) })
+		}
+	})
+	wg.Wait()
+}
+
+// The converter lookup of a type nobody registered, which is nearly every non-scalar field.
+func BenchmarkConverterMiss(b *testing.B) {
+	c := newCache()
+	for _, typ := range slotTypes(3) {
+		c.registerConverter(reflect.Zero(typ).Interface(), func(string) reflect.Value { return reflect.Value{} })
+	}
+	// Take the first of a few types that no registered type shares a slot with.
+	var typ reflect.Type
+	for _, candidate := range []reflect.Type{
+		reflect.TypeFor[*int](), reflect.TypeFor[*string](), reflect.TypeFor[[]string](),
+		reflect.TypeFor[*bool](), reflect.TypeFor[[]int](), reflect.TypeFor[float64](),
+	} {
+		if c.regconv.Load().slots&(1<<typeSlot(candidate)) == 0 {
+			typ = candidate
+			break
+		}
+	}
+	if typ == nil {
+		b.Skip("every candidate type shares a slot with a registered one")
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		if c.converter(typ) != nil {
+			b.Fatal("unexpected converter")
+		}
+	}
 }

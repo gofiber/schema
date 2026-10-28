@@ -1005,6 +1005,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			return d.decodeBuiltinSlice(v, t, path, values)
 		}
 
+		if m.IsValid && !isPtrElem {
+			return d.decodeUnmarshalerSlice(v, t, path, values)
+		}
+
 		return d.decodeBoxedSlice(v, t, elemT, path, values, conv, m, isPtrElem)
 	} else {
 		val := ""
@@ -1069,36 +1073,53 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
+type mapEntry struct {
+	key, val reflect.Value
+}
+
+func newMapEntryPool(t reflect.Type) *sync.Pool {
+	return &sync.Pool{New: func() any {
+		return &mapEntry{key: reflect.New(t.Key()).Elem(), val: reflect.New(t.Elem()).Elem()}
+	}}
+}
+
 // decodeMapEntry decodes values into the entry of the map field v that the
 // rest of path from part.keyStart names, allocating the map on first use. The value is decoded as
 // a field of the map's value type, so it converts, reports errors and takes
 // the last of several values the way such a field does; the key is stored
 // exactly as sent.
 func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string) error {
+	f := part.field
 	// A plain scalar field ignores an empty value unless ZeroEmpty is set, so
 	// such a value leaves the map as it is rather than storing a zero value.
-	if k := part.field.mapValue[0].field.fastKind; k != reflect.Invalid && !d.zeroEmpty &&
+	if k := f.mapValue[0].field.fastKind; k != reflect.Invalid && !d.zeroEmpty &&
 		(len(values) == 0 || values[len(values)-1] == "") {
 		return nil
 	}
-	t := v.Type()
-	value := reflect.New(t.Elem()).Elem()
-	if err := d.decode(value, path, part.field.mapValue, values, nil, nil); err != nil {
-		return err
+	keyStart := int(part.keyStart)
+	if keyStart == 0 {
+		keyStart = strings.IndexByte(path, '.') + 1
 	}
-	if v.IsNil() {
-		v.Set(reflect.MakeMap(t))
+	e, _ := f.entries.Get().(*mapEntry)
+	err := d.decode(e.val, path, f.mapValue, values, nil, nil)
+	if err == nil {
+		if v.IsNil() {
+			v.Set(reflect.MakeMap(v.Type()))
+		}
+		// The key may alias the caller's buffer.
+		e.key.SetString(strings.Clone(path[keyStart:]))
+		v.SetMapIndex(e.key, e.val)
 	}
-	// The key may alias the caller's buffer, so it is cloned before the map
-	// keeps it.
-	v.SetMapIndex(reflect.ValueOf(strings.Clone(path[part.keyStart:])).Convert(t.Key()), value)
-	return nil
+	// The map holds copies; zero the pair so the pool keeps none of the request's data.
+	e.val.SetZero()
+	e.key.SetZero()
+	f.entries.Put(e)
+	return err
 }
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
-// to round-trip through a reflect.Value: a custom converter, a
-// TextUnmarshaler, or pointer elements. It is split out so that decode, which
-// runs once per source key, carries no defer of its own.
+// to round-trip through a reflect.Value: a custom converter, or pointer
+// elements. Split out so that decode carries no defer of its own.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
 	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
 	items := (*itemsBuf)[:0]
@@ -1114,10 +1135,8 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 				items = append(items, reflect.Zero(t.Elem()))
 			}
 		} else if m.IsValid {
+			// Only pointer elements get here, so u itself is the element.
 			u := reflect.New(elemT)
-			if m.IsSliceElementPtr {
-				u = reflect.New(reflect.PointerTo(elemT).Elem())
-			}
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 			if err := um.UnmarshalText([]byte(value)); err != nil {
 				return ConversionError{
@@ -1127,13 +1146,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 					Err:   err,
 				}
 			}
-			if m.IsSliceElementPtr {
-				items = append(items, u.Elem().Addr())
-			} else {
-				// u is always a pointer from reflect.New; store the
-				// pointed-to value.
-				items = append(items, u.Elem())
-			}
+			items = append(items, u)
 		} else if item := conv(value); item.IsValid() {
 			items = appendConvertedItem(items, item, elemT, isPtrElem)
 		} else {
@@ -1186,6 +1199,62 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 		item = ptr
 	}
 	return append(items, item)
+}
+
+// unmarshalerSliceBudget bounds the first allocation: the client chooses how many values arrive.
+const unmarshalerSliceBudget = 4 << 10
+
+// decodeUnmarshalerSlice unmarshals each value into an element of a detached slice,
+// set on v only if all succeed; empty values are skipped unless ZeroEmpty is set.
+func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
+	var sl reflect.Value
+	room, i := 0, 0
+	for key, value := range values {
+		if value == "" && !d.zeroEmpty {
+			continue
+		}
+		if i == room {
+			sl = growUnmarshalerSlice(sl, t, len(values))
+			room = sl.Len()
+		}
+		if value != "" { // an empty value kept for ZeroEmpty leaves its slot zero
+			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](sl.Index(i).Addr())
+			if err := um.UnmarshalText([]byte(value)); err != nil {
+				return ConversionError{
+					Key:   path,
+					Type:  t,
+					Index: key,
+					Err:   err,
+				}
+			}
+		}
+		i++
+	}
+	if room == 0 {
+		sl = reflect.MakeSlice(t, 0, 0)
+	} else if i < room {
+		sl = sl.Slice(0, i)
+	}
+	v.Set(sl)
+	return nil
+}
+
+// growUnmarshalerSlice returns sl with more room: the budget at first, then doubled, up to limit.
+func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
+	var n int
+	if sl.IsValid() {
+		n = 2 * sl.Len()
+	} else if size := int(t.Elem().Size()); size == 0 {
+		n = limit
+	} else {
+		n = max(1, unmarshalerSliceBudget/size)
+	}
+	n = min(n, limit)
+	grown := reflect.MakeSlice(t, n, n)
+	if sl.IsValid() {
+		reflect.Copy(grown, sl)
+	}
+	return grown
 }
 
 // decodeBuiltinSlice decodes values into the slice field v of type t whose
@@ -1243,7 +1312,9 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 				i++ // slot stays zero
 			}
 		case split && strings.IndexByte(value, ',') != -1:
-			for item := range strings.SplitSeq(value, ",") {
+			for rest, more := value, true; more; {
+				var item string
+				item, rest, more = utils.CutByte(rest, ',')
 				if item == "" {
 					if d.zeroEmpty {
 						i++ // slot stays zero
@@ -1301,7 +1372,9 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 				out = append(out, zero)
 			}
 		case split && strings.IndexByte(value, ',') != -1:
-			for item := range strings.SplitSeq(value, ",") {
+			for rest, more := value, true; more; {
+				var item string
+				item, rest, more = utils.CutByte(rest, ',')
 				if item == "" {
 					if zeroEmpty {
 						out = append(out, zero)
