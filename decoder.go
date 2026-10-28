@@ -858,9 +858,12 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				// the existing capacity would write into memory the caller
 				// may still share through another slice aliasing it.
 				if nested {
-					if grow.nested += n * int(t.Elem().Size()); grow.nested > maxNestedSliceBytes {
+					// Checked before adding, so the count cannot wrap and a refused key costs nothing.
+					sz := int(t.Elem().Size())
+					if sz != 0 && n > (maxNestedSliceBytes-grow.nested)/sz {
 						return errTooManyElements
 					}
+					grow.nested += n * sz
 				}
 				value := reflect.MakeSlice(t, n, d.growCap(n, owner >= 0))
 				if v.Len() > 0 {
