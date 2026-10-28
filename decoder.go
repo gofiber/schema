@@ -689,7 +689,7 @@ func isMultipartField(typ reflect.Type) bool {
 // walkHops follows a path to the target field, dereferencing pointers and
 // allocating the embedded pointers promoted fields need on the way. It
 // returns the zero Value when an unsettable nil embedded pointer blocks the
-// walk.
+// walk, and an error once the call's allocation budget is spent.
 func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value, error) {
 	var err error
 	for _, hop := range hops {
@@ -731,7 +731,7 @@ func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value
 // allocated so promoted fields stay reachable. It returns the zero Value
 // when the chain is blocked by a nil pointer that cannot be set (an
 // unexported embedded pointer), which callers treat as an unreachable
-// field.
+// field, and an error once the call's allocation budget is spent.
 func walkIndexChain(v reflect.Value, chain []int, grow *growTracker) (reflect.Value, error) {
 	for j, fi := range chain {
 		if j > 0 && v.Kind() == reflect.Pointer {
@@ -750,10 +750,8 @@ func walkIndexChain(v reflect.Value, chain []int, grow *growTracker) (reflect.Va
 	return v, nil
 }
 
-// growTracker remembers the backing arrays a Decode call allocated for the
-// slices at a key's first index, so they can grow geometrically, and what the
-// call counted toward maxAllocBytes. Arrays past the eight entries grow
-// exactly.
+// growTracker counts what a Decode call allocates toward maxAllocBytes and lets the
+// first eight arrays it grows at a key's first index grow geometrically.
 type growTracker struct {
 	arrays [8]unsafe.Pointer
 	n      int
@@ -883,10 +881,8 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			if ours && n <= v.Cap() {
 				v.SetLen(n)
 			} else {
-				// Otherwise grow into a fresh backing array: extending within
-				// the existing capacity would write into memory the caller
-				// may still share through another slice aliasing it. A root
-				// field reserves room from its first growth, other slices from their second.
+				// Otherwise grow into a fresh array, as the caller may still alias the old one;
+				// a root field reserves room from its first growth, other slices from their second.
 				c := d.growCap(n, slot >= 0 && (root || ours))
 				// Only a tracked slice field of the destination struct is left to its index limit.
 				if slot < 0 || !root {
