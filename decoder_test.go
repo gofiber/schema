@@ -3764,6 +3764,31 @@ func TestDecodePathDepthLimit(t *testing.T) {
 	}
 }
 
+func TestRequiredCheckLinearInKeyLength(t *testing.T) {
+	t.Parallel()
+	// Nine required keys: a map of at most eight compares long keys by length without hashing them.
+	type form struct {
+		A string `schema:"a,required"`
+		B string `schema:"b,required"`
+		C string `schema:"c,required"`
+		D string `schema:"d,required"`
+		E string `schema:"e,required"`
+		F string `schema:"f,required"`
+		G string `schema:"g,required"`
+		H string `schema:"h,required"`
+		I string `schema:"i,required"`
+	}
+	key := strings.Repeat("x.", 1<<19) + "x"
+	start := time.Now()
+	err := NewDecoder().Decode(new(form), map[string][]string{key: {"1"}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("a %d-byte key took %v to check", len(key), elapsed)
+	}
+	if err == nil {
+		t.Fatal("want the required keys reported missing")
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{

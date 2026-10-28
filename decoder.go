@@ -493,7 +493,8 @@ func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) 
 // new pending count. Callers test for a dotted, non-empty key themselves, so
 // the keys that can answer nothing do not pay for a call.
 func markProvidedByNestedKey(info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
-	for {
+	// Each lookup hashes the whole prefix, so stopping at the longest one keeps a long key linear.
+	for off <= info.maxRequiredPrefixLen {
 		for _, p := range info.requiredPrefixes[key[:off]] {
 			if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
 				continue
@@ -509,6 +510,7 @@ func markProvidedByNestedKey(info *structInfo, key string, off int, val []string
 		}
 		off += i + 1
 	}
+	return pending
 }
 
 // missingRequired reports the required keys nothing in src answered.
