@@ -3787,6 +3787,40 @@ func TestDecodeNestedSliceLimit(t *testing.T) {
 	}
 }
 
+type TreeNode[T any] struct {
+	Parent *T `schema:"parent"`
+}
+
+type Category struct {
+	TreeNode[Category]
+	Name string `schema:"name,default:none"`
+}
+
+type ENode struct {
+	*Inner
+}
+
+type Inner struct {
+	L    *ENode `schema:"l"`
+	Name string `schema:"name"`
+}
+
+func TestDefaultsWalkThroughEmbeddedRecursion(t *testing.T) {
+	t.Parallel()
+	// Each level holds an embedded field and its promoted copy; walking both doubled the work per level.
+	d := NewDecoder()
+	c := new(Category)
+	if err := d.Decode(c, map[string][]string{strings.Repeat("parent.", maxPathDepth-1) + "name": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if c.Name != "none" || c.Parent.Name != "none" {
+		t.Fatalf("defaults not set: %q, %q", c.Name, c.Parent.Name)
+	}
+	if err := d.Decode(new(ENode), map[string][]string{strings.Repeat("l.", maxPathDepth-1) + "name": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRequiredCheckLinearInKeyLength(t *testing.T) {
 	t.Parallel()
 	// Nine required keys: a map of at most eight compares long keys by length without hashing them.

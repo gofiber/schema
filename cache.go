@@ -564,8 +564,9 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	for _, f := range info.fields {
-		if k := f.typ.Kind(); f.def != nil || k == reflect.Struct ||
-			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct) {
+		// A promoted struct is walked through its embedded field, under the same prefix.
+		if k := f.typ.Kind(); f.def != nil || len(f.index) == 1 && (k == reflect.Struct ||
+			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct)) {
 			info.defaultFields = append(info.defaultFields, f)
 		}
 		if f.mapValue != nil {
