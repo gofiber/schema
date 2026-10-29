@@ -3732,6 +3732,267 @@ func TestDecodeIndexExceedsParserLimit(t *testing.T) {
 	}
 }
 
+func TestDecodePathDepthLimit(t *testing.T) {
+	t.Parallel()
+	type node struct {
+		Name     string `schema:"name"`
+		Children []node `schema:"children"`
+	}
+	type comment struct {
+		Parent *comment `schema:"parent"`
+		Text   string   `schema:"text,default:none"`
+	}
+	tests := []struct {
+		dst          func() any
+		level, field string
+	}{
+		{func() any { return new(node) }, "children.0.", "name"},
+		{func() any { return new(comment) }, "parent.", "text"},
+	}
+	d := NewDecoder()
+	d.IgnoreUnknownKeys(true)
+	for _, tt := range tests {
+		key := strings.Repeat(tt.level, maxPathDepth-1) + tt.field
+		if err := d.Decode(tt.dst(), map[string][]string{key: {"x"}}); err != nil {
+			t.Fatalf("%d fields: %v", maxPathDepth, err)
+		}
+		key = tt.level + key
+		err := d.Decode(tt.dst(), map[string][]string{key: {"x"}})
+		if want := (MultiError{key: errPathTooDeep}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%d fields: got %v, want %v", maxPathDepth+1, err, want)
+		}
+	}
+}
+
+func TestDecodeNestedSliceLimit(t *testing.T) {
+	t.Parallel()
+	type node struct {
+		Name     string `schema:"name"`
+		Children []node `schema:"children"`
+	}
+	// Each key grows one slice of maxParserIndex+1 nodes below its first index.
+	fit := maxAllocBytes / ((maxParserIndex + 1) * int(reflect.TypeFor[node]().Size()))
+	keys, values := make([]string, fit+2), make([]string, fit+2)
+	for i := range keys {
+		keys[i] = "children." + strconv.Itoa(i) + ".children." + strconv.Itoa(maxParserIndex) + ".name"
+		values[i] = "x"
+	}
+	// The refused key takes nothing from the budget, so what is left still fits a small one.
+	keys[fit+1] = "children." + strconv.Itoa(fit+1) + ".children.0.name"
+	d := NewDecoder()
+	if err := d.DecodeValues(new(node), keys[:fit], values[:fit]); err != nil {
+		t.Fatalf("%d keys: %v", fit, err)
+	}
+	err := d.DecodeValues(new(node), keys, values)
+	if want := (MultiError{keys[fit]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("%d keys: got %v, want %v", fit+2, err, want)
+	}
+	// Inside a slice element every reallocation counts, so an ascending fill stops early.
+	size, used, refused := int(reflect.TypeFor[node]().Size()), 0, 0
+	for ; used+(refused+1)*size <= maxAllocBytes; refused++ {
+		used += (refused + 1) * size
+	}
+	keys, values = make([]string, refused+1), make([]string, refused+1)
+	for i := range keys {
+		keys[i], values[i] = "children.0.children."+strconv.Itoa(i)+".name", "x"
+	}
+	err = NewDecoder().DecodeValues(new(node), keys, values)
+	if want := (MultiError{keys[refused]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("ascending fill: got %v, want %v", err, want)
+	}
+}
+
+func TestDecodeNestedSliceLimitThroughPointers(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		Name string `schema:"name"`
+		Note string
+		N    int
+	}
+	type tree struct {
+		Left  *tree  `schema:"l"`
+		Right *tree  `schema:"r"`
+		Items []item `schema:"items"`
+	}
+	// Every key reaches the slice of another node at its first index; the nodes no earlier key reached count too.
+	used := func(keys int) int {
+		n := keys * (maxParserIndex + 1) * int(reflect.TypeFor[item]().Size())
+		for depth := 1; depth <= 10; depth++ {
+			n += min(keys, 1<<depth) * int(reflect.TypeFor[tree]().Size())
+		}
+		return n
+	}
+	fit := 0
+	for used(fit+1) <= maxAllocBytes {
+		fit++
+	}
+	keys, values := make([]string, fit+1), make([]string, fit+1)
+	for i := range keys {
+		var b strings.Builder
+		for j := range 10 {
+			b.WriteString([2]string{"l.", "r."}[i>>j&1])
+		}
+		keys[i] = b.String() + "items." + strconv.Itoa(maxParserIndex) + ".name"
+		values[i] = "x"
+	}
+	d := NewDecoder()
+	if err := d.DecodeValues(new(tree), keys[:fit], values[:fit]); err != nil {
+		t.Fatalf("%d keys: %v", fit, err)
+	}
+	err := d.DecodeValues(new(tree), keys, values)
+	if want := (MultiError{keys[fit]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
+	}
+	// Such a slice filled in ascending order grows geometrically, so it fits as well.
+	keys, values = make([]string, maxParserIndex+1), make([]string, maxParserIndex+1)
+	for i := range keys {
+		keys[i], values[i] = "l.items."+strconv.Itoa(i)+".name", "x"
+	}
+	if err := d.DecodeValues(new(tree), keys, values); err != nil {
+		t.Fatalf("ascending fill: %v", err)
+	}
+}
+
+func TestDecodeFirstIndexGrowsGeometrically(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		Name string `schema:"name"`
+		Note string
+		N    int
+	}
+	type tree struct {
+		Left  *tree  `schema:"l"`
+		Right *tree  `schema:"r"`
+		Items []item `schema:"items"`
+	}
+	keys, values := make([]string, maxParserIndex+1), make([]string, maxParserIndex+1)
+	for i := range keys {
+		keys[i], values[i] = "l.items."+strconv.Itoa(i)+".name", "x"
+	}
+	var dst tree
+	if err := NewDecoder().DecodeValues(&dst, keys, values); err != nil {
+		t.Fatal(err)
+	}
+	if got := dst.Left.Items; len(got) != len(keys) || cap(got) == len(got) {
+		t.Fatalf("len %d, cap %d: want room reserved ahead", len(got), cap(got))
+	}
+	// Once every tracked entry is taken, each reallocation counts toward the budget.
+	keys, values = nil, nil
+	for _, p := range []string{"l.", "r.", "l.l.", "l.r.", "r.l.", "r.r.", "l.l.l.", "l.l.r."} {
+		keys, values = append(keys, p+"items.0.name"), append(values, "x")
+	}
+	size := int(reflect.TypeFor[item]().Size())
+	used, refused := len(keys)*size, 0
+	for ; used+(refused+1)*size <= maxAllocBytes; refused++ {
+		used += (refused + 1) * size
+	}
+	for i := range refused + 1 {
+		keys, values = append(keys, "r.r.r.items."+strconv.Itoa(i)+".name"), append(values, "x")
+	}
+	err := NewDecoder().DecodeValues(new(tree), keys, values)
+	if want := (MultiError{keys[len(keys)-1]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+}
+
+func TestDecodeCountsPointerTargets(t *testing.T) {
+	t.Parallel()
+	type Pad struct{ B [maxAllocBytes / 40]byte }
+	type chain struct {
+		L    *chain `schema:"l"`
+		Name string `schema:"name"`
+		Pad
+	}
+	type embedded struct {
+		*Pad
+		L    *embedded `schema:"l"`
+		Name string    `schema:"name"`
+	}
+	pad := int(reflect.TypeFor[Pad]().Size())
+	tests := []struct {
+		dst        func() any
+		first, per int // what the first key allocates on top of per, and what each key does
+	}{
+		{func() any { return new(chain) }, 0, int(reflect.TypeFor[chain]().Size())},
+		{func() any { return new(embedded) }, pad, int(reflect.TypeFor[embedded]().Size()) + pad},
+	}
+	for _, tt := range tests {
+		// Each key reaches one node deeper than the last.
+		fit := (maxAllocBytes - tt.first) / tt.per
+		keys, values := make([]string, fit+1), make([]string, fit+1)
+		for i := range keys {
+			keys[i], values[i] = strings.Repeat("l.", i+1)+"name", "x"
+		}
+		d := NewDecoder()
+		if err := d.DecodeValues(tt.dst(), keys[:fit], values[:fit]); err != nil {
+			t.Fatalf("%d keys: %v", fit, err)
+		}
+		err := d.DecodeValues(tt.dst(), keys, values)
+		if want := (MultiError{keys[fit]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
+		}
+	}
+}
+
+type TreeNode[T any] struct {
+	Parent *T `schema:"parent"`
+}
+
+type Category struct {
+	TreeNode[Category]
+	Name string `schema:"name,default:none"`
+}
+
+type ENode struct {
+	*Inner
+}
+
+type Inner struct {
+	L    *ENode `schema:"l"`
+	Name string `schema:"name"`
+}
+
+func TestDefaultsWalkThroughEmbeddedRecursion(t *testing.T) {
+	t.Parallel()
+	// Each level holds an embedded field and its promoted copy; walking both doubled the work per level.
+	d := NewDecoder()
+	c := new(Category)
+	if err := d.Decode(c, map[string][]string{strings.Repeat("parent.", maxPathDepth-1) + "name": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if c.Name != "none" || c.Parent.Name != "none" {
+		t.Fatalf("defaults not set: %q, %q", c.Name, c.Parent.Name)
+	}
+	if err := d.Decode(new(ENode), map[string][]string{strings.Repeat("l.", maxPathDepth-1) + "name": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRequiredCheckLinearInKeyLength(t *testing.T) {
+	t.Parallel()
+	// Nine required keys: a map of at most eight compares long keys by length without hashing them.
+	type form struct {
+		A string `schema:"a,required"`
+		B string `schema:"b,required"`
+		C string `schema:"c,required"`
+		D string `schema:"d,required"`
+		E string `schema:"e,required"`
+		F string `schema:"f,required"`
+		G string `schema:"g,required"`
+		H string `schema:"h,required"`
+		I string `schema:"i,required"`
+	}
+	key := strings.Repeat("x.", 1<<19) + "x"
+	start := time.Now()
+	err := NewDecoder().Decode(new(form), map[string][]string{key: {"1"}})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("a %d-byte key took %v to check", len(key), elapsed)
+	}
+	if err == nil {
+		t.Fatal("want the required keys reported missing")
+	}
+}
+
 func BenchmarkHandleMultipartField(b *testing.B) {
 	// Create dummy file headers for testing
 	dummyFile := &multipart.FileHeader{

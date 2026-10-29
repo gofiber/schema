@@ -36,9 +36,14 @@ const maxDirectPaths = 512
 // reservation still works, and real paths are a few segments deep.
 const maxPathReserve = 16
 
+// maxPathDepth caps the fields one path names: decoding recurses per level,
+// and a type that contains itself puts no other bound on the depth.
+const maxPathDepth = 64
+
 var (
 	errInvalidPath   = errors.New("schema: invalid path")
 	errIndexTooLarge = errors.New("schema: index exceeds parser limit")
+	errPathTooDeep   = errors.New("schema: path exceeds depth limit")
 )
 
 // newCache returns a new cache.
@@ -174,7 +179,10 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	hopStart := 0
 	// Only paths spelled as declared (alias or its lower case, plain indexes) are cached.
 	canonical := true
-	for keyStart := 0; ; {
+	for keyStart, depth := 0, 0; ; depth++ {
+		if depth == maxPathDepth {
+			return nil, errPathTooDeep
+		}
 		keyEnd, segment, err := nextPathSegment(p, keyStart)
 		if err != nil {
 			return nil, errInvalidPath
@@ -556,11 +564,9 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	for _, f := range info.fields {
-		if f.takesIndex() {
-			info.hasIndexedSlice = true
-		}
-		if k := f.typ.Kind(); f.def != nil || k == reflect.Struct ||
-			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct) {
+		// A promoted struct is walked through its embedded field, under the same prefix.
+		if k := f.typ.Kind(); f.def != nil || len(f.index) == 1 && (k == reflect.Struct ||
+			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct)) {
 			info.defaultFields = append(info.defaultFields, f)
 		}
 		if f.mapValue != nil {
@@ -572,6 +578,9 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
 	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
+	for k := range info.requiredPrefixes {
+		info.maxRequiredPrefixLen = max(info.maxRequiredPrefixLen, len(k))
+	}
 	info.direct = c.buildDirectPaths(info)
 	info.directIndex = newFoldIndex(info.direct)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
@@ -844,8 +853,9 @@ type structInfo struct {
 	// requiredGroups lists the required keys in a stable order, so each has
 	// an index the satisfied-group bitset can address; requiredPrefixes maps
 	// a nested-key prefix to the groups a key under it can satisfy.
-	requiredGroups   []requiredGroup
-	requiredPrefixes map[string][]requiredPrefix
+	requiredGroups       []requiredGroup
+	requiredPrefixes     map[string][]requiredPrefix
+	maxRequiredPrefixLen int
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
@@ -854,11 +864,8 @@ type structInfo struct {
 	directIndex foldIndex
 	// paths caches parsed paths rooted at this struct type; keys are cloned
 	// so they never alias reused request buffers.
-	paths pathCache
-	// hasIndexedSlice reports whether any field's paths carry a slice element
-	// index, and so may grow that slice while decoding.
-	hasIndexedSlice bool
-	hasMapFields    bool
+	paths        pathCache
+	hasMapFields bool
 	// defaultFields are the fields the setDefaults walk has to visit: those
 	// with a default, and the structs and pointers to structs it descends
 	// into. The rest of the fields can never be affected by it.
