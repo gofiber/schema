@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	utils "github.com/gofiber/utils/v2"
+	utilstrings "github.com/gofiber/utils/v2/strings"
 )
 
 const (
@@ -545,16 +546,15 @@ func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uin
 // key was looked up exactly, so it is skipped unless a required path is not.
 func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
 	var buf [maxDirectKeyLen]byte
-	var folded []byte
+	var lower string
 	if len(key) <= maxDirectKeyLen {
-		folded = buf[:len(key)]
-	} else {
-		folded = make([]byte, len(key))
-	}
-	if !foldASCIILower(folded, key) && !info.requiredMixedCase {
+		if !foldASCIILower(buf[:len(key)], key) && !info.requiredMixedCase {
+			return pending
+		}
+		lower = utils.UnsafeString(buf[:len(key)])
+	} else if lower = utilstrings.ToLower(key); lower == key && !info.requiredMixedCase {
 		return pending
 	}
-	lower := utils.UnsafeString(folded)
 	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
 	for off := 0; pending > 0; {
 		i := strings.IndexByte(lower[off:], '.')

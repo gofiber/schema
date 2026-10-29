@@ -2996,6 +2996,23 @@ func TestRequiredLongKeyMatchesAnyCase(t *testing.T) {
 	}
 }
 
+// A long lowercase key needs no folded lookup, so it costs no more than a short one.
+func TestRequiredLongLowercaseKeyDoesNotAllocate(t *testing.T) {
+	long := strings.Repeat("unrelated", 8)
+	if len(long) <= maxDirectKeyLen {
+		t.Fatalf("key is %d bytes, must exceed %d for this test", len(long), maxDirectKeyLen)
+	}
+	decoder := NewDecoder()
+	info := decoder.cache.get(reflect.TypeFor[requiredFormStruct]())
+	allocs := func(key string) float64 {
+		src := map[string][]string{key: {"v"}}
+		return testing.AllocsPerRun(100, func() { _ = decoder.checkRequired(info, src) })
+	}
+	if short, got := allocs("unrelated"), allocs(long); got != short {
+		t.Fatalf("long key: %v allocs, short key: %v", got, short)
+	}
+}
+
 func TestRequiredFieldsCannotHaveDefaults(t *testing.T) {
 	type D struct {
 		S string  `schema:"s,required,default:test1"`
