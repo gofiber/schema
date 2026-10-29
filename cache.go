@@ -572,6 +572,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
 	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
+	info.foldedRequiredPaths, info.foldedRequiredPrefixes, info.requiredMixedCase = buildFoldedRequiredIndex(info.requiredGroups)
 	info.direct = c.buildDirectPaths(info)
 	info.directIndex = newFoldIndex(info.direct)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
@@ -632,11 +633,16 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 
 // directEligible reports whether f can serve as a direct-path terminal: it is
 // its alias's first-wins winner, the alias has no dot, and a bare alias is a
-// valid path (slice-of-structs fields require a following slice index).
+// valid path.
 func directEligible(info *structInfo, f *fieldInfo) bool {
 	if info.fieldsByName[f.aliasLower] != f || strings.IndexByte(f.aliasLower, '.') >= 0 {
 		return false
 	}
+	return f.endsPath()
+}
+
+// endsPath reports whether a path may end at f: a slice of structs needs an index after it, a map field a key.
+func (f *fieldInfo) endsPath() bool {
 	return !f.takesIndex() && f.mapValue == nil
 }
 
@@ -846,6 +852,11 @@ type structInfo struct {
 	// a nested-key prefix to the groups a key under it can satisfy.
 	requiredGroups   []requiredGroup
 	requiredPrefixes map[string][]requiredPrefix
+	// The required paths and prefixes lowercased, for keys in another case;
+	// requiredMixedCase is set if any of them was not lowercase.
+	foldedRequiredPaths    map[string][]requiredPrefix
+	foldedRequiredPrefixes map[string][]requiredPrefix
+	requiredMixedCase      bool
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
@@ -956,6 +967,45 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 		}
 	}
 	return prefixes
+}
+
+// buildFoldedRequiredIndex indexes the groups by their lowercased paths and nested-key prefixes.
+func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[string][]requiredPrefix, mixedCase bool) {
+	if len(groups) == 0 {
+		return nil, nil, false
+	}
+	paths = make(map[string][]requiredPrefix)
+	prefixes = make(map[string][]requiredPrefix)
+	for gi := range groups {
+		for _, f := range groups[gi].fields {
+			for _, path := range f.searchPaths {
+				lower := utilstrings.ToLower(path)
+				mixedCase = mixedCase || lower != path
+				addRequiredOwner(paths, lower, gi, f.typ)
+			}
+			typ := f.typ
+			if f.mapValue != nil {
+				typ = typ.Elem()
+			}
+			for _, dot := range f.searchPathDots {
+				lower := utilstrings.ToLower(dot)
+				mixedCase = mixedCase || lower != dot
+				addRequiredOwner(prefixes, lower, gi, typ)
+			}
+		}
+	}
+	return paths, prefixes, mixedCase
+}
+
+// addRequiredOwner adds group gi to index[key], once per field type.
+func addRequiredOwner(index map[string][]requiredPrefix, key string, gi int, typ reflect.Type) {
+	owners := index[key]
+	for _, o := range owners {
+		if o.group == gi && o.typ == typ {
+			return
+		}
+	}
+	index[key] = append(owners, requiredPrefix{group: gi, typ: typ})
 }
 
 func containsAlias(infos []*structInfo, alias string) bool {

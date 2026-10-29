@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	utils "github.com/gofiber/utils/v2"
+	utilstrings "github.com/gofiber/utils/v2/strings"
 )
 
 const (
@@ -224,6 +225,9 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, grow, satisfied, path, values, errs, pending)
 		}
 	}
+	if pending > 0 {
+		pending = markProvidedFolded(d.cache, rootInfo, src, satisfied, pending)
+	}
 	if rootInfo.needsDefaultsWalk {
 		errs = mergeErrors(errs, d.setDefaults(t, v, src, ""))
 	}
@@ -241,12 +245,12 @@ func (d *Decoder) decodeKey(
 	v reflect.Value, rootInfo *structInfo, files map[string][]*multipart.FileHeader, grow *growTracker,
 	satisfied []uint64, path string, values []string, errs MultiError, pending int,
 ) (MultiError, int) {
-	if pending > 0 {
-		if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
-			pending = markProvidedByNestedKey(rootInfo, path, i+1, values, satisfied, pending)
-		}
-	}
 	if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
+		if pending > 0 {
+			if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
+				pending = markProvidedByNestedKey(nil, rootInfo, path, i+1, values, satisfied, pending)
+			}
+		}
 		var filesSlice []*multipart.FileHeader
 		if files != nil {
 			filesSlice = files[path]
@@ -458,9 +462,9 @@ func keyProvided(src *source, prefix, name string) bool {
 // A group is satisfied by a value under one of its own paths, or by any
 // nested key below one of them ("d.e" satisfies required "d"). Direct paths
 // are looked up first, since they settle almost every group; what is left is
-// answered by walking the dotted prefixes of each source key. Decode runs
-// those three steps around its own loop over src; checkRequired composes them
-// for a standalone check.
+// answered by walking the dotted prefixes of each source key, then by the keys
+// in another case. Decode runs those steps around its own loop over src;
+// checkRequired composes them for a standalone check.
 
 // requiredBitWords sizes the inline satisfied-group bitset: 256 required
 // keys, past which it is allocated.
@@ -492,17 +496,18 @@ func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) 
 // markProvidedByNestedKey walks the dotted prefixes of key from off, marking
 // every required group they name that val is non-empty for, and returns the
 // new pending count. Callers test for a dotted, non-empty key themselves, so
-// the keys that can answer nothing do not pay for a call.
-func markProvidedByNestedKey(info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
+// the keys that can answer nothing do not pay for a call. Only a key the
+// decoder can parse counts: c parses it, or nil if the caller already has.
+func markProvidedByNestedKey(c *cache, info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
 	for {
-		for _, p := range info.requiredPrefixes[key[:off]] {
-			if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
-				continue
+		if owners := info.requiredPrefixes[key[:off]]; len(owners) > 0 {
+			if c != nil {
+				if _, err := c.parsePathInfo(key, info); err != nil {
+					return pending
+				}
+				c = nil
 			}
-			if !isEmpty(p.typ, val) {
-				satisfied[p.group>>6] |= 1 << uint(p.group&63)
-				pending--
-			}
+			pending = markProvided(owners, val, satisfied, pending)
 		}
 		i := strings.IndexByte(key[off:], '.')
 		if i < 0 {
@@ -510,6 +515,78 @@ func markProvidedByNestedKey(info *structInfo, key string, off int, val []string
 		}
 		off += i + 1
 	}
+}
+
+// markProvidedFolded matches src's keys case-insensitively against the groups still pending.
+func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uint64, pending int) int {
+	if p := src.pairs; p != nil {
+		var scratch [8]string
+		for i, key := range p.keys {
+			if !p.first(i) {
+				continue
+			}
+			if pending = markProvidedByFoldedKey(c, info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
+				break
+			}
+		}
+		return pending
+	}
+	for key, val := range src.m {
+		if len(val) == 0 {
+			continue
+		}
+		if pending = markProvidedByFoldedKey(c, info, key, val, satisfied, pending); pending == 0 {
+			break
+		}
+	}
+	return pending
+}
+
+// markProvidedByFoldedKey marks the groups key names in lower case; a lowercase
+// key was looked up exactly, so it is skipped unless a required path is not.
+func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []string, satisfied []uint64, pending int) int {
+	var buf [maxDirectKeyLen]byte
+	var lower string
+	if len(key) <= maxDirectKeyLen {
+		if !foldASCIILower(buf[:len(key)], key) && !info.requiredMixedCase {
+			return pending
+		}
+		lower = utils.UnsafeString(buf[:len(key)])
+	} else if lower = utilstrings.ToLower(key); lower == key && !info.requiredMixedCase {
+		return pending
+	}
+	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
+	for off := 0; pending > 0; {
+		i := strings.IndexByte(lower[off:], '.')
+		if i < 0 {
+			break
+		}
+		off += i + 1
+		if owners := info.foldedRequiredPrefixes[lower[:off]]; len(owners) > 0 {
+			if c != nil {
+				if _, err := c.parsePathInfo(key, info); err != nil {
+					return pending
+				}
+				c = nil
+			}
+			pending = markProvided(owners, val, satisfied, pending)
+		}
+	}
+	return pending
+}
+
+// markProvided marks the owners' groups that val is non-empty for; group g is bit g&63 of satisfied[g>>6].
+func markProvided(owners []requiredPrefix, val []string, satisfied []uint64, pending int) int {
+	for _, p := range owners {
+		if satisfied[p.group>>6]&(1<<uint(p.group&63)) != 0 {
+			continue
+		}
+		if !isEmpty(p.typ, val) {
+			satisfied[p.group>>6] |= 1 << uint(p.group&63)
+			pending--
+		}
+	}
+	return pending
 }
 
 // missingRequired reports the required keys nothing in src answered.
@@ -538,10 +615,13 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 			if i < 0 || len(val) == 0 {
 				continue
 			}
-			if pending = markProvidedByNestedKey(info, key, i+1, val, satisfied, pending); pending == 0 {
+			if pending = markProvidedByNestedKey(d.cache, info, key, i+1, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}
+	}
+	if pending > 0 {
+		pending = markProvidedFolded(d.cache, info, &s, satisfied, pending)
 	}
 	return missingRequired(info.requiredGroups, satisfied, pending)
 }
@@ -566,7 +646,7 @@ type fieldWithPrefix struct {
 	// searchPaths lists the src keys this required field answers to, and
 	// searchPathDots the corresponding nested-key prefixes; both are
 	// precomputed at cache-build time so per-request checks allocate
-	// nothing.
+	// nothing. A field no path may end at has no searchPaths.
 	searchPaths    []string
 	searchPathDots []string
 }
@@ -576,6 +656,9 @@ func newFieldWithPrefix(f *fieldInfo, prefix string) fieldWithPrefix {
 	dots := make([]string, len(paths))
 	for i, p := range paths {
 		dots[i] = p + "."
+	}
+	if !f.endsPath() {
+		paths = nil
 	}
 	return fieldWithPrefix{
 		fieldInfo:      f,
@@ -598,7 +681,7 @@ func directlyProvided(fields []fieldWithPrefix, src *source) bool {
 	return false
 }
 
-// isEmpty returns true if value is empty for specific type
+// isEmpty returns true if value is empty for specific type, judging the last value as a scalar decodes it.
 func isEmpty(t reflect.Type, value []string) bool {
 	if len(value) == 0 {
 		return true
@@ -608,7 +691,7 @@ func isEmpty(t reflect.Type, value []string) bool {
 		intType, int8Type, int16Type, int32Type, int64Type,
 		stringType,
 		uintType, uint8Type, uint16Type, uint32Type, uint64Type:
-		return len(value[0]) == 0
+		return len(value[len(value)-1]) == 0
 	}
 	return false
 }
