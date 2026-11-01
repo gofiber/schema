@@ -577,11 +577,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	info.requiredGroups = c.buildRequiredFields(info)
-	info.requiredPrefixes = buildRequiredPrefixes(info.requiredGroups)
-	for k := range info.requiredPrefixes {
-		info.maxRequiredPrefixLen = max(info.maxRequiredPrefixLen, len(k))
-	}
-	info.foldedRequiredPaths, info.foldedRequiredPrefixes, info.requiredMixedCase = buildFoldedRequiredIndex(info.requiredGroups)
+	buildRequiredIndex(info)
 	info.direct = c.buildDirectPaths(info)
 	info.directIndex = newFoldIndex(info.direct)
 	// The setDefaults walk also allocates nil anonymous embedded pointers,
@@ -862,11 +858,9 @@ type structInfo struct {
 	requiredGroups       []requiredGroup
 	requiredPrefixes     map[string][]requiredPrefix
 	maxRequiredPrefixLen int
-	// The required paths and prefixes lowercased, for keys in another case;
-	// requiredMixedCase is set if any of them was not lowercase.
+	// The required paths and prefixes lowercased, for keys in another case.
 	foldedRequiredPaths    map[string][]requiredPrefix
 	foldedRequiredPrefixes map[string][]requiredPrefix
-	requiredMixedCase      bool
 	// direct maps lowercase statically-resolvable keys to their precomputed
 	// parsed paths; built once and immutable, see buildDirectPaths.
 	direct map[string][]pathPart
@@ -886,6 +880,8 @@ type structInfo struct {
 	// anonymous embedded pointer field (which the walk allocates) exists
 	// anywhere in the tree, letting the decoder skip the walk otherwise.
 	needsDefaultsWalk bool
+	// requiredMixedCase is set if a required path or prefix is not lowercase.
+	requiredMixedCase bool
 }
 
 func (i *structInfo) get(alias string) *fieldInfo {
@@ -940,16 +936,25 @@ func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
 	return groups
 }
 
-// buildRequiredPrefixes indexes the groups by the nested-key prefix that can
-// satisfy them ("d." for required key "d"), so a source key can be resolved
-// against all of them at once.
-func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
+// buildRequiredIndex indexes info's required groups by the nested-key prefix
+// that can satisfy them ("d." for required key "d"), so a source key can be
+// resolved against all of them at once, and by their paths and prefixes
+// lowercased, for keys in another case.
+func buildRequiredIndex(info *structInfo) {
+	groups := info.requiredGroups
 	if len(groups) == 0 {
-		return nil
+		return
 	}
-	prefixes := make(map[string][]requiredPrefix)
+	info.requiredPrefixes = make(map[string][]requiredPrefix)
+	info.foldedRequiredPaths = make(map[string][]requiredPrefix)
+	info.foldedRequiredPrefixes = make(map[string][]requiredPrefix)
 	for gi := range groups {
 		for _, f := range groups[gi].fields {
+			for _, path := range f.searchPaths {
+				lower := utilstrings.ToLower(path)
+				info.requiredMixedCase = info.requiredMixedCase || lower != path
+				addRequiredOwner(info.foldedRequiredPaths, lower, gi, f.typ)
+			}
 			typ := f.typ
 			if f.mapValue != nil {
 				// A key under a map field gives one entry, so it is empty
@@ -957,54 +962,18 @@ func buildRequiredPrefixes(groups []requiredGroup) map[string][]requiredPrefix {
 				typ = typ.Elem()
 			}
 			for _, dot := range f.searchPathDots {
-				owners := prefixes[dot]
-				// One entry per (group, type): several fields of a group
-				// can reach the same prefix.
-				dup := false
-				for _, o := range owners {
-					if o.group == gi && o.typ == typ {
-						dup = true
-						break
-					}
-				}
-				if !dup {
-					prefixes[dot] = append(owners, requiredPrefix{group: gi, typ: typ})
-				}
-			}
-		}
-	}
-	return prefixes
-}
-
-// buildFoldedRequiredIndex indexes the groups by their lowercased paths and nested-key prefixes.
-func buildFoldedRequiredIndex(groups []requiredGroup) (paths, prefixes map[string][]requiredPrefix, mixedCase bool) {
-	if len(groups) == 0 {
-		return nil, nil, false
-	}
-	paths = make(map[string][]requiredPrefix)
-	prefixes = make(map[string][]requiredPrefix)
-	for gi := range groups {
-		for _, f := range groups[gi].fields {
-			for _, path := range f.searchPaths {
-				lower := utilstrings.ToLower(path)
-				mixedCase = mixedCase || lower != path
-				addRequiredOwner(paths, lower, gi, f.typ)
-			}
-			typ := f.typ
-			if f.mapValue != nil {
-				typ = typ.Elem()
-			}
-			for _, dot := range f.searchPathDots {
+				addRequiredOwner(info.requiredPrefixes, dot, gi, typ)
 				lower := utilstrings.ToLower(dot)
-				mixedCase = mixedCase || lower != dot
-				addRequiredOwner(prefixes, lower, gi, typ)
+				info.requiredMixedCase = info.requiredMixedCase || lower != dot
+				addRequiredOwner(info.foldedRequiredPrefixes, lower, gi, typ)
+				info.maxRequiredPrefixLen = max(info.maxRequiredPrefixLen, len(dot))
 			}
 		}
 	}
-	return paths, prefixes, mixedCase
 }
 
-// addRequiredOwner adds group gi to index[key], once per field type.
+// addRequiredOwner adds group gi to index[key], once per field type: several
+// fields of a group can reach the same key.
 func addRequiredOwner(index map[string][]requiredPrefix, key string, gi int, typ reflect.Type) {
 	owners := index[key]
 	for _, o := range owners {

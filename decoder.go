@@ -248,7 +248,7 @@ func (d *Decoder) decodeKey(
 	if parts, err := d.cache.parsePathInfo(path, rootInfo); err == nil {
 		if pending > 0 {
 			if i := strings.IndexByte(path, '.'); i >= 0 && len(values) > 0 {
-				pending = markProvidedByNestedKey(nil, rootInfo, path, i+1, values, satisfied, pending)
+				pending = markProvidedByNestedKey(d.cache, true, rootInfo, path, i+1, values, satisfied, pending)
 			}
 		}
 		var filesSlice []*multipart.FileHeader
@@ -496,16 +496,17 @@ func markProvidedDirectly(groups []requiredGroup, src *source, inline []uint64) 
 // every required group they name that val is non-empty for, and returns the
 // new pending count. Callers test for a dotted, non-empty key themselves, so
 // the keys that can answer nothing do not pay for a call. Only a key the
-// decoder can parse counts: c parses it, or nil if the caller already has.
-func markProvidedByNestedKey(c *cache, info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
+// decoder can parse counts; unless parsed is set, c parses it on the first
+// prefix that names a group.
+func markProvidedByNestedKey(c *cache, parsed bool, info *structInfo, key string, off int, val []string, satisfied []uint64, pending int) int {
 	// Each lookup hashes the whole prefix, so stopping at the longest one keeps a long key linear.
 	for off <= info.maxRequiredPrefixLen {
 		if owners := info.requiredPrefixes[key[:off]]; len(owners) > 0 {
-			if c != nil {
+			if !parsed {
 				if _, err := c.parsePathInfo(key, info); err != nil {
 					return pending
 				}
-				c = nil
+				parsed = true
 			}
 			pending = markProvided(owners, val, satisfied, pending)
 		}
@@ -557,6 +558,7 @@ func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []strin
 		return pending
 	}
 	pending = markProvided(info.foldedRequiredPaths[lower], val, satisfied, pending)
+	parsed := false
 	for off := 0; pending > 0; {
 		i := strings.IndexByte(lower[off:], '.')
 		if i < 0 {
@@ -567,11 +569,11 @@ func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []strin
 			break
 		}
 		if owners := info.foldedRequiredPrefixes[lower[:off]]; len(owners) > 0 {
-			if c != nil {
+			if !parsed {
 				if _, err := c.parsePathInfo(key, info); err != nil {
 					return pending
 				}
-				c = nil
+				parsed = true
 			}
 			pending = markProvided(owners, val, satisfied, pending)
 		}
@@ -619,7 +621,7 @@ func (d *Decoder) checkRequired(info *structInfo, src map[string][]string) Multi
 			if i < 0 || len(val) == 0 {
 				continue
 			}
-			if pending = markProvidedByNestedKey(d.cache, info, key, i+1, val, satisfied, pending); pending == 0 {
+			if pending = markProvidedByNestedKey(d.cache, false, info, key, i+1, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}

@@ -2879,7 +2879,6 @@ func TestRequiredMatchesDecoding(t *testing.T) {
 	}
 }
 
-// A key the decoder ignores, bare or unparsable, satisfies no required field.
 func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	t.Parallel()
 
@@ -2994,9 +2993,15 @@ func TestRequiredLongKeyMatchesAnyCase(t *testing.T) {
 	if s.V != "x" {
 		t.Fatalf("got %q, want %q", s.V, "x")
 	}
+	s = S{}
+	if err := NewDecoder().DecodeValues(&s, []string{strings.ToUpper(long)}, []string{"x"}); err != nil {
+		t.Fatal(err)
+	}
+	if s.V != "x" {
+		t.Fatalf("DecodeValues: got %q, want %q", s.V, "x")
+	}
 }
 
-// A long lowercase key needs no folded lookup, so it costs no more than a short one.
 func TestRequiredLongLowercaseKeyDoesNotAllocate(t *testing.T) {
 	long := strings.Repeat("unrelated", 8)
 	if len(long) <= maxDirectKeyLen {
