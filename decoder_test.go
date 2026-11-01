@@ -4212,14 +4212,17 @@ func TestRequiredCheckLinearInKeyLength(t *testing.T) {
 		H string `schema:"h,required"`
 		I string `schema:"i,required"`
 	}
-	key := strings.Repeat("x.", 1<<19) + "x"
-	start := time.Now()
-	err := NewDecoder().Decode(new(form), map[string][]string{key: {"1"}})
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("a %d-byte key took %v to check", len(key), elapsed)
-	}
-	if err == nil {
-		t.Fatal("want the required keys reported missing")
+	lower := strings.Repeat("x.", 1<<19) + "x"
+	// The uppercase key goes through the folded pass too.
+	for _, key := range []string{lower, strings.ToUpper(lower)} {
+		start := time.Now()
+		err := NewDecoder().Decode(new(form), map[string][]string{key: {"1"}})
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("a %d-byte key %.4q took %v to check", len(key), key, elapsed)
+		}
+		if err == nil {
+			t.Fatalf("%.4q: want the required keys reported missing", key)
+		}
 	}
 }
 

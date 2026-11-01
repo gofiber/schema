@@ -562,7 +562,10 @@ func markProvidedByFoldedKey(c *cache, info *structInfo, key string, val []strin
 		if i < 0 {
 			break
 		}
-		off += i + 1
+		// Lowercasing is ASCII-only, so the folded prefixes are no longer than maxRequiredPrefixLen either.
+		if off += i + 1; off > info.maxRequiredPrefixLen {
+			break
+		}
 		if owners := info.foldedRequiredPrefixes[lower[:off]]; len(owners) > 0 {
 			if c != nil {
 				if _, err := c.parsePathInfo(key, info); err != nil {
