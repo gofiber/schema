@@ -747,8 +747,8 @@ func TestPathCacheSkipsLongKeys(t *testing.T) {
 	d := NewDecoder()
 	info := d.cache.get(reflect.TypeFor[deepNode]())
 
-	// deepPath(depth, 0) is 4*depth+4 bytes, so these sit either side of the limit.
-	long := deepPath(maxCachedPathLen/4, 0)
+	// deepPath(depth, 0) is 4*depth+4 bytes; a wider last index takes the same depth past the limit.
+	long := deepPath(maxCachedPathLen/4-1, maxParserIndex)
 	if len(long) <= maxCachedPathLen {
 		t.Fatalf("test key is %d bytes, want over %d", len(long), maxCachedPathLen)
 	}

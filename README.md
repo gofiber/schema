@@ -114,6 +114,10 @@ err := decoder.DecodeValues(&person, keys, values)
 
 `values[i]` is a value of the key `keys[i]`, and a key given more than once has all of its values in the order given, as it would in the map. The two slices must be the same length.
 
+## Limits
+
+Keys usually come from a client, so the decoder bounds what they can make it allocate: a key may name at most 64 fields, and a slice index may be at most 1000 (or `MaxSize`, if lower). One call may also allocate at most 8 MiB in all for the values behind nil pointers on its keys' paths and for the slices it grows, counting the capacity each growth reserves. Maps and file fields are not counted, nor are the slice fields declared on the destination struct itself unless the struct embeds an exported pointer or the call grew eight other slices at a key's first index before them. The first eight slices a call grows at a key's first index grow geometrically, any other slice to exactly the index plus one. A key past a limit is not decoded and is reported under its own name in the returned `MultiError`, also when `IgnoreUnknownKeys` is set.
+
 ## Setting Defaults
 
 It is possible to set default values when encoding/decoding by using the `default` tag option. The value of `default` is applied when a field has a zero value, a pointer has a nil value, or a slice is empty.
@@ -177,7 +181,7 @@ Fiber is an open-source project that runs on donations to pay the bills, e.g., o
 <table>
 <tr><td valign="top"><strong>🔥 Fiber Guardian</strong></td><td><a href="https://www.coderabbit.ai/?utm_source=cr_org&amp;utm_medium=github" title="@coderabbitai"><img src="https://github.com/coderabbitai.png" width="50" alt="@coderabbitai" /></a></td></tr>
 <tr><td valign="top"><strong>☕ Fiber Supporter</strong></td><td><a href="https://ndole.studio" title="@NdoleStudio"><img src="https://github.com/NdoleStudio.png" width="34" alt="@NdoleStudio" /></a></td></tr>
-<tr><td valign="top"><strong>🪴 Fiber Friend</strong></td><td><a href="https://github.com/simonheisstpeter" title="@simonheisstpeter"><img src="https://github.com/simonheisstpeter.png" width="32" alt="@simonheisstpeter" /></a></td></tr>
+<tr><td valign="top"><strong>🪴 Fiber Friend</strong></td><td><a href="https://www.kamaslau.com" title="@kamaslau"><img src="https://github.com/kamaslau.png" width="32" alt="@kamaslau" /></a>&nbsp;<a href="https://github.com/simonheisstpeter" title="@simonheisstpeter"><img src="https://github.com/simonheisstpeter.png" width="32" alt="@simonheisstpeter" /></a></td></tr>
 </table>
 
 ### 🎁 One-time Sponsors
