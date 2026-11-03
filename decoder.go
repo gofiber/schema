@@ -98,9 +98,20 @@ func (d *Decoder) MaxSize(size int) {
 	d.maxSize = size
 }
 
-// RegisterConverter registers a converter function for a custom type.
+// RegisterConverter registers a converter function for a custom type,
+// replacing any converter registered for the type before, including one
+// registered with RegisterConverterE.
 func (d *Decoder) RegisterConverter(value any, converterFunc Converter) {
 	d.cache.registerConverter(value, converterFunc)
+}
+
+// RegisterConverterE registers a converter function for a custom type that
+// reports why a value does not convert: a non-nil error fails the conversion
+// and is kept as the Err of the returned ConversionError. It replaces any
+// converter registered for the type before, including one registered with
+// RegisterConverter.
+func (d *Decoder) RegisterConverterE(value any, converterFunc ConverterE) {
+	d.cache.registerConverterE(value, converterFunc)
 }
 
 // Decode decodes a map[string][]string to a struct.
@@ -1011,14 +1022,15 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 
 		// Try to get a converter for the element type.
 		customConv := d.cache.converter(elemT)
-		conv := customConv
-		if conv == nil {
-			conv = getBuiltinConverter(elemT.Kind())
-			if conv == nil {
-				// As we are not dealing with slice of structs here, we don't need to check if the type
-				// implements TextUnmarshaler interface
-				return fmt.Errorf("schema: converter not found for %v", elemT)
-			}
+		var conv valueConverter
+		if customConv != nil {
+			conv = *customConv
+		} else if builtin := getBuiltinConverter(elemT.Kind()); builtin != nil {
+			conv.plain = builtin
+		} else {
+			// As we are not dealing with slice of structs here, we don't need to check if the type
+			// implements TextUnmarshaler interface
+			return fmt.Errorf("schema: converter not found for %v", elemT)
 		}
 
 		// Fast path: builtin element kinds without unmarshalers, custom
@@ -1041,15 +1053,16 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 		}
 
 		if conv != nil {
-			if value := conv(val); value.IsValid() {
-				v.Set(value.Convert(t))
-			} else {
+			value, err := conv.convert(val)
+			if err != nil || !value.IsValid() {
 				return ConversionError{
 					Key:   path,
 					Type:  t,
 					Index: -1,
+					Err:   err,
 				}
 			}
+			v.Set(value.Convert(t))
 		} else if m.IsValid {
 			if m.IsPtr {
 				u := reflect.New(v.Type())
@@ -1143,7 +1156,7 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 // decodeBoxedSlice decodes values into the slice field v whose elements have
 // to round-trip through a reflect.Value: a custom converter, or pointer
 // elements. Split out so that decode carries no defer of its own.
-func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv Converter, m unmarshaler, isPtrElem bool) error {
+func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv valueConverter, m unmarshaler, isPtrElem bool) error {
 	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
 	items := (*itemsBuf)[:0]
 	defer func() {
@@ -1157,7 +1170,9 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			if d.zeroEmpty {
 				items = append(items, reflect.Zero(t.Elem()))
 			}
-		} else if m.IsValid {
+			continue
+		}
+		if m.IsValid {
 			// Only pointer elements get here, so u itself is the element.
 			u := reflect.New(elemT)
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
@@ -1170,30 +1185,45 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 				}
 			}
 			items = append(items, u)
-		} else if item := conv(value); item.IsValid() {
-			items = appendConvertedItem(items, item, elemT, isPtrElem)
+			continue
+		}
+		// conv.convert, spelled out: it is too big to inline, and this
+		// runs once per element.
+		var item reflect.Value
+		var err error
+		if conv.withErr == nil {
+			item = conv.plain(value)
 		} else {
-			if strings.IndexByte(value, ',') != -1 {
-				for value := range strings.SplitSeq(value, ",") {
-					if value == "" {
-						if d.zeroEmpty {
-							items = append(items, reflect.Zero(t.Elem()))
-						}
-					} else if item := conv(value); item.IsValid() {
-						items = appendConvertedItem(items, item, elemT, isPtrElem)
-					} else {
-						return ConversionError{
-							Key:   path,
-							Type:  elemT,
-							Index: key,
-						}
-					}
+			item, err = conv.withErr(value)
+		}
+		if err == nil && item.IsValid() {
+			items = appendConvertedItem(items, item, elemT, isPtrElem)
+			continue
+		}
+		if strings.IndexByte(value, ',') == -1 {
+			return ConversionError{
+				Key:   path,
+				Type:  elemT,
+				Index: key,
+				Err:   err,
+			}
+		}
+		// The value did not convert as a whole, so it is retried as a
+		// comma-separated list; the whole value's error is dropped, and an
+		// item that fails reports its own.
+		for value := range strings.SplitSeq(value, ",") {
+			if value == "" {
+				if d.zeroEmpty {
+					items = append(items, reflect.Zero(t.Elem()))
 				}
+			} else if item, err := conv.convert(value); err == nil && item.IsValid() {
+				items = appendConvertedItem(items, item, elemT, isPtrElem)
 			} else {
 				return ConversionError{
 					Key:   path,
 					Type:  elemT,
 					Index: key,
+					Err:   err,
 				}
 			}
 		}

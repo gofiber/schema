@@ -1488,6 +1488,230 @@ func TestRegisterConverterMap(t *testing.T) {
 	}
 }
 
+type convECustom int
+
+// parseConvECustom is a ConverterE for convECustom that wraps strconv's error.
+func parseConvECustom(s string) (reflect.Value, error) {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return reflect.Value{}, fmt.Errorf("convECustom %q: %w", s, err)
+	}
+	return reflect.ValueOf(convECustom(n)), nil
+}
+
+type convEPayload struct {
+	Map     map[string]convECustom `schema:"map"`
+	Ptr     *convECustom           `schema:"ptr"`
+	Many    []convECustom          `schema:"many"`
+	ManyPtr []*convECustom         `schema:"manyptr"`
+	One     convECustom            `schema:"one"`
+}
+
+// conversionErrorAt returns the ConversionError err reports for key.
+func conversionErrorAt(t *testing.T, err error, key string) ConversionError {
+	t.Helper()
+	var errs MultiError
+	if !errors.As(err, &errs) || len(errs) != 1 {
+		t.Fatalf("got %v, want a MultiError with one error", err)
+	}
+	var conv ConversionError
+	if !errors.As(errs[key], &conv) {
+		t.Fatalf("got %#v at %q, want a ConversionError", errs[key], key)
+	}
+	return conv
+}
+
+func TestRegisterConverterE(t *testing.T) {
+	t.Parallel()
+
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+
+	var got convEPayload
+	err := decoder.Decode(&got, map[string][]string{
+		"one":     {"1"},
+		"ptr":     {"2"},
+		"many":    {"3", "4,5"},
+		"manyptr": {"6"},
+		"map.k":   {"7"},
+	})
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if got.One != 1 || got.Ptr == nil || *got.Ptr != 2 ||
+		!slices.Equal(got.Many, []convECustom{3, 4, 5}) ||
+		len(got.ManyPtr) != 1 || *got.ManyPtr[0] != 6 || got.Map["k"] != 7 {
+		t.Fatalf("decoded %+v", got)
+	}
+
+	for _, tc := range []struct {
+		key     string
+		errKey  string
+		values  []string
+		wantBad string // the value the converter error must name
+		index   int
+	}{
+		{key: "one", values: []string{"x"}, index: -1, wantBad: "x"},
+		{key: "one", values: []string{"1", "y"}, index: -1, wantBad: "y"},
+		{key: "ptr", values: []string{"x"}, index: -1, wantBad: "x"},
+		{key: "many", values: []string{"1", "x"}, index: 1, wantBad: "x"},
+		// A value that fails as a whole is retried split on commas; the
+		// item that fails is the one reported, not the whole value.
+		{key: "many", values: []string{"1,x"}, index: 0, wantBad: "x"},
+		{key: "manyptr", values: []string{"2", "x"}, index: 1, wantBad: "x"},
+		{key: "manyptr", values: []string{"1,x"}, index: 0, wantBad: "x"},
+		{key: "map.k", values: []string{"x"}, index: -1, wantBad: "x"},
+	} {
+		t.Run(tc.key+"="+strings.Join(tc.values, "&"), func(t *testing.T) {
+			t.Parallel()
+
+			var s convEPayload
+			err := decoder.Decode(&s, map[string][]string{tc.key: tc.values})
+			conv := conversionErrorAt(t, err, tc.key)
+			if conv.Key != tc.key || conv.Index != tc.index {
+				t.Errorf("Key, Index = %q, %d, want %q, %d", conv.Key, conv.Index, tc.key, tc.index)
+			}
+			if !errors.Is(conv.Err, strconv.ErrSyntax) {
+				t.Fatalf("Err = %v, want the converter's error wrapping strconv.ErrSyntax", conv.Err)
+			}
+			if want := "convECustom " + strconv.Quote(tc.wantBad); !strings.Contains(conv.Err.Error(), want) {
+				t.Errorf("Err = %q, want it to name %s", conv.Err, want)
+			}
+			if want := ". Details: " + conv.Err.Error(); !strings.HasSuffix(conv.Error(), want) {
+				t.Errorf("Error() = %q, want it to end in %q", conv.Error(), want)
+			}
+		})
+	}
+}
+
+func TestRegisterConverterEMessage(t *testing.T) {
+	t.Parallel()
+
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+	var s convEPayload
+	err := decoder.Decode(&s, map[string][]string{"one": {"x"}})
+	conv := conversionErrorAt(t, err, "one")
+	const want = `schema: error converting value for "one". Details: convECustom "x": strconv.Atoi: parsing "x": invalid syntax`
+	if got := conv.Error(); got != want {
+		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+	if conv.Type != reflect.TypeFor[convECustom]() {
+		t.Fatalf("Type = %v, want convECustom", conv.Type)
+	}
+}
+
+// A non-nil error fails the conversion even when a valid value comes with it.
+func TestRegisterConverterEErrorWinsOverValue(t *testing.T) {
+	t.Parallel()
+
+	errReject := errors.New("rejected")
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), func(string) (reflect.Value, error) {
+		return reflect.ValueOf(convECustom(9)), errReject
+	})
+	for _, key := range []string{"one", "many", "manyptr"} {
+		var s convEPayload
+		err := decoder.Decode(&s, map[string][]string{key: {"1"}})
+		if conv := conversionErrorAt(t, err, key); !errors.Is(conv.Err, errReject) {
+			t.Fatalf("%s: Err = %v, want %v", key, conv.Err, errReject)
+		}
+		if s.One != 0 || s.Many != nil || s.ManyPtr != nil {
+			t.Fatalf("%s: a failed conversion set %+v", key, s)
+		}
+	}
+}
+
+// An invalid value with a nil error fails as a Converter's invalid value does.
+func TestRegisterConverterEInvalidWithoutError(t *testing.T) {
+	t.Parallel()
+
+	invalid := func(string) (reflect.Value, error) { return reflect.Value{}, nil }
+	for _, key := range []string{"one", "many", "manyptr"} {
+		decoder := NewDecoder()
+		decoder.RegisterConverterE(convECustom(0), invalid)
+		var s convEPayload
+		errE := decoder.Decode(&s, map[string][]string{key: {"1"}})
+
+		plain := NewDecoder()
+		plain.RegisterConverter(convECustom(0), func(string) reflect.Value { return reflect.Value{} })
+		errPlain := plain.Decode(&s, map[string][]string{key: {"1"}})
+
+		convE, convPlain := conversionErrorAt(t, errE, key), conversionErrorAt(t, errPlain, key)
+		if convE != convPlain || convE.Err != nil {
+			t.Fatalf("%s: got %#v, want %#v", key, convE, convPlain)
+		}
+	}
+}
+
+// Registering a converter of either kind replaces one of the other kind.
+func TestRegisterConverterEReplaces(t *testing.T) {
+	t.Parallel()
+
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+	decoder.RegisterConverter(convECustom(0), func(string) reflect.Value { return reflect.ValueOf(convECustom(-1)) })
+	var s convEPayload
+	if err := decoder.Decode(&s, map[string][]string{"one": {"x"}}); err != nil || s.One != -1 {
+		t.Fatalf("after RegisterConverter: One = %d, err = %v, want -1 and no error", s.One, err)
+	}
+
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+	s = convEPayload{}
+	err := decoder.Decode(&s, map[string][]string{"one": {"x"}})
+	if conv := conversionErrorAt(t, err, "one"); !errors.Is(conv.Err, strconv.ErrSyntax) {
+		t.Fatalf("after RegisterConverterE: Err = %v, want the ConverterE's error", conv.Err)
+	}
+}
+
+// A nil function registers no converter, for either kind: the field decodes
+// as its kind would without one.
+func TestRegisterConverterENil(t *testing.T) {
+	t.Parallel()
+
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+	decoder.RegisterConverterE(convECustom(0), nil)
+	var s convEPayload
+	if err := decoder.Decode(&s, map[string][]string{"one": {"5"}, "many": {"6"}}); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if s.One != 5 || !slices.Equal(s.Many, []convECustom{6}) {
+		t.Fatalf("decoded %+v, want the builtin int conversion", s)
+	}
+	if decoder.cache.converter(reflect.TypeFor[convECustom]()) != nil {
+		t.Fatal("a nil ConverterE reads back as a converter")
+	}
+}
+
+// A ConverterE registered for a slice type converts the field as a whole.
+func TestRegisterConverterESliceType(t *testing.T) {
+	t.Parallel()
+
+	errEmpty := errors.New("empty item")
+	decoder := NewDecoder()
+	decoder.RegisterConverterE([]string{}, func(input string) (reflect.Value, error) {
+		parts := strings.Split(input, ";")
+		if slices.Contains(parts, "") {
+			return reflect.Value{}, errEmpty
+		}
+		return reflect.ValueOf(parts), nil
+	})
+	var s struct {
+		Multiple []string `schema:"multiple"`
+	}
+	if err := decoder.Decode(&s, map[string][]string{"multiple": {"a;b"}}); err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if !slices.Equal(s.Multiple, []string{"a", "b"}) {
+		t.Fatalf("Multiple = %q", s.Multiple)
+	}
+	err := decoder.Decode(&s, map[string][]string{"multiple": {"a;;b"}})
+	if conv := conversionErrorAt(t, err, "multiple"); conv.Index != -1 || !errors.Is(conv.Err, errEmpty) {
+		t.Fatalf("got %#v, want the converter's error for the whole field", conv)
+	}
+}
+
 type S13 struct {
 	Value []S14
 }
@@ -6486,6 +6710,44 @@ func benchConverterLookup(b *testing.B, register bool) {
 
 func BenchmarkConverterLookupNone(b *testing.B)       { benchConverterLookup(b, false) }
 func BenchmarkConverterLookupRegistered(b *testing.B) { benchConverterLookup(b, true) }
+
+// A registered converter's type as a field, a slice and a slice of pointers.
+type benchConvPayload struct {
+	Many    []convECustom  `schema:"many"`
+	ManyPtr []*convECustom `schema:"manyptr"`
+	One     convECustom    `schema:"one"`
+}
+
+var benchConvData = map[string][]string{"one": {"1"}, "many": {"2", "3"}, "manyptr": {"4"}}
+
+func benchRegisteredConverter(b *testing.B, decoder *Decoder) {
+	b.Helper()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s benchConvPayload
+		if err := decoder.Decode(&s, benchConvData); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkRegisteredConverter(b *testing.B) {
+	decoder := NewDecoder()
+	decoder.RegisterConverter(convECustom(0), func(s string) reflect.Value {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return reflect.Value{}
+		}
+		return reflect.ValueOf(convECustom(n))
+	})
+	benchRegisteredConverter(b, decoder)
+}
+
+func BenchmarkRegisteredConverterE(b *testing.B) {
+	decoder := NewDecoder()
+	decoder.RegisterConverterE(convECustom(0), parseConvECustom)
+	benchRegisteredConverter(b, decoder)
+}
 
 // A map field promoted from an embedded struct is reached by its own alias and
 // through the embedded field's, each by a path of its own.
