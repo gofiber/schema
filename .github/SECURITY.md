@@ -1,56 +1,88 @@
 # Security Policy
 
-1. [Supported Versions](#versions)
-2. [Reporting security problems to Fiber Schema](#reporting)
-3. [Security Points of Contact](#contact)
-4. [Incident Response Process](#process)
+This is a copy of the
+[gofiber organization security policy](https://github.com/gofiber/.github/blob/main/SECURITY.md).
+gofiber/schema keeps its own copy because it is a fork, and GitHub may not
+apply the organization's default files to forks.
 
-<a name="versions"></a>
+1. [Supported versions](#supported-versions)
+2. [Reporting a vulnerability](#reporting-a-vulnerability)
+3. [What happens after you report](#what-happens-after-you-report)
+4. [Security points of contact](#security-points-of-contact)
+5. [Incident response process](#incident-response-process)
+6. [Secure accounts with access](#secure-accounts-with-access)
+7. [Critical updates and security notices](#critical-updates-and-security-notices)
 
-## Supported Versions
+## Supported versions
 
-The table below shows the supported versions for Fiber Schema which include security updates.
-Security updates are provided for the latest release only.
+Security fixes are released for the **latest release** of every module.
+Upgrade to it to receive the fix.
 
-| Version   | Supported          |
-| --------- | ------------------ |
-| >= 1.9.0  | :white_check_mark: |
-| < 1.9.0   | :x:                |
+Some repositories hold several Go modules that are versioned and released on
+their own, for example `gofiber/contrib`, `gofiber/storage` and
+`gofiber/template`. There a fix is published as a new release of the affected
+module only. The latest releases are listed on the **Releases** page of each
+repository.
 
-<a name="reporting"></a>
+You do not need to find out first whether your version is still supported.
+Report the problem and tell us the module and version you use.
 
-## Reporting security problems to Fiber Schema
+## Reporting a vulnerability
 
-**DO NOT CREATE AN ISSUE** to report a security problem. Instead, please
-send us an e-mail at `rene@gofiber.io` or join our discord server via
-[this invite link](https://gofiber.io/discord) and send a private message
-to any of the maintainers.
+**Do not open a public issue, discussion or pull request for a security
+problem.** Report it privately instead:
 
-<a name="contact"></a>
+1. **GitHub private vulnerability reporting (preferred).** Open the
+   **Security** tab of the affected repository and click
+   **Report a vulnerability**. The form is at
+   `https://github.com/gofiber/<repository>/security/advisories/new`.
+   Only you and the maintainers can see the report.
+2. **E-mail.** Send the report to `rene@gofiber.io`.
+3. **Discord.** Join our server via
+   [this invite link](https://gofiber.io/discord) and send a *private* message
+   to one of the maintainers. Do not post any details in public channels.
 
-## Security Points of Contact
+Please include as much of the following as you can:
 
-For security-related matters, please contact any of the
-[@maintainers](https://github.com/orgs/gofiber/teams/maintainers).
+- the affected repository, module and version (or commit)
+- a description of the problem and its impact
+- the steps or a minimal proof of concept to reproduce it
+- a suggested fix, if you have one
 
-The maintainers are the only persons with administrative access to Fiber Schema's source code
-and respond to security incident reports as fast as possible, within one business day
-at the latest.
+## What happens after you report
 
-<a name="process"></a>
+- We confirm that we received the report and assess it together with you.
+- We prepare the fix privately and release it for all affected supported
+  versions.
+- We publish a GitHub Security Advisory for the affected repository and
+  request a CVE ID for it.
+- We credit you as the reporter in the advisory, unless you prefer to stay
+  anonymous.
 
-## Incident Response Process
+Please keep the problem confidential until the advisory is published.
 
-In case an incident is discovered or reported, we will follow the following
-process to contain, respond and remediate:
+## Security points of contact
+
+For security-related matters, please contact any of the maintainers through
+the channels listed under
+[Reporting a vulnerability](#reporting-a-vulnerability).
+
+The maintainers are the only persons with administrative access to the source
+code of the gofiber repositories and respond to security incident reports as
+fast as possible, within one business day at the latest.
+
+## Incident response process
+
+In case an incident is discovered or reported, we will follow this process to
+contain, respond and remediate:
 
 ### 1. Containment
 
 The first step is to find out the root cause, nature and scope of the incident.
 
-- Is still ongoing? If yes, first priority is to stop it.
-- Is the incident outside of our influence? If yes, first priority is to contain it.
-- Find out knows about the incident and who is affected.
+- Is the incident still ongoing? If yes, prioritize stopping it.
+- Is the incident outside our influence? If yes, prioritize containment.
+- Find out who knows about the incident and who is affected.
 - Find out what data was potentially exposed.
 
 ### 2. Response
@@ -58,8 +90,8 @@ The first step is to find out the root cause, nature and scope of the incident.
 After the initial assessment and containment to our best abilities, we will
 document all actions taken in a response plan.
 
-We will create a comment in the official `#announcements` channel to inform users about
-the incident and what actions we took to contain it.
+We will create a comment in the official `#announcements` channel to inform
+users about the incident and what actions we took to contain it.
 
 ### 3. Remediation
 
@@ -67,14 +99,16 @@ Once the incident is confirmed to be resolved, we will summarize the lessons
 learned from the incident and create a list of actions we will take to prevent
 it from happening again.
 
-### Secure accounts with access
+## Secure accounts with access
 
-The [Fiber Organization](https://github.com/gofiber) requires 2FA authorization
-for all of it's members.
+The [gofiber organization](https://github.com/gofiber) requires 2FA
+authorization for all of its members.
 
-### Critical Updates And Security Notices
+## Critical updates and security notices
 
-We learn about critical software updates and security threats from these sources
+We learn about critical software updates and security threats from these
+sources:
 
-1. GitHub Security Alerts
-2. GitHub: [https://status.github.com/](https://status.github.com/) & [@githubstatus](https://twitter.com/githubstatus)
+1. GitHub Security Alerts and Dependabot
+2. GitHub: [githubstatus.com](https://www.githubstatus.com/) and
+   [@githubstatus](https://twitter.com/githubstatus)
