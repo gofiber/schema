@@ -87,6 +87,24 @@ The supported field types in the struct are:
 
 Unsupported types are simply ignored, however custom types can be registered to be converted.
 
+### Custom converters
+
+`RegisterConverter` takes a `func(string) reflect.Value` that returns an invalid `reflect.Value` when the input does not convert. The decoder then reports a `ConversionError` without saying why. To report the reason, register a `func(string) (reflect.Value, error)` with `RegisterConverterE` instead: a non-nil error fails the conversion and is kept as the error's `Err`, so the message ends in its text, as it does for a failing `encoding.TextUnmarshaler`.
+
+```go
+decoder.RegisterConverterE(Level(0), func(s string) (reflect.Value, error) {
+    n, err := strconv.Atoi(s)
+    if err != nil {
+        return reflect.Value{}, fmt.Errorf("level: %w", err)
+    }
+    return reflect.ValueOf(Level(n)), nil
+})
+// "level=high" fails with:
+// schema: error converting value for "level". Details: level: strconv.Atoi: parsing "high": invalid syntax
+```
+
+A type has at most one converter: registering one of either kind replaces the other.
+
 ### Map fields
 
 A map field is filled from keys of the form `<field>.<key>`, one map entry per key:

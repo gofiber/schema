@@ -98,7 +98,7 @@ type cacheEntry struct {
 }
 
 type converterRegistry struct {
-	m map[reflect.Type]Converter
+	m map[reflect.Type]*valueConverter
 	// slots has bit typeSlot(t) set for every registered t: a clear bit skips the lookup in m.
 	slots uint64
 }
@@ -108,14 +108,35 @@ const _ = uint8(64 - typeCacheSlots)
 
 // registerConverter registers a converter function for a custom type.
 func (c *cache) registerConverter(value any, converterFunc Converter) {
+	var vc *valueConverter
+	if converterFunc != nil {
+		vc = &valueConverter{plain: converterFunc}
+	}
+	c.storeConverter(value, vc)
+}
+
+// registerConverterE registers an error-returning converter function for a
+// custom type.
+func (c *cache) registerConverterE(value any, converterFunc ConverterE) {
+	var vc *valueConverter
+	if converterFunc != nil {
+		vc = &valueConverter{withErr: converterFunc}
+	}
+	c.storeConverter(value, vc)
+}
+
+// storeConverter publishes vc as the converter of value's type, replacing any
+// converter registered for it before, of either kind. A nil vc is stored as
+// is, so a nil function reads back as no converter, as it always has.
+func (c *cache) storeConverter(value any, vc *valueConverter) {
 	c.l.Lock()
 	t := reflect.TypeOf(value)
-	next := &converterRegistry{m: make(map[reflect.Type]Converter)}
+	next := &converterRegistry{m: make(map[reflect.Type]*valueConverter)}
 	if prev := c.regconv.Load(); prev != nil {
 		maps.Copy(next.m, prev.m)
 		next.slots = prev.slots
 	}
-	next.m[t] = converterFunc
+	next.m[t] = vc
 	next.slots |= 1 << typeSlot(t)
 	c.regconv.Store(next)
 	c.reset()
@@ -837,8 +858,8 @@ func (c *cache) decodesFromText(f *fieldInfo) bool {
 	return true
 }
 
-// converter returns the converter for a type.
-func (c *cache) converter(t reflect.Type) Converter {
+// converter returns the converter registered for a type, or nil.
+func (c *cache) converter(t reflect.Type) *valueConverter {
 	reg := c.regconv.Load()
 	if reg == nil || reg.slots&(1<<typeSlot(t)) == 0 {
 		return nil
