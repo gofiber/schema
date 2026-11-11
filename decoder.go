@@ -1052,9 +1052,19 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			}
 		} else if m.IsValid {
 			if m.IsPtr {
-				u := reflect.New(v.Type())
+				// A zero v is what reflect.New would hand UnmarshalText, so
+				// decode into it in place and save the allocation; a failed
+				// call leaves it zero again, as it found it.
+				inPlace := v.IsZero()
+				u := v.Addr()
+				if !inPlace {
+					u = reflect.New(v.Type())
+				}
 				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 				if err := um.UnmarshalText([]byte(val)); err != nil {
+					if inPlace {
+						v.SetZero()
+					}
 					return ConversionError{
 						Key:   path,
 						Type:  t,
@@ -1062,7 +1072,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 						Err:   err,
 					}
 				}
-				v.Set(reflect.Indirect(u))
+				if !inPlace {
+					v.Set(reflect.Indirect(u))
+				}
 			} else {
 				// If the value implements the encoding.TextUnmarshaler interface
 				// apply UnmarshalText as the converter, binding it to the
