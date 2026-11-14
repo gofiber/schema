@@ -6347,6 +6347,118 @@ func BenchmarkMapFieldDecode(b *testing.B) {
 	}
 }
 
+// hexID mirrors a 16-byte ID such as uuid.UUID. hex.Decode writes the bytes it
+// decodes before an invalid one, and a short value leaves the remaining bytes
+// as they were, so it shows both what a failed call left behind and whether
+// the receiver started out zero.
+type hexID [16]byte
+
+func (id *hexID) UnmarshalText(text []byte) error {
+	if hex.DecodedLen(len(text)) > len(id) {
+		return errors.New("too long")
+	}
+	_, err := hex.Decode(id[:], text)
+	return err
+}
+
+func TestDecodeTextUnmarshalerFieldStartsFromZero(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		ID  hexID  `schema:"id"`
+		Ptr *hexID `schema:"ptr"`
+	}
+	full := hexID{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}
+	prefilled := hexID{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	for _, tc := range []struct {
+		name    string
+		start   hexID
+		in      string
+		want    hexID
+		wantErr error
+	}{
+		{"zero field", hexID{}, "0102030405060708090a0b0c0d0e0f10", full, nil},
+		{"zero field, short value", hexID{}, "02", hexID{0x02}, nil},
+		{"prefilled field, short value", prefilled, "02", hexID{0x02}, nil},
+		{"zero field, failing after a partial write", hexID{}, "01zz", hexID{}, hex.InvalidByteError('z')},
+		{"prefilled field, failing after a partial write", prefilled, "01zz", prefilled, hex.InvalidByteError('z')},
+	} {
+		s := S{ID: tc.start}
+		err := NewDecoder().Decode(&s, map[string][]string{"id": {tc.in}})
+		if s.ID != tc.want {
+			t.Errorf("%s: ID = %x, want %x", tc.name, s.ID, tc.want)
+		}
+		if tc.wantErr == nil {
+			if err != nil {
+				t.Errorf("%s: %v", tc.name, err)
+			}
+			continue
+		}
+		var me MultiError
+		if !errors.As(err, &me) {
+			t.Errorf("%s: err = %v, want a MultiError", tc.name, err)
+			continue
+		}
+		want := ConversionError{Key: "id", Type: reflect.TypeFor[hexID](), Index: -1, Err: tc.wantErr}
+		if got, ok := me["id"].(ConversionError); !ok || got != want {
+			t.Errorf("%s: me[id] = %#v, want %#v", tc.name, me["id"], want)
+		}
+	}
+
+	var p S
+	if err := NewDecoder().Decode(&p, map[string][]string{"ptr": {"02"}}); err != nil {
+		t.Fatal(err)
+	}
+	if p.Ptr == nil || *p.Ptr != (hexID{0x02}) {
+		t.Fatalf("Ptr = %v, want &%x", p.Ptr, hexID{0x02})
+	}
+	shared := prefilled
+	p.Ptr = &shared
+	if err := NewDecoder().Decode(&p, map[string][]string{"ptr": {"02"}}); err != nil {
+		t.Fatal(err)
+	}
+	if shared != (hexID{0x02}) {
+		t.Fatalf("pointee = %x, want %x", shared, hexID{0x02})
+	}
+}
+
+// TestDecodeTextUnmarshalerFieldAllocatesOnlyTheText pins that a zero field
+// whose pointer implements encoding.TextUnmarshaler is decoded in place: the
+// only allocation left is the []byte copy of the value.
+func TestDecodeTextUnmarshalerFieldAllocatesOnlyTheText(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type S struct {
+		ID hexID `schema:"id"`
+	}
+	d := NewDecoder()
+	keys := []string{"id"}
+	values := []string{"0102030405060708090a0b0c0d0e0f10"}
+	var s S
+	if err := d.DecodeValues(&s, keys, values); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		s = S{}
+		_ = d.DecodeValues(&s, keys, values) //nolint:errcheck // checked above
+	}); allocs != 1 {
+		t.Fatalf("DecodeValues allocated %v times per run, want 1", allocs)
+	}
+}
+
+func BenchmarkUnmarshalerFieldDecode(b *testing.B) {
+	type S struct {
+		ID hexID `schema:"id"`
+	}
+	data := map[string][]string{"id": {"0102030405060708090a0b0c0d0e0f10"}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
 	type S struct {
 		Flags []rudeBool `schema:"flags"`
