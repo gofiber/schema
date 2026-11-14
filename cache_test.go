@@ -891,7 +891,7 @@ func TestConverterRegistrySlots(t *testing.T) {
 
 	for i, typ := range registered {
 		conv := c.converter(typ)
-		if conv == nil || conv("").Int() != int64(i) {
+		if conv == nil || conv.plain("").Int() != int64(i) {
 			t.Fatalf("registered type %d: got the wrong converter", i)
 		}
 	}
@@ -909,10 +909,10 @@ func TestConverterRegistrySlots(t *testing.T) {
 	}
 
 	c.registerConverter(reflect.Zero(registered[0]).Interface(), converterFor(100))
-	if conv := c.converter(registered[0]); conv == nil || conv("").Int() != 100 {
+	if conv := c.converter(registered[0]); conv == nil || conv.plain("").Int() != 100 {
 		t.Fatal("re-registering did not replace the converter")
 	}
-	if conv := c.converter(registered[1]); conv == nil || conv("").Int() != 1 {
+	if conv := c.converter(registered[1]); conv == nil || conv.plain("").Int() != 1 {
 		t.Fatal("re-registering lost another converter")
 	}
 }
@@ -928,7 +928,7 @@ func TestConverterRegistryConcurrent(t *testing.T) {
 		wg.Go(func() {
 			for n := range 500 {
 				typ := types[(g*13+n)%len(types)]
-				if conv := c.converter(typ); conv != nil && conv("").Int() != int64(slices.Index(types, typ)) {
+				if conv := c.converter(typ); conv != nil && conv.plain("").Int() != int64(slices.Index(types, typ)) {
 					t.Errorf("type %d: got the converter of another type", slices.Index(types, typ))
 					return
 				}

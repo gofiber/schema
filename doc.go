@@ -70,7 +70,10 @@ The supported field types in the destination struct are:
   - a slice or a pointer to a slice of one of the above types
 
 Non-supported types are simply ignored, however custom types can be registered
-to be converted.
+to be converted. A converter registered with RegisterConverter reports a value
+it cannot convert by returning an invalid reflect.Value, which gives the
+ConversionError no reason; one registered with RegisterConverterE returns an
+error instead, which the ConversionError keeps as its Err.
 
 To fill nested structs, keys must use a dotted notation as the "path" for the
 field. So for example, to fill the struct Person below:

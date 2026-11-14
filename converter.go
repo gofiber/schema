@@ -11,7 +11,35 @@ import (
 	utils "github.com/gofiber/utils/v2"
 )
 
+// Converter converts a source value to a custom type. An invalid (zero)
+// reflect.Value reports that the value does not convert; the resulting
+// ConversionError carries no Err, as Converter has no way to say why. Use
+// ConverterE to report the reason.
 type Converter func(string) reflect.Value
+
+// ConverterE is a Converter that reports why a value does not convert. A
+// non-nil error fails the conversion, whatever value is returned with it,
+// and is kept as the Err of the resulting ConversionError, whose message
+// then ends in its text, as for an encoding.TextUnmarshaler that fails. An
+// invalid reflect.Value with a nil error fails as a Converter's does.
+type ConverterE func(string) (reflect.Value, error)
+
+// valueConverter is a converter of either kind; exactly one field is set.
+// Plain converters are called directly rather than wrapped in a ConverterE,
+// which would add an indirect call to every conversion.
+type valueConverter struct {
+	plain   Converter
+	withErr ConverterE
+}
+
+// convert runs the converter. The conversion failed when the error is
+// non-nil or the value is invalid; callers check both.
+func (vc valueConverter) convert(s string) (reflect.Value, error) {
+	if vc.withErr != nil {
+		return vc.withErr(s)
+	}
+	return vc.plain(s), nil
+}
 
 var (
 	invalidValue = reflect.Value{}
