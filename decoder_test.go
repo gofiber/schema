@@ -2879,6 +2879,135 @@ func TestRequiredMatchesDecoding(t *testing.T) {
 	}
 }
 
+// With ZeroEmpty every key that reaches a field assigns it, so the last one
+// decides whether a required field is provided (#107).
+func TestRequiredZeroEmptyJudgesLastAssignedKey(t *testing.T) {
+	t.Parallel()
+
+	type Inner struct {
+		V string `schema:"v,required"`
+	}
+	type form struct {
+		Inner
+		X string `schema:"x,required"`
+		N int    `schema:"n,required"`
+	}
+	type pair struct{ key, value string }
+
+	tests := []struct {
+		name      string
+		pairs     []pair
+		zeroEmpty bool
+		want      form
+		missing   string // the error, "" for none
+	}{
+		{
+			name:      "key in another case empties the field",
+			pairs:     []pair{{"v", "set"}, {"x", "set"}, {"n", "1"}, {"X", ""}},
+			zeroEmpty: true,
+			want:      form{Inner: Inner{V: "set"}, N: 1},
+			missing:   "x is empty",
+		},
+		{
+			name:      "key in another case sets the field again",
+			pairs:     []pair{{"v", "set"}, {"x", ""}, {"n", "1"}, {"X", "set"}},
+			zeroEmpty: true,
+			want:      form{Inner: Inner{V: "set"}, X: "set", N: 1},
+		},
+		{
+			name:      "lowercase key empties a field set in another case",
+			pairs:     []pair{{"v", "set"}, {"X", "set"}, {"n", "1"}, {"x", ""}},
+			zeroEmpty: true,
+			want:      form{Inner: Inner{V: "set"}, N: 1},
+			missing:   "x is empty",
+		},
+		{
+			name:      "key in another case still counts when another field is emptied",
+			pairs:     []pair{{"v", "set"}, {"X", "set"}, {"n", "1"}, {"N", ""}},
+			zeroEmpty: true,
+			want:      form{Inner: Inner{V: "set"}, X: "set"},
+			missing:   "n is empty",
+		},
+		{
+			name:      "embedded path empties the field",
+			pairs:     []pair{{"v", "set"}, {"x", "set"}, {"n", "1"}, {"Inner.v", ""}},
+			zeroEmpty: true,
+			want:      form{X: "set", N: 1},
+			missing:   "Inner.v is empty",
+		},
+		{
+			name:      "embedded path set after an empty promoted key",
+			pairs:     []pair{{"v", ""}, {"x", "set"}, {"n", "1"}, {"Inner.v", "set"}},
+			zeroEmpty: true,
+			want:      form{Inner: Inner{V: "set"}, X: "set", N: 1},
+		},
+		{
+			name:  "without ZeroEmpty an empty key leaves the field",
+			pairs: []pair{{"v", "set"}, {"x", "set"}, {"n", "1"}, {"X", ""}, {"Inner.v", ""}, {"N", ""}},
+			want:  form{Inner: Inner{V: "set"}, X: "set", N: 1},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			keys := make([]string, 0, len(tc.pairs))
+			values := make([]string, 0, len(tc.pairs))
+			for _, p := range tc.pairs {
+				keys = append(keys, p.key)
+				values = append(values, p.value)
+			}
+			d := NewDecoder()
+			d.ZeroEmpty(tc.zeroEmpty)
+			var got form
+			err := d.DecodeValues(&got, keys, values)
+			switch {
+			case tc.missing == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.missing != "" && (err == nil || err.Error() != tc.missing):
+				t.Fatalf("got error %v, want %q", err, tc.missing)
+			}
+			if got != tc.want {
+				t.Fatalf("decoded %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// Decode walks a map in no fixed order, so whichever key it assigns last
+	// can win; the required check has to agree with the field it left.
+	t.Run("Decode agrees with the decoded field", func(t *testing.T) {
+		t.Parallel()
+
+		d := NewDecoder()
+		d.ZeroEmpty(true)
+		src := map[string][]string{"x": {"set"}, "X": {""}, "v": {"set"}, "Inner.v": {""}, "n": {"1"}}
+		for range 100 {
+			var got form
+			err := d.Decode(&got, src)
+			var empty []string
+			if got.V == "" {
+				empty = append(empty, "Inner.v")
+			}
+			if got.X == "" {
+				empty = append(empty, "x")
+			}
+			var reported []string
+			if multi, ok := errors.AsType[MultiError](err); ok {
+				for key := range multi {
+					reported = append(reported, key)
+				}
+			} else if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			slices.Sort(reported)
+			if !slices.Equal(reported, empty) {
+				t.Fatalf("decoded %+v with required errors for %v, want errors for %v", got, reported, empty)
+			}
+		}
+	})
+}
+
 func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	t.Parallel()
 
