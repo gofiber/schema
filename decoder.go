@@ -1551,6 +1551,11 @@ func (e ConversionError) Error() string {
 	return output
 }
 
+// Unwrap returns Err, so errors.Is and errors.As reach the converter's error.
+func (e ConversionError) Unwrap() error {
+	return e.Err
+}
+
 // UnknownKeyError stores information about an unknown key in the source map.
 type UnknownKeyError struct {
 	Key string // key from the source map.

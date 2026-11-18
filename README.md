@@ -89,7 +89,7 @@ Unsupported types are simply ignored, however custom types can be registered to 
 
 ### Custom converters
 
-`RegisterConverter` takes a `func(string) reflect.Value` that returns an invalid `reflect.Value` when the input does not convert. The decoder then reports a `ConversionError` without saying why. To report the reason, register a `func(string) (reflect.Value, error)` with `RegisterConverterE` instead: a non-nil error fails the conversion and is kept as the error's `Err`, so the message ends in its text, as it does for a failing `encoding.TextUnmarshaler`.
+`RegisterConverter` takes a `func(string) reflect.Value` that returns an invalid `reflect.Value` when the input does not convert. The decoder then reports a `ConversionError` without saying why. To report the reason, register a `func(string) (reflect.Value, error)` with `RegisterConverterE` instead: a non-nil error fails the conversion and is kept as the error's `Err`, so the message ends in its text, as it does for a failing `encoding.TextUnmarshaler`. `ConversionError` unwraps to `Err`, so `errors.Is` and `errors.As` reach it.
 
 ```go
 decoder.RegisterConverterE(Level(0), func(s string) (reflect.Value, error) {

@@ -1571,8 +1571,8 @@ func TestRegisterConverterE(t *testing.T) {
 			if conv.Key != tc.key || conv.Index != tc.index {
 				t.Errorf("Key, Index = %q, %d, want %q, %d", conv.Key, conv.Index, tc.key, tc.index)
 			}
-			if !errors.Is(conv.Err, strconv.ErrSyntax) {
-				t.Fatalf("Err = %v, want the converter's error wrapping strconv.ErrSyntax", conv.Err)
+			if !errors.Is(conv, strconv.ErrSyntax) {
+				t.Fatalf("Err = %v, want errors.Is to reach strconv.ErrSyntax through the ConversionError", conv.Err)
 			}
 			if want := "convECustom " + strconv.Quote(tc.wantBad); !strings.Contains(conv.Err.Error(), want) {
 				t.Errorf("Err = %q, want it to name %s", conv.Err, want)
