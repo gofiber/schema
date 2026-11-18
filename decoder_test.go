@@ -3006,6 +3006,52 @@ func TestRequiredZeroEmptyJudgesLastAssignedKey(t *testing.T) {
 			}
 		}
 	})
+
+	// Past maxDirectKeyLen the key is not lowercased in the stack buffer.
+	t.Run("key longer than the direct lookup", func(t *testing.T) {
+		t.Parallel()
+
+		key := strings.Repeat("k", maxDirectKeyLen+1)
+		typ := reflect.StructOf([]reflect.StructField{{
+			Name: "F",
+			Type: reflect.TypeFor[string](),
+			Tag:  reflect.StructTag(`schema:"` + key + `,required"`),
+		}})
+		d := NewDecoder()
+		d.ZeroEmpty(true)
+		err := d.DecodeValues(reflect.New(typ).Interface(), []string{key, strings.ToUpper(key)}, []string{"set", ""})
+		if want := key + " is empty"; err == nil || err.Error() != want {
+			t.Fatalf("got error %v, want %q", err, want)
+		}
+	})
+
+	t.Run("more required keys than the inline bitset", func(t *testing.T) {
+		t.Parallel()
+
+		const n = requiredBitWords*64 + 8
+		fields := make([]reflect.StructField, 0, n)
+		keys := make([]string, 0, n+1)
+		values := make([]string, 0, n+1)
+		for i := range n {
+			key := "f" + strconv.Itoa(i)
+			fields = append(fields, reflect.StructField{
+				Name: "F" + strconv.Itoa(i),
+				Type: reflect.TypeFor[string](),
+				Tag:  reflect.StructTag(`schema:"` + key + `,required"`),
+			})
+			keys = append(keys, key)
+			values = append(values, "set")
+		}
+		last := keys[n-1]
+		keys = append(keys, strings.ToUpper(last))
+		values = append(values, "")
+		d := NewDecoder()
+		d.ZeroEmpty(true)
+		err := d.DecodeValues(reflect.New(reflect.StructOf(fields)).Interface(), keys, values)
+		if want := last + " is empty"; err == nil || err.Error() != want {
+			t.Fatalf("got error %v, want %q", err, want)
+		}
+	})
 }
 
 func TestRequiredKeyNeedsADecodablePath(t *testing.T) {

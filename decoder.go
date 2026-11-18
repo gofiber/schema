@@ -573,21 +573,15 @@ func markAssigned(info *structInfo, key string, val []string, satisfied, decided
 // markProvidedFoldedUndecided is markProvidedFolded for a decode in which
 // markAssigned zeroed some groups: it leaves alone the ones the decode left
 // zeroed, since a key in another case seen before the empty value no longer
-// counts for them.
+// counts for them. decided is reused to hold those groups, so it is not
+// meaningful afterwards.
 func markProvidedFoldedUndecided(c *cache, info *structInfo, src *source, satisfied, decided []uint64, pending int) int {
-	var inline [requiredBitWords]uint64
-	var zeroed []uint64
-	if len(satisfied) <= len(inline) {
-		zeroed = inline[:len(satisfied)]
-	} else {
-		zeroed = make([]uint64, len(satisfied))
-	}
 	for w := range satisfied {
-		zeroed[w] = decided[w] &^ satisfied[w]
+		decided[w] &^= satisfied[w]
 	}
 	pending = markProvidedFolded(c, info, src, satisfied, pending)
 	for w := range satisfied {
-		if again := satisfied[w] & zeroed[w]; again != 0 {
+		if again := satisfied[w] & decided[w]; again != 0 {
 			satisfied[w] &^= again
 			pending += bits.OnesCount64(again)
 		}
