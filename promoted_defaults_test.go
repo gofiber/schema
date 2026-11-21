@@ -432,3 +432,108 @@ func TestDefaultsBehindPromotedPointerRespectEveryKey(t *testing.T) {
 		}
 	}
 }
+
+type DefaultTaggedPaging struct {
+	Page int `schema:"page,default:1"`
+}
+
+// A default tag on the embedded field itself must not hide its fields' spellings.
+func TestDefaultsInsideDefaultTaggedEmbeddedStruct(t *testing.T) {
+	t.Parallel()
+
+	type R struct {
+		*DefaultTaggedPaging `schema:"pg,default:x"`
+	}
+
+	for _, key := range []string{"page", "pg.page"} {
+		var v R
+		if err := NewDecoder().Decode(&v, map[string][]string{key: {"0"}}); err != nil {
+			t.Fatal(err)
+		}
+		if v.DefaultTaggedPaging == nil || v.Page != 0 {
+			t.Errorf("%s=0: got %+v, want page=0", key, v.DefaultTaggedPaging)
+		}
+	}
+}
+
+type (
+	DeepL0 struct {
+		X int `schema:"x,default:5"`
+	}
+	DeepL1  struct{ DeepL0 }
+	DeepL2  struct{ DeepL1 }
+	DeepL3  struct{ DeepL2 }
+	DeepL4  struct{ DeepL3 }
+	DeepL5  struct{ DeepL4 }
+	DeepL6  struct{ DeepL5 }
+	DeepL7  struct{ DeepL6 }
+	DeepL8  struct{ DeepL7 }
+	DeepL9  struct{ DeepL8 }
+	DeepL10 struct{ DeepL9 }
+)
+
+// Spellings double per embedding level; the bare and the full one must survive the cap.
+func TestDefaultsThroughDeepEmbeddingChain(t *testing.T) {
+	t.Parallel()
+
+	full := "DeepL9.DeepL8.DeepL7.DeepL6.DeepL5.DeepL4.DeepL3.DeepL2.DeepL1.DeepL0.x"
+	for _, key := range []string{"x", full} {
+		var v DeepL10
+		if err := NewDecoder().Decode(&v, map[string][]string{key: {"0"}}); err != nil {
+			t.Fatal(err)
+		}
+		if v.X != 0 {
+			t.Errorf("%s=0: got %d, want 0", key, v.X)
+		}
+	}
+	if keys := NewDecoder().cache.get(reflect.TypeFor[DeepL10]()).defaults.steps[0].keys; len(keys) > maxDefaultKeys {
+		t.Errorf("got %d keys, want at most %d", len(keys), maxDefaultKeys)
+	}
+}
+
+type (
+	UnsupportedDefaultInner struct {
+		Y int `schema:"y"`
+	}
+	UnsupportedDefaultEmb struct{ *UnsupportedDefaultInner }
+)
+
+func TestDefaultTaggedEmbeddedStructStillReportsUnsupported(t *testing.T) {
+	t.Parallel()
+
+	type R struct {
+		UnsupportedDefaultEmb `schema:"e,default:x"`
+	}
+
+	var v R
+	err := NewDecoder().Decode(&v, map[string][]string{})
+	if err == nil || !strings.Contains(err.Error(), errUnsupportedDefault.Error()) {
+		t.Errorf("got err=%v, want %v", err, errUnsupportedDefault)
+	}
+	if v.UnsupportedDefaultInner != nil {
+		t.Error("embedded pointer under a defaulted struct was allocated")
+	}
+}
+
+func TestDefaultsBehindPromotedPointerWithReembedding(t *testing.T) {
+	t.Parallel()
+
+	type Emb2 struct {
+		V int `schema:"v,default:1"`
+	}
+	type N struct{ Emb2 }
+	type Emb struct {
+		Next *N `schema:"next"`
+	}
+	type Out struct{ Emb }
+
+	for _, key := range []string{"next.v", "next.Emb2.v", "Emb.next.v", "Emb.next.Emb2.v"} {
+		var v Out
+		if err := NewDecoder().Decode(&v, map[string][]string{key: {"0"}}); err != nil {
+			t.Fatal(err)
+		}
+		if v.Next == nil || v.Next.V != 0 {
+			t.Errorf("%s=0: got %+v, want v=0", key, v.Next)
+		}
+	}
+}

@@ -385,10 +385,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		if def == nil {
 			if !vCurrent.IsNil() {
 				// Mixed spellings would multiply per level, and recursive types nest without limit.
-				np, nl := prefix+s.keys[0], ""
-				if long == prefix && len(s.keys) == 1 {
-					nl = np
-				} else {
+				np := prefix + s.keys[0]
+				nl := np
+				if long != prefix || len(s.keys) > 1 {
 					nl = long + s.keys[len(s.keys)-1]
 				}
 				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl))

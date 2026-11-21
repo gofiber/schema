@@ -6,6 +6,7 @@ package schema
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"reflect"
 	"slices"
@@ -607,10 +608,29 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	return info
 }
 
-// buildDefaults plans every defaulted field with every key the decoder resolves
-// to it, so the walk joins prefixes only at named pointers.
+// maxDefaultKeys bounds the spellings kept per field: each embedding level can
+// be spelled or skipped, so they double per level.
+const maxDefaultKeys = 8
+
+// buildDefaults plans every defaulted field with its spellings through embedded
+// structs, so the walk joins prefixes only at named pointers.
 func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
 	var p defaultsPlan
+	at := map[string]int{} // index chain -> step, merging the paths to one field
+	add := func(f *fieldInfo, index []int, keys ...string) {
+		chain := fmt.Sprint(index)
+		i, ok := at[chain]
+		if !ok {
+			i = len(p.steps)
+			at[chain] = i
+			p.steps = append(p.steps, defaultStep{field: f, index: index})
+		}
+		for _, key := range keys {
+			if !slices.Contains(p.steps[i].keys, key) {
+				p.steps[i].keys = append(p.steps[i].keys, key)
+			}
+		}
+	}
 	for _, idx := range info.anonymousPtrFields {
 		p.allocs = append(p.allocs, []int{idx})
 	}
@@ -618,45 +638,40 @@ func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
 		if len(f.index) > 1 && info.fieldsByName[f.aliasLower] != f {
 			continue // shadowed promoted copy, reached through its embedded struct
 		}
+		if f.def != nil {
+			add(f, f.index, f.alias)
+		}
 		k := f.typ.Kind()
 		structPtr := k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct
 		switch {
-		case f.def != nil:
-			p.add(f, f.index, f.alias)
+		case f.def != nil && !f.isAnonymous: // a defaulted named struct is reported, never descended
 		case k == reflect.Struct || structPtr && f.isAnonymous:
 			child := c.get(indirectType(f.typ)).defaults
-			if len(f.index) == 1 {
+			if len(f.index) == 1 && f.def == nil { // a defaulted embedded struct stays zero, so its error is reported
 				for _, a := range child.allocs {
 					p.allocs = append(p.allocs, slices.Concat(f.index, a))
 				}
 			}
 			for _, s := range child.steps {
-				idx := slices.Concat(f.index, s.index)
-				for _, sk := range s.keys {
-					p.add(s.field, idx, f.alias+"."+sk)
+				keys := make([]string, len(s.keys))
+				for i, sk := range s.keys {
+					keys[i] = f.alias + "." + sk
 				}
+				add(s.field, slices.Concat(f.index, s.index), keys...)
 			}
 		case structPtr:
-			p.add(f, f.index, f.alias+".") // walked when set, under its keys
+			add(f, f.index, f.alias+".") // walked when set, under its keys
 		}
 	}
-	for _, s := range p.steps {
+	for i := range p.steps {
 		// Shortest first: a pointer step's first and last keys are its bare and full spellings.
-		slices.SortStableFunc(s.keys, func(a, b string) int { return len(a) - len(b) })
+		keys := p.steps[i].keys
+		slices.SortStableFunc(keys, func(a, b string) int { return len(a) - len(b) })
+		if len(keys) > maxDefaultKeys {
+			p.steps[i].keys = append(keys[:maxDefaultKeys-1], keys[len(keys)-1])
+		}
 	}
 	return p
-}
-
-// add records key for the field at index, merging the paths that reach one field.
-func (p *defaultsPlan) add(f *fieldInfo, index []int, key string) {
-	i := slices.IndexFunc(p.steps, func(s defaultStep) bool { return slices.Equal(s.index, index) })
-	if i < 0 {
-		i = len(p.steps)
-		p.steps = append(p.steps, defaultStep{field: f, index: index})
-	}
-	if !slices.Contains(p.steps[i].keys, key) {
-		p.steps[i].keys = append(p.steps[i].keys, key)
-	}
 }
 
 // buildDirectPaths precomputes, keyed by lowercase path, the parsed paths for
@@ -839,7 +854,6 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		alias:            alias,
 		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
-		canonicalDot:     canonicalAlias + ".",
 		unmarshalerInfo:  m,
 		derefUnmarshaler: derefU,
 		elemUnmarshaler:  elemU,
@@ -877,7 +891,6 @@ func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias 
 		alias:          alias,
 		aliasLower:     utilstrings.ToLower(alias),
 		canonicalAlias: canonicalAlias,
-		canonicalDot:   canonicalAlias + ".",
 		isAnonymous:    field.Anonymous,
 		isRequired:     options.Contains("required"),
 		defaultValue:   options.getDefaultOptionValue(),
@@ -1107,9 +1120,6 @@ type fieldInfo struct {
 	isAnonymous  bool
 	isRequired   bool
 	defaultValue string
-	// canonicalDot is canonicalAlias with the trailing separator, the prefix
-	// the fields of a nested struct are looked up under.
-	canonicalDot string
 	// def is the default option resolved at build time, nil for the fields
 	// that have none; see resolveDefault.
 	def *fieldDefault
