@@ -5246,6 +5246,45 @@ func BenchmarkDecodeWithDefaults(b *testing.B) {
 	}
 }
 
+type embeddedPaging struct {
+	Page  int `schema:"page,default:1"`
+	Limit int `schema:"limit,default:50"`
+}
+
+type embeddedDefaultsRequest struct {
+	embeddedPaging
+	Q string `schema:"q"`
+}
+
+func BenchmarkDecodeEmbeddedDefaults(b *testing.B) {
+	src := map[string][]string{"q": {"shoes"}, "page": {"0"}}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r embeddedDefaultsRequest
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+type pointerDefaultsNode struct {
+	V    int                  `schema:"v,default:1"`
+	Next *pointerDefaultsNode `schema:"next"`
+}
+
+func BenchmarkDecodePointerDefaults(b *testing.B) {
+	src := map[string][]string{"next.next.v": {"0"}}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r pointerDefaultsNode
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTimeDurationDecoding(b *testing.B) {
 	type DurationStruct struct {
 		Timeout time.Duration `schema:"timeout"`
