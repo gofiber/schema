@@ -586,13 +586,6 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	for _, f := range info.fields {
-		// Only the resolved copy of a promoted named struct is walked, so its
-		// bare alias counts as provided; embedded structs go through their own field.
-		promotedNamed := !f.isAnonymous && info.fieldsByName[f.aliasLower] == f
-		if k := f.typ.Kind(); f.def != nil || (len(f.index) == 1 || promotedNamed) && (k == reflect.Struct ||
-			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct)) {
-			info.defaultFields = append(info.defaultFields, f)
-		}
 		if f.mapValue != nil {
 			// Per field, not per type: a promoted copy's path is its own.
 			hops := []pathHop{{index: f.index, ensure: info.anonymousPtrFields}}
@@ -608,7 +601,62 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	// so it can only be skipped when neither defaults nor such pointers
 	// exist anywhere in the tree.
 	info.needsDefaultsWalk = c.needsDefaultsWalk(t, tag, map[reflect.Type]bool{})
+	if info.needsDefaultsWalk && parentAlias == "" { // promotion-only builds never walk
+		info.defaults = c.buildDefaults(info)
+	}
 	return info
+}
+
+// buildDefaults plans every defaulted field with every key the decoder resolves
+// to it, so the walk joins prefixes only at named pointers.
+func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
+	var p defaultsPlan
+	for _, idx := range info.anonymousPtrFields {
+		p.allocs = append(p.allocs, []int{idx})
+	}
+	for _, f := range info.fields {
+		if len(f.index) > 1 && info.fieldsByName[f.aliasLower] != f {
+			continue // shadowed promoted copy, reached through its embedded struct
+		}
+		k := f.typ.Kind()
+		structPtr := k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct
+		switch {
+		case f.def != nil:
+			p.add(f, f.index, f.alias)
+		case k == reflect.Struct || structPtr && f.isAnonymous:
+			child := c.get(indirectType(f.typ)).defaults
+			if len(f.index) == 1 {
+				for _, a := range child.allocs {
+					p.allocs = append(p.allocs, slices.Concat(f.index, a))
+				}
+			}
+			for _, s := range child.steps {
+				idx := slices.Concat(f.index, s.index)
+				for _, sk := range s.keys {
+					p.add(s.field, idx, f.alias+"."+sk)
+				}
+			}
+		case structPtr:
+			p.add(f, f.index, f.alias+".") // walked when set, under its keys
+		}
+	}
+	for _, s := range p.steps {
+		// Shortest first: a pointer step's first and last keys are its bare and full spellings.
+		slices.SortStableFunc(s.keys, func(a, b string) int { return len(a) - len(b) })
+	}
+	return p
+}
+
+// add records key for the field at index, merging the paths that reach one field.
+func (p *defaultsPlan) add(f *fieldInfo, index []int, key string) {
+	i := slices.IndexFunc(p.steps, func(s defaultStep) bool { return slices.Equal(s.index, index) })
+	if i < 0 {
+		i = len(p.steps)
+		p.steps = append(p.steps, defaultStep{field: f, index: index})
+	}
+	if !slices.Contains(p.steps[i].keys, key) {
+		p.steps[i].keys = append(p.steps[i].keys, key)
+	}
 }
 
 // buildDirectPaths precomputes, keyed by lowercase path, the parsed paths for
@@ -895,10 +943,8 @@ type structInfo struct {
 	// so they never alias reused request buffers.
 	paths        pathCache
 	hasMapFields bool
-	// defaultFields are the fields the setDefaults walk has to visit: those
-	// with a default, and the structs and pointers to structs it descends
-	// into. The rest of the fields can never be affected by it.
-	defaultFields []*fieldInfo
+	// defaults is the setDefaults walk of this struct tree, see buildDefaults.
+	defaults defaultsPlan
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
 	// anonymous embedded pointer field (which the walk allocates) exists
@@ -924,13 +970,6 @@ func (i *structInfo) get(alias string) *fieldInfo {
 		return i.fieldsByName[string(buf[:n])]
 	}
 	return i.fieldsByName[utilstrings.ToLower(alias)]
-}
-
-// promotes reports whether f, a field of the struct embedded at field embedAt,
-// is promoted into i, so its bare alias reaches it from i.
-func (i *structInfo) promotes(embedAt int, f *fieldInfo) bool {
-	p := i.fieldsByName[f.aliasLower]
-	return p != nil && len(p.index) == len(f.index)+1 && p.index[0] == embedAt && slices.Equal(p.index[1:], f.index)
 }
 
 func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
@@ -1081,6 +1120,19 @@ type fieldInfo struct {
 	// mapRoot is the path of an entry named by the bare alias, the same for every key.
 	mapRoot []pathPart
 	entries *sync.Pool
+}
+
+type defaultsPlan struct {
+	allocs [][]int // nil embedded pointers to allocate, parents first
+	steps  []defaultStep
+}
+
+// defaultStep is a defaulted field, or a named struct pointer walked when set,
+// whose keys then end in the separator.
+type defaultStep struct {
+	field *fieldInfo
+	index []int
+	keys  []string
 }
 
 // fieldDefault is what setDefaults assigns for a field's default option:

@@ -5268,6 +5268,23 @@ func BenchmarkDecodeEmbeddedDefaults(b *testing.B) {
 	}
 }
 
+type pointerDefaultsNode struct {
+	V    int                  `schema:"v,default:1"`
+	Next *pointerDefaultsNode `schema:"next"`
+}
+
+func BenchmarkDecodePointerDefaults(b *testing.B) {
+	src := map[string][]string{"next.next.v": {"0"}}
+	d := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var r pointerDefaultsNode
+		if err := d.Decode(&r, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkTimeDurationDecoding(b *testing.B) {
 	type DurationStruct struct {
 		Timeout time.Duration `schema:"timeout"`

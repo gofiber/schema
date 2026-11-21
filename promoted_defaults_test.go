@@ -1,6 +1,10 @@
 package schema
 
-import "testing"
+import (
+	"reflect"
+	"strings"
+	"testing"
+)
 
 // See https://github.com/gofiber/schema/issues/117.
 func TestDefaultsOfPromotedFieldsAppliedOnlyWhenMissing(t *testing.T) {
@@ -243,5 +247,188 @@ func TestDefaultsOfDeepEmbeddedPointerAllocated(t *testing.T) {
 	}
 	if v.D == nil || v.Z != 1 {
 		t.Errorf("got %+v, want allocated D with z=1", v.D)
+	}
+}
+
+type defaultLeaf struct {
+	index []int
+	segs  []string
+}
+
+// collectDefaultLeaves lists the int fields with a default reachable through
+// struct values and embedded pointers, with their declared segment chain.
+func collectDefaultLeaves(t reflect.Type, index []int, segs []string, out *[]defaultLeaf) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, opts, _ := strings.Cut(f.Tag.Get("schema"), ",")
+		if name == "-" || !f.IsExported() {
+			continue
+		}
+		if name == "" {
+			name = f.Name
+		}
+		idx := append(append([]int{}, index...), i)
+		sg := append(append([]string{}, segs...), name)
+		ft := f.Type
+		if f.Anonymous && ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		switch {
+		case ft.Kind() == reflect.Struct:
+			collectDefaultLeaves(ft, idx, sg, out)
+		case ft.Kind() == reflect.Int && strings.Contains(opts, "default:"):
+			*out = append(*out, defaultLeaf{idx, sg})
+		}
+	}
+}
+
+func leafInts(v reflect.Value, leaves []defaultLeaf) []int64 {
+	out := make([]int64, len(leaves))
+	for i, l := range leaves {
+		f, err := v.FieldByIndexErr(l.index)
+		if err != nil {
+			out[i] = -1
+			continue
+		}
+		out[i] = f.Int()
+	}
+	return out
+}
+
+// Every key the decoder resolves to a defaulted field must keep a provided
+// zero there, whichever embedded segments it spells out or skips.
+func TestDefaultsKeepProvidedZeroForEveryResolvingKey(t *testing.T) {
+	t.Parallel()
+
+	type Paging struct {
+		Page int `schema:"page,default:1"`
+	}
+	type In struct {
+		X int `schema:"x,default:3"`
+	}
+	type B struct {
+		X int `schema:"x,default:5"`
+	}
+	type C struct {
+		X int `schema:"x,default:6"`
+	}
+	type BIn struct {
+		Inner In `schema:"inner"`
+	}
+	type D struct {
+		Z int `schema:"z,default:1"`
+	}
+	type BD struct{ *D }
+	type Emb struct {
+		P int `schema:"p,default:7"`
+	}
+	type ShadowedInA struct {
+		B
+		X int `schema:"x,default:7"`
+	}
+	type AmbiguousInA struct {
+		B
+		C
+	}
+	type AB struct{ B }
+	type ABIn struct{ BIn }
+	type ABD struct{ BD }
+
+	shapes := []any{
+		struct {
+			Paging
+			Limit int `schema:"limit,default:50"`
+		}{},
+		struct{ *Paging }{},
+		struct {
+			Emb
+			P int `schema:"p,default:9"`
+		}{},
+		struct{ BIn }{},
+		struct{ AB }{},
+		struct{ ABIn }{},
+		struct {
+			ABIn
+			Inner In `schema:"inner"`
+		}{},
+		struct {
+			BIn
+			Inner In `schema:"inner"`
+		}{},
+		struct{ ShadowedInA }{},
+		struct{ AmbiguousInA }{},
+		struct{ ABD }{},
+	}
+
+	for _, shape := range shapes {
+		typ := reflect.TypeOf(shape)
+		var leaves []defaultLeaf
+		collectDefaultLeaves(typ, nil, nil, &leaves)
+
+		decode := func(src map[string][]string) []int64 {
+			d := NewDecoder()
+			d.IgnoreUnknownKeys(true)
+			v := reflect.New(typ)
+			if err := d.Decode(v.Interface(), src); err != nil {
+				t.Fatalf("%v %v: %v", typ, src, err)
+			}
+			return leafInts(v.Elem(), leaves)
+		}
+		defaults := decode(map[string][]string{})
+
+		for _, l := range leaves {
+			last := len(l.segs) - 1
+			for mask := 0; mask < 1<<last; mask++ {
+				var segs []string
+				for i := range last {
+					if mask&(1<<i) != 0 {
+						segs = append(segs, l.segs[i])
+					}
+				}
+				key := strings.Join(append(segs, l.segs[last]), ".")
+
+				landed := -1
+				for i, got := range decode(map[string][]string{key: {"42"}}) {
+					if got == 42 {
+						landed = i
+					}
+				}
+				if landed < 0 {
+					continue
+				}
+				got := decode(map[string][]string{key: {"0"}})
+				for i := range leaves {
+					want := defaults[i]
+					if i == landed {
+						want = 0
+					}
+					if got[i] != want {
+						t.Errorf("%v %s=0: field %v got %d, want %d", typ, key, leaves[i].segs, got[i], want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestDefaultsBehindPromotedPointerRespectEveryKey(t *testing.T) {
+	t.Parallel()
+
+	type Node struct {
+		V int `schema:"v,default:1"`
+	}
+	type Emb struct {
+		Next *Node `schema:"next"`
+	}
+	type Out struct{ Emb }
+
+	for _, key := range []string{"next.v", "Emb.next.v"} {
+		var v Out
+		if err := NewDecoder().Decode(&v, map[string][]string{key: {"0"}}); err != nil {
+			t.Fatal(err)
+		}
+		if v.Next == nil || v.Next.V != 0 {
+			t.Errorf("%s=0: got %+v, want v=0", key, v.Next)
+		}
 	}
 }

@@ -255,7 +255,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", nil, 0))
+		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", ""))
 	}
 	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(errs) > 0 {
@@ -352,11 +352,9 @@ func (f *fieldInfo) resolveDefault() {
 	}
 }
 
-// short is prefix with every promoted struct named by its bare alias. owner is
-// the struct that embeds t at field embedAt, nil unless t is walked as embedded.
-func (d *Decoder) setDefaults(
-	t reflect.Type, v reflect.Value, src *source, prefix, short string, owner *structInfo, embedAt int,
-) MultiError {
+// setDefaults runs the planned walk of t, reached under prefix, the shortest
+// path, and under long, the fully spelled one.
+func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
 	// no anonymous embedded pointers to allocate anywhere in the tree) — the
@@ -369,54 +367,42 @@ func (d *Decoder) setDefaults(
 
 	// Allocate nil anonymous embedded pointer fields so their promoted
 	// fields stay reachable.
-	for _, idx := range struc.anonymousPtrFields {
-		if field := v.Field(idx); field.IsNil() {
+	for _, chain := range struc.defaults.allocs {
+		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
 	}
 
-	for _, f := range struc.defaultFields {
-		// The owner defaults its resolved copy of f, which also checks the bare key.
-		if owner != nil && !f.isAnonymous && owner.promotes(embedAt, f) {
-			continue
-		}
-		vCurrent, _ := walkIndexChain(v, f.index, nil) // nothing to refuse without a tracker
+	for _, s := range struc.defaults.steps {
+		f := s.field
+		vCurrent, _ := walkIndexChain(v, s.index, nil) // nothing to refuse without a tracker
 		if !vCurrent.IsValid() {
 			// Unreachable behind an unsettable nil embedded pointer.
 			continue
 		}
 
-		// vCurrent's type is f.typ; a nested struct is walked under its own
-		// prefix (an empty prefix concatenates without allocating).
-		kind := f.typ.Kind()
-		if f.defaultValue == "" && (kind == reflect.Struct || kind == reflect.Pointer && isPointerToStruct(vCurrent)) {
-			nt, nv := f.typ, vCurrent
-			if kind == reflect.Pointer {
-				nt, nv = nt.Elem(), nv.Elem()
-			}
-			nPrefix := prefix + f.canonicalDot
-			nShort := nPrefix
-			if short != prefix || f.alias != f.canonicalAlias {
-				nShort = short + f.alias + "."
-			}
-			var nOwner *structInfo
-			if f.isAnonymous {
-				nOwner = struc
-			}
-			errs = mergeErrors(errs, d.setDefaults(nt, nv, src, nPrefix, nShort, nOwner, f.index[0]))
-		}
-
 		def := f.def
 		if def == nil {
+			if !vCurrent.IsNil() {
+				// Mixed spellings would multiply per level, and recursive types nest without limit.
+				np, nl := prefix+s.keys[0], ""
+				if long == prefix && len(s.keys) == 1 {
+					nl = np
+				} else {
+					nl = long + s.keys[len(s.keys)-1]
+				}
+				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl))
+			}
 			continue
 		}
 		if f.isRequired {
 			errs = appendError(errs, "default-"+f.name, errRequiredDefault)
 			continue
 		}
-		if !vCurrent.IsZero() || fieldProvided(src, prefix, f) || short != prefix && fieldProvided(src, short, f) {
+		if !vCurrent.IsZero() || keysProvided(src, prefix, long, s.keys) {
 			continue
 		}
+		kind := f.typ.Kind()
 		// The default itself was resolved when the metadata was built; see
 		// resolveDefault. Only the per-call parts remain: the errors a kind
 		// that takes no default reports, and a fresh pointer or slice so no
@@ -477,15 +463,13 @@ func (d *Decoder) growCap(n int, tracked bool) int {
 	return c
 }
 
-func isPointerToStruct(v reflect.Value) bool {
-	return !v.IsZero() && v.Type().Kind() == reflect.Pointer && v.Elem().Type().Kind() == reflect.Struct
-}
-
-func fieldProvided(src *source, prefix string, f *fieldInfo) bool {
-	if keyProvided(src, prefix, f.alias) {
-		return true
+func keysProvided(src *source, prefix, long string, keys []string) bool {
+	for _, key := range keys {
+		if keyProvided(src, prefix, key) || long != prefix && keyProvided(src, long, key) {
+			return true
+		}
 	}
-	return f.alias != f.canonicalAlias && keyProvided(src, prefix, f.canonicalAlias)
+	return false
 }
 
 // keyProvided reports whether prefix+name is a key of src, assembling the key
