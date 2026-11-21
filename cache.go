@@ -8,6 +8,7 @@ import (
 	"errors"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -585,8 +586,10 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		}
 	}
 	for _, f := range info.fields {
-		// A promoted struct is walked through its embedded field, under the same prefix.
-		if k := f.typ.Kind(); f.def != nil || len(f.index) == 1 && (k == reflect.Struct ||
+		// Only the resolved copy of a promoted named struct is walked, so its
+		// bare alias counts as provided; embedded structs go through their own field.
+		promotedNamed := !f.isAnonymous && info.fieldsByName[f.aliasLower] == f
+		if k := f.typ.Kind(); f.def != nil || (len(f.index) == 1 || promotedNamed) && (k == reflect.Struct ||
 			(k == reflect.Pointer && f.typ.Elem().Kind() == reflect.Struct)) {
 			info.defaultFields = append(info.defaultFields, f)
 		}
@@ -921,6 +924,13 @@ func (i *structInfo) get(alias string) *fieldInfo {
 		return i.fieldsByName[string(buf[:n])]
 	}
 	return i.fieldsByName[utilstrings.ToLower(alias)]
+}
+
+// promotes reports whether f, a field of the struct embedded at field embedAt,
+// is promoted into i, so its bare alias reaches it from i.
+func (i *structInfo) promotes(embedAt int, f *fieldInfo) bool {
+	p := i.fieldsByName[f.aliasLower]
+	return p != nil && len(p.index) == len(f.index)+1 && p.index[0] == embedAt && slices.Equal(p.index[1:], f.index)
 }
 
 func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {

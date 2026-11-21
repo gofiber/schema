@@ -255,7 +255,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", nil))
+		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", nil, 0))
 	}
 	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(errs) > 0 {
@@ -352,12 +352,10 @@ func (f *fieldInfo) resolveDefault() {
 	}
 }
 
+// short is prefix with every promoted struct named by its bare alias. owner is
+// the struct that embeds t at field embedAt, nil unless t is walked as embedded.
 func (d *Decoder) setDefaults(
-	t reflect.Type,
-	v reflect.Value,
-	src *source,
-	prefix, promotedPrefix string,
-	promoted map[string]bool,
+	t reflect.Type, v reflect.Value, src *source, prefix, short string, owner *structInfo, embedAt int,
 ) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
@@ -378,6 +376,10 @@ func (d *Decoder) setDefaults(
 	}
 
 	for _, f := range struc.defaultFields {
+		// The owner defaults its resolved copy of f, which also checks the bare key.
+		if owner != nil && !f.isAnonymous && owner.promotes(embedAt, f) {
+			continue
+		}
 		vCurrent, _ := walkIndexChain(v, f.index, nil) // nothing to refuse without a tracker
 		if !vCurrent.IsValid() {
 			// Unreachable behind an unsettable nil embedded pointer.
@@ -385,20 +387,23 @@ func (d *Decoder) setDefaults(
 		}
 
 		// vCurrent's type is f.typ; a nested struct is walked under its own
-		// prefix (an empty prefix concatenates without allocating). A promoted
-		// field is also reachable from the outer struct under its bare alias,
-		// so the nested walk carries both prefixes: `promoted` marks which of
-		// the nested fields are reachable via `promotedPrefix`.
+		// prefix (an empty prefix concatenates without allocating).
 		kind := f.typ.Kind()
-		if kind == reflect.Struct && f.defaultValue == "" {
-			child := d.cache.get(f.typ)
-			cp, pp, pm := defaultsChildContext(struc, child, f, prefix, promotedPrefix, promoted)
-			errs = mergeErrors(errs, d.setDefaults(f.typ, vCurrent, src, cp, pp, pm))
-		} else if kind == reflect.Pointer && f.defaultValue == "" && isPointerToStruct(vCurrent) {
-			t1 := f.typ.Elem()
-			child := d.cache.get(t1)
-			cp, pp, pm := defaultsChildContext(struc, child, f, prefix, promotedPrefix, promoted)
-			errs = mergeErrors(errs, d.setDefaults(t1, vCurrent.Elem(), src, cp, pp, pm))
+		if f.defaultValue == "" && (kind == reflect.Struct || kind == reflect.Pointer && isPointerToStruct(vCurrent)) {
+			nt, nv := f.typ, vCurrent
+			if kind == reflect.Pointer {
+				nt, nv = nt.Elem(), nv.Elem()
+			}
+			nPrefix := prefix + f.canonicalDot
+			nShort := nPrefix
+			if short != prefix || f.alias != f.canonicalAlias {
+				nShort = short + f.alias + "."
+			}
+			var nOwner *structInfo
+			if f.isAnonymous {
+				nOwner = struc
+			}
+			errs = mergeErrors(errs, d.setDefaults(nt, nv, src, nPrefix, nShort, nOwner, f.index[0]))
 		}
 
 		def := f.def
@@ -409,11 +414,7 @@ func (d *Decoder) setDefaults(
 			errs = appendError(errs, "default-"+f.name, errRequiredDefault)
 			continue
 		}
-		provided := fieldProvided(src, prefix, f)
-		if !provided && promoted != nil && promoted[f.aliasLower] {
-			provided = fieldProvided(src, promotedPrefix, f)
-		}
-		if !vCurrent.IsZero() || provided {
+		if !vCurrent.IsZero() || fieldProvided(src, prefix, f) || short != prefix && fieldProvided(src, short, f) {
 			continue
 		}
 		// The default itself was resolved when the metadata was built; see
@@ -478,63 +479,6 @@ func (d *Decoder) growCap(n int, tracked bool) int {
 
 func isPointerToStruct(v reflect.Value) bool {
 	return !v.IsZero() && v.Type().Kind() == reflect.Pointer && v.Elem().Type().Kind() == reflect.Struct
-}
-
-// defaultsChildContext computes the walk context for a struct the defaults
-// walk descends into. `prefix` is the canonical dotted path; `promotedPrefix`
-// is the path under which the child's fields are reachable from the outermost
-// struct (Go promotion drops embedded type names). `promoted` marks which of
-// the current struct's fields are reachable via `promotedPrefix`.
-func defaultsChildContext(
-	parent, child *structInfo,
-	f *fieldInfo,
-	prefix, promotedPrefix string,
-	promoted map[string]bool,
-) (string, string, map[string]bool) {
-	childPrefix := prefix + f.canonicalDot
-	if !f.isAnonymous {
-		// A named nested struct keeps its alias in the promoted path, and all
-		// its fields are reachable through it. If the struct itself is not
-		// reachable from the outer struct (shadowed), neither are its fields.
-		if promoted == nil || promoted[f.aliasLower] {
-			promotedPrefix += f.alias + "."
-		} else {
-			promotedPrefix = ""
-		}
-		return childPrefix, promotedPrefix, allAliases(child)
-	}
-
-	// An embedded struct is transparent to promotion: its fields take the
-	// parent's prefix unless shadowed. A shadowed field resolves to a
-	// different index chain in the parent, so it is not promoted.
-	next := make(map[string]bool, len(child.fields))
-	for _, sf := range child.fields {
-		if other := parent.fieldsByName[sf.aliasLower]; other != nil &&
-			indexStartsWith(other.index, f.index) {
-			next[sf.aliasLower] = true
-		}
-	}
-	return childPrefix, promotedPrefix, next
-}
-
-func allAliases(info *structInfo) map[string]bool {
-	out := make(map[string]bool, len(info.fields))
-	for _, f := range info.fields {
-		out[f.aliasLower] = true
-	}
-	return out
-}
-
-func indexStartsWith(index, prefix []int) bool {
-	if len(index) < len(prefix) {
-		return false
-	}
-	for i := range prefix {
-		if index[i] != prefix[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func fieldProvided(src *source, prefix string, f *fieldInfo) bool {
