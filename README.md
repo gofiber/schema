@@ -161,7 +161,7 @@ The `default` tag option is supported for the following types:
 * a pointer to one of the above types (pointer to slice and slice of pointers are not supported).
 
 > [!NOTE]  
-> Because primitive types like int, float, bool, unint and their variants have their default (or zero) values set by Golang, it is not possible to distinguish them from a provided value when decoding/encoding form values. In this case, the value provided by the `default` option tag will be always applied. For example, let's assume that the value submitted in the form for `balance` is `0.0` then the default of `10.0` will be applied, even if `0.0` is part of the form data for the `balance` field. In such cases, it is highly recommended to use pointers to allow schema to distinguish between when a form field has no provided value and when a form has a value equal to the corresponding default set by Golang for a particular type. If the type of the `Balance` field above is changed to `*float64`, then the zero value would be `nil`. In this case, if the form data value for `balance` is `0.0`, then the default will not be applied.
+> The default is applied only when the field's key is missing from the source. A provided key keeps its decoded value even if it is the zero value: `balance=0.0` leaves `Balance` at `0`. This also holds for fields promoted from an embedded struct. Use a pointer only when the handler itself needs to tell "not sent" from "sent as zero" after decoding.
 
 <!-- skip-docs -->
 ## ☕ Supporters
