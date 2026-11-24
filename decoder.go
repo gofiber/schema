@@ -39,13 +39,6 @@ var errAllocLimit = errors.New("schema: keys allocate past the per-call limit")
 // goes into is this package's own copy, so one slice serves every file key.
 var fileKeyValues = []string{""}
 
-var decodeValueBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]reflect.Value, 0, 8)
-		return &buf
-	},
-}
-
 // NewDecoder returns a new Decoder.
 func NewDecoder() *Decoder {
 	return &Decoder{cache: newCache(), maxSize: defaultMaxSize}
@@ -1261,20 +1254,28 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
 // to round-trip through a reflect.Value: a custom converter, or pointer
-// elements. Split out so that decode carries no defer of its own.
+// elements. Each item goes straight into a slot of a detached slice, set on v
+// only if all convert.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv valueConverter, m unmarshaler, isPtrElem bool) error {
-	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
-	items := (*itemsBuf)[:0]
-	defer func() {
-		clear(items)
-		*itemsBuf = items[:0]
-		decodeValueBufferPool.Put(itemsBuf)
-	}()
+	limit := len(values) // a value yields at most one item more than it has commas
+	for _, value := range values {
+		limit += strings.Count(value, ",")
+	}
+	var sl reflect.Value
+	room, n := 0, 0
+	slot := func() reflect.Value {
+		if n == room {
+			sl = growSlice(sl, t, limit)
+			room = sl.Len()
+		}
+		n++
+		return sl.Index(n - 1)
+	}
 
 	for key, value := range values {
 		if value == "" {
 			if d.zeroEmpty {
-				items = append(items, reflect.Zero(t.Elem()))
+				slot() // stays zero
 			}
 			continue
 		}
@@ -1290,7 +1291,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 					Err:   err,
 				}
 			}
-			items = append(items, u)
+			slot().Set(u)
 			continue
 		}
 		// conv.convert, spelled out: it is too big to inline, and this
@@ -1303,7 +1304,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			item, err = conv.withErr(value)
 		}
 		if err == nil && item.IsValid() {
-			items = appendConvertedItem(items, item, elemT, isPtrElem)
+			setConvertedItem(slot(), item, elemT, isPtrElem)
 			continue
 		}
 		if strings.IndexByte(value, ',') == -1 {
@@ -1320,10 +1321,10 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 		for value := range strings.SplitSeq(value, ",") {
 			if value == "" {
 				if d.zeroEmpty {
-					items = append(items, reflect.Zero(t.Elem()))
+					slot()
 				}
 			} else if item, err := conv.convert(value); err == nil && item.IsValid() {
-				items = appendConvertedItem(items, item, elemT, isPtrElem)
+				setConvertedItem(slot(), item, elemT, isPtrElem)
 			} else {
 				return ConversionError{
 					Key:   path,
@@ -1334,21 +1335,22 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			}
 		}
 	}
-	value := reflect.MakeSlice(t, len(items), len(items))
-	for i, item := range items {
-		value.Index(i).Set(item)
+	if room == 0 {
+		sl = reflect.MakeSlice(t, 0, 0)
+	} else if n < room {
+		sl = sl.Slice(0, n)
 	}
-	v.Set(value)
+	v.Set(sl)
 	return nil
 }
 
-// appendConvertedItem converts a builtin/custom converter result to the slice
-// element type and appends it, wrapping it in a freshly allocated pointer for
+// setConvertedItem converts a builtin/custom converter result to the slice
+// element type and stores it in slot, wrapping it in a freshly allocated pointer for
 // pointer-element slices. The conversion must happen before the pointer wrap:
 // builtin converters return the underlying kind (e.g. int for a named
 // `type MyInt int`), which is not assignable to the named element type, so
 // Set-ing it into a *MyInt without converting first panics.
-func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflect.Type, isPtrElem bool) []reflect.Value {
+func setConvertedItem(slot, item reflect.Value, elemT reflect.Type, isPtrElem bool) {
 	if item.Type() != elemT {
 		item = item.Convert(elemT)
 	}
@@ -1357,11 +1359,11 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 		ptr.Elem().Set(item)
 		item = ptr
 	}
-	return append(items, item)
+	slot.Set(item)
 }
 
-// unmarshalerSliceBudget bounds the first allocation: the client chooses how many values arrive.
-const unmarshalerSliceBudget = 4 << 10
+// sliceBudget bounds the first allocation: the client chooses how many values arrive.
+const sliceBudget = 4 << 10
 
 // decodeUnmarshalerSlice unmarshals each value into an element of a detached slice,
 // set on v only if all succeed; empty values are skipped unless ZeroEmpty is set.
@@ -1373,7 +1375,7 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 			continue
 		}
 		if i == room {
-			sl = growUnmarshalerSlice(sl, t, len(values))
+			sl = growSlice(sl, t, len(values))
 			room = sl.Len()
 		}
 		if value != "" { // an empty value kept for ZeroEmpty leaves its slot zero
@@ -1398,15 +1400,15 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 	return nil
 }
 
-// growUnmarshalerSlice returns sl with more room: the budget at first, then doubled, up to limit.
-func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
+// growSlice returns sl with more room: the budget at first, then doubled, up to limit.
+func growSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
 	var n int
 	if sl.IsValid() {
 		n = 2 * sl.Len()
 	} else if size := int(t.Elem().Size()); size == 0 {
 		n = limit
 	} else {
-		n = max(1, unmarshalerSliceBudget/size)
+		n = max(1, sliceBudget/size)
 	}
 	n = min(n, limit)
 	grown := reflect.MakeSlice(t, n, n)

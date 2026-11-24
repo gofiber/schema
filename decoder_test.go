@@ -5907,6 +5907,47 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	}
 }
 
+// Not parallel: TotalAlloc counts the allocations of every running test.
+func TestDecodeCommaListOfPointersAllocatesPerItem(t *testing.T) {
+	type target struct {
+		Ints []int  `schema:"ints"`
+		Ptrs []*int `schema:"ptrs"`
+	}
+	const items = 4<<20 + 1
+	value := strings.Repeat(",", items-1)
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	decode := func(key string) (allocated uint64) {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		var s target
+		if err := d.Decode(&s, map[string][]string{key: {value}}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		if n := len(s.Ints) + len(s.Ptrs); n != items {
+			t.Fatalf("%s: decoded %d items, want %d", key, n, items)
+		}
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	ints := decode("ints")
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ptrs := decode("ptrs")
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	// []int is sized up front; the pointers' slice doubles toward its bound, which costs up to three times as much.
+	if ptrs > 4*ints {
+		t.Fatalf("a list of %d items allocated %d bytes into []*int, %d into []int", items, ptrs, ints)
+	}
+	if retained > 1<<20 {
+		t.Fatalf("decoding into []*int kept %d bytes after the call", retained)
+	}
+}
+
 func TestDecodeSliceReplacesPreviousValues(t *testing.T) {
 	type target struct {
 		N []int `schema:"n"`
