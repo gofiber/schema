@@ -4602,6 +4602,41 @@ func TestDefaultsWalkThroughEmbeddedRecursion(t *testing.T) {
 	}
 }
 
+// Not parallel: TotalAlloc counts the allocations of every running test.
+func TestDefaultsWalkOfDeepDestinationIsLinear(t *testing.T) {
+	// Another decoder (JSON, say) can nest a recursive type far deeper than any key reaches.
+	const depth = 4096
+	c := new(Category)
+	last := c
+	for range depth {
+		last.Parent = new(Category)
+		last = last.Parent
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := NewDecoder().Decode(c, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("defaults walk of %d levels allocated %d bytes, want well under a megabyte", depth, got)
+	}
+	if last.Name != "none" {
+		t.Fatalf("deepest Name = %q, want the default", last.Name)
+	}
+	// The deepest level a key reaches still counts as provided.
+	c = new(Category)
+	if err := NewDecoder().Decode(c, map[string][]string{strings.Repeat("parent.", maxPathDepth-1) + "name": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	for last = c; last.Parent != nil; last = last.Parent {
+	}
+	if last.Name != "" {
+		t.Fatalf("deepest Name = %q, want the provided empty value", last.Name)
+	}
+}
+
 func TestRequiredCheckLinearInKeyLength(t *testing.T) {
 	t.Parallel()
 	// Nine required keys: a map of at most eight compares long keys by length without hashing them.

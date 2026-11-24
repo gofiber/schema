@@ -255,7 +255,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", ""))
+		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", 0))
 	}
 	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(errs) > 0 {
@@ -353,8 +353,8 @@ func (f *fieldInfo) resolveDefault() {
 }
 
 // setDefaults runs the planned walk of t, reached under prefix, the shortest
-// path, and under long, the fully spelled one.
-func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string) MultiError {
+// path, and under long, the fully spelled one, depth levels below the root.
+func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string, depth int) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
 	// no anonymous embedded pointers to allocate anywhere in the tree) — the
@@ -385,12 +385,17 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		if def == nil {
 			if !vCurrent.IsNil() {
 				// Mixed spellings would multiply per level, and recursive types nest without limit.
-				np := prefix + s.keys[0]
-				nl := np
-				if long != prefix || len(s.keys) > 1 {
-					nl = long + s.keys[len(s.keys)-1]
+				np, nl := prefix, long
+				// No key names more than maxPathDepth fields, so a deeper prefix could never match; a
+				// destination filled by another decoder can be far deeper, and each prefix would stay live.
+				if depth < maxPathDepth {
+					np = prefix + s.keys[0]
+					nl = np
+					if long != prefix || len(s.keys) > 1 {
+						nl = long + s.keys[len(s.keys)-1]
+					}
 				}
-				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl))
+				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl, depth+1))
 			}
 			continue
 		}
@@ -398,7 +403,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			errs = appendError(errs, "default-"+f.name, errRequiredDefault)
 			continue
 		}
-		if !vCurrent.IsZero() || keysProvided(src, prefix, long, s.keys) {
+		if !vCurrent.IsZero() || depth < maxPathDepth && keysProvided(src, prefix, long, s.keys) {
 			continue
 		}
 		kind := f.typ.Kind()
