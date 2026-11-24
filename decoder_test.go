@@ -3591,6 +3591,27 @@ func TestRequiredFileNeedsAFile(t *testing.T) {
 	}
 }
 
+// A text key assigns nothing to a file field, so under ZeroEmpty it must not
+// unsettle a file another spelling of the key bound.
+func TestRequiredFileKeepsFileOverTextKey(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		Avatar *multipart.FileHeader `schema:"avatar,required"`
+	}
+	file := &multipart.FileHeader{Filename: "a.png"}
+	files := map[string][]*multipart.FileHeader{"AVATAR": {file}}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	// The map yields the two keys in either order; 64 runs all miss one with probability 2^-63.
+	for range 64 {
+		var got form
+		if err := d.Decode(&got, map[string][]string{"avatar": {""}}, files); err != nil || got.Avatar != file {
+			t.Fatalf("got %v and %v, want the file", err, got.Avatar)
+		}
+	}
+}
+
 // An untagged field's alias is its Go name, which the folded index must lowercase.
 func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
 	t.Parallel()

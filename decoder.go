@@ -567,6 +567,9 @@ func markAssigned(info *structInfo, key string, val []string, satisfied, decided
 		lower = utilstrings.ToLower(key)
 	}
 	for _, p := range info.foldedRequiredPaths[lower] {
+		if !isFileValue(val) && isMultipartField(p.typ) {
+			continue // a text key assigns nothing to a file field
+		}
 		word, bit := p.group>>6, uint64(1)<<uint(p.group&63)
 		if isEmpty(p.typ, val) {
 			decided[word] |= bit
@@ -792,10 +795,14 @@ func isEmpty(t reflect.Type, value []string) bool {
 		return len(value[len(value)-1]) == 0
 	}
 	if isMultipartField(t) {
-		// Only a file fills a file field, and Decode gives each file's key fileKeyValues itself.
-		return &value[0] != &fileKeyValues[0]
+		return !isFileValue(value) // only a file fills a file field
 	}
 	return false
+}
+
+// isFileValue reports whether value is the fileKeyValues Decode gives a file's key itself.
+func isFileValue(value []string) bool {
+	return len(value) > 0 && &value[0] == &fileKeyValues[0]
 }
 
 var (
