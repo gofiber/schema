@@ -161,5 +161,9 @@ a converter, like:
 		<input type="email" name="Emails.1">
 		<input type="email" name="Emails.2">
 	</form>
+
+A struct type with a converter or a TextUnmarshaler, like Email, is decoded as
+a whole from its field's own key, and so is a multipart file field: a key
+below one, like "Emails.0.Name", is an unknown key.
 */
 package schema

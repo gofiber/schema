@@ -259,7 +259,8 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			if err != nil {
 				return nil, errInvalidPath
 			}
-			if index64, err = utils.ParseInt(segment); err != nil {
+			// A negative index would wrap to a large one where int is 32 bits.
+			if index64, err = utils.ParseInt(segment); err != nil || index64 < 0 {
 				return nil, errInvalidPath
 			}
 			if index64 > maxParserIndex {
@@ -302,7 +303,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		if keyStart >= len(p) {
 			return nil, errInvalidPath
 		}
-		if t.Kind() != reflect.Struct {
+		if t.Kind() != reflect.Struct || field.whole {
 			return nil, errInvalidPath
 		}
 		struc = c.get(t)
@@ -559,12 +560,16 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		if f := c.createField(structField, parentAlias, tag); f != nil {
 			f.index = structField.Index
 			info.fields = append(info.fields, f)
-			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous {
+			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous && !f.whole {
 				anonymousInfos = append(anonymousInfos, c.create(ft, f.canonicalAlias))
 				anonymousIdx = append(anonymousIdx, structField.Index)
 			}
 		}
 	}
+	// The shadow check below reads the struct's own fields from fieldsByName.
+	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
+	info.addByName(info.fields)
+	own := len(info.fields)
 	for i, a := range anonymousInfos {
 		others := []*structInfo{info}
 		others = append(others, anonymousInfos[:i]...)
@@ -580,12 +585,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			}
 		}
 	}
-	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
-	for _, field := range info.fields {
-		if _, exists := info.fieldsByName[field.aliasLower]; !exists {
-			info.fieldsByName[field.aliasLower] = field
-		}
-	}
+	info.addByName(info.fields[own:])
 	for _, f := range info.fields {
 		if f.mapValue != nil {
 			// Per field, not per type: a promoted copy's path is its own.
@@ -698,7 +698,7 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 		if len(direct) >= maxDirectPaths {
 			break
 		}
-		if !directEligible(info, f) || f.typ.Kind() != reflect.Struct {
+		if !directEligible(info, f) || f.typ.Kind() != reflect.Struct || f.whole {
 			continue
 		}
 		// Non-pointer struct nesting cannot recurse (the type would be
@@ -863,6 +863,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		isRequired:       options.Contains("required"),
 		defaultValue:     options.getDefaultOptionValue(),
 	}
+	f.whole = f.isMultipart || isStruct && (elemU.IsValid || c.converter(ft) != nil)
 	f.resolveDefault()
 	return f
 }
@@ -967,6 +968,15 @@ type structInfo struct {
 	requiredMixedCase bool
 }
 
+// addByName indexes fields by lowercase alias; the first field of an alias wins.
+func (i *structInfo) addByName(fields []*fieldInfo) {
+	for _, field := range fields {
+		if _, exists := i.fieldsByName[field.aliasLower]; !exists {
+			i.fieldsByName[field.aliasLower] = field
+		}
+	}
+}
+
 func (i *structInfo) get(alias string) *fieldInfo {
 	// fieldsByName is keyed by lowercase alias, so the raw probe settles an
 	// already-lowercase one without folding. A mixed-case alias is folded
@@ -1000,8 +1010,9 @@ func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
 		groups = append(groups, requiredGroup{key: key, fields: []fieldWithPrefix{f}})
 	}
 	for _, field := range info.fields {
-		if field.typ.Kind() == reflect.Struct {
-			nested := c.get(field.typ)
+		// Fields promoted through an embedded pointer are required as through a value.
+		if ft := indirectType(field.typ); ft.Kind() == reflect.Struct && (ft == field.typ || field.isAnonymous) && !field.whole {
+			nested := c.get(ft)
 			for _, prefix := range field.paths("") {
 				nestedPrefix := prefix + "."
 				for _, group := range nested.requiredGroups {
@@ -1114,6 +1125,9 @@ type fieldInfo struct {
 	// multipart file header shapes, precomputed so the decoder can skip the
 	// type comparisons on every other field.
 	isMultipart bool
+	// whole marks a file field, or a struct (or slice of them) that a converter or
+	// encoding.TextUnmarshaler fills: no key continues into the struct's own fields.
+	whole bool
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.

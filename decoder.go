@@ -39,13 +39,6 @@ var errAllocLimit = errors.New("schema: keys allocate past the per-call limit")
 // goes into is this package's own copy, so one slice serves every file key.
 var fileKeyValues = []string{""}
 
-var decodeValueBufferPool = sync.Pool{
-	New: func() any {
-		buf := make([]reflect.Value, 0, 8)
-		return &buf
-	},
-}
-
 // NewDecoder returns a new Decoder.
 func NewDecoder() *Decoder {
 	return &Decoder{cache: newCache(), maxSize: defaultMaxSize}
@@ -71,7 +64,8 @@ func (d *Decoder) SetAliasTag(tag string) {
 // ZeroEmpty controls the behaviour when the decoder encounters empty values
 // in a map.
 // If z is true and a key in the map has the empty string as a value
-// then the corresponding struct field is set to the zero value.
+// then the corresponding struct field is set to the zero value, unless no
+// value could set it, as for a struct without a converter or TextUnmarshaler.
 // If z is false then empty strings are ignored.
 //
 // The default value is false, that is empty values do not change
@@ -255,7 +249,7 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", ""))
+		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", 0))
 	}
 	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(errs) > 0 {
@@ -353,8 +347,8 @@ func (f *fieldInfo) resolveDefault() {
 }
 
 // setDefaults runs the planned walk of t, reached under prefix, the shortest
-// path, and under long, the fully spelled one.
-func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string) MultiError {
+// path, and under long, the fully spelled one, depth levels below the root.
+func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string, depth int) MultiError {
 	struc := d.cache.get(t)
 	// Skip the walk entirely when it can have no effect (no default tags and
 	// no anonymous embedded pointers to allocate anywhere in the tree) — the
@@ -385,12 +379,17 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		if def == nil {
 			if !vCurrent.IsNil() {
 				// Mixed spellings would multiply per level, and recursive types nest without limit.
-				np := prefix + s.keys[0]
-				nl := np
-				if long != prefix || len(s.keys) > 1 {
-					nl = long + s.keys[len(s.keys)-1]
+				np, nl := prefix, long
+				// No key names more than maxPathDepth fields, so a deeper prefix could never match; a
+				// destination filled by another decoder can be far deeper, and each prefix would stay live.
+				if depth < maxPathDepth {
+					np = prefix + s.keys[0]
+					nl = np
+					if long != prefix || len(s.keys) > 1 {
+						nl = long + s.keys[len(s.keys)-1]
+					}
 				}
-				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl))
+				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl, depth+1))
 			}
 			continue
 		}
@@ -398,7 +397,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			errs = appendError(errs, "default-"+f.name, errRequiredDefault)
 			continue
 		}
-		if !vCurrent.IsZero() || keysProvided(src, prefix, long, s.keys) {
+		if !vCurrent.IsZero() || depth < maxPathDepth && keysProvided(src, prefix, long, s.keys) {
 			continue
 		}
 		kind := f.typ.Kind()
@@ -568,6 +567,9 @@ func markAssigned(info *structInfo, key string, val []string, satisfied, decided
 		lower = utilstrings.ToLower(key)
 	}
 	for _, p := range info.foldedRequiredPaths[lower] {
+		if !isFileValue(val) && isMultipartField(p.typ) {
+			continue // a text key assigns nothing to a file field
+		}
 		word, bit := p.group>>6, uint64(1)<<uint(p.group&63)
 		if isEmpty(p.typ, val) {
 			decided[word] |= bit
@@ -792,7 +794,15 @@ func isEmpty(t reflect.Type, value []string) bool {
 		uintType, uint8Type, uint16Type, uint32Type, uint64Type:
 		return len(value[len(value)-1]) == 0
 	}
+	if isMultipartField(t) {
+		return !isFileValue(value) // only a file fills a file field
+	}
 	return false
+}
+
+// isFileValue reports whether value is the fileKeyValues Decode gives a file's key itself.
+func isFileValue(value []string) bool {
+	return len(value) > 0 && &value[0] == &fileKeyValues[0]
 }
 
 var (
@@ -1185,7 +1195,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 			}
 		} else if val == "" {
-			if d.zeroEmpty {
+			// Clear only what a value could set: a struct's own key must not
+			// reach the fields no key names.
+			if d.zeroEmpty && getBuiltinConverter(t.Kind()) != nil {
 				v.Set(reflect.Zero(t))
 			}
 		} else if handled, ok := setBuiltinKind(v, t.Kind(), val); handled {
@@ -1249,20 +1261,28 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 
 // decodeBoxedSlice decodes values into the slice field v whose elements have
 // to round-trip through a reflect.Value: a custom converter, or pointer
-// elements. Split out so that decode carries no defer of its own.
+// elements. Each item goes straight into a slot of a detached slice, set on v
+// only if all convert.
 func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv valueConverter, m unmarshaler, isPtrElem bool) error {
-	itemsBuf := decodeValueBufferPool.Get().(*[]reflect.Value)
-	items := (*itemsBuf)[:0]
-	defer func() {
-		clear(items)
-		*itemsBuf = items[:0]
-		decodeValueBufferPool.Put(itemsBuf)
-	}()
+	limit := len(values) // a value yields at most one item more than it has commas
+	for _, value := range values {
+		limit += strings.Count(value, ",")
+	}
+	var sl reflect.Value
+	room, n := 0, 0
+	slot := func() reflect.Value {
+		if n == room {
+			sl = growSlice(sl, t, limit)
+			room = sl.Len()
+		}
+		n++
+		return sl.Index(n - 1)
+	}
 
 	for key, value := range values {
 		if value == "" {
 			if d.zeroEmpty {
-				items = append(items, reflect.Zero(t.Elem()))
+				slot() // stays zero
 			}
 			continue
 		}
@@ -1278,7 +1298,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 					Err:   err,
 				}
 			}
-			items = append(items, u)
+			slot().Set(u)
 			continue
 		}
 		// conv.convert, spelled out: it is too big to inline, and this
@@ -1291,7 +1311,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			item, err = conv.withErr(value)
 		}
 		if err == nil && item.IsValid() {
-			items = appendConvertedItem(items, item, elemT, isPtrElem)
+			setConvertedItem(slot(), item, elemT, isPtrElem)
 			continue
 		}
 		if strings.IndexByte(value, ',') == -1 {
@@ -1308,10 +1328,10 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 		for value := range strings.SplitSeq(value, ",") {
 			if value == "" {
 				if d.zeroEmpty {
-					items = append(items, reflect.Zero(t.Elem()))
+					slot()
 				}
 			} else if item, err := conv.convert(value); err == nil && item.IsValid() {
-				items = appendConvertedItem(items, item, elemT, isPtrElem)
+				setConvertedItem(slot(), item, elemT, isPtrElem)
 			} else {
 				return ConversionError{
 					Key:   path,
@@ -1322,21 +1342,22 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			}
 		}
 	}
-	value := reflect.MakeSlice(t, len(items), len(items))
-	for i, item := range items {
-		value.Index(i).Set(item)
+	if room == 0 {
+		sl = reflect.MakeSlice(t, 0, 0)
+	} else if n < room {
+		sl = sl.Slice(0, n)
 	}
-	v.Set(value)
+	v.Set(sl)
 	return nil
 }
 
-// appendConvertedItem converts a builtin/custom converter result to the slice
-// element type and appends it, wrapping it in a freshly allocated pointer for
+// setConvertedItem converts a builtin/custom converter result to the slice
+// element type and stores it in slot, wrapping it in a freshly allocated pointer for
 // pointer-element slices. The conversion must happen before the pointer wrap:
 // builtin converters return the underlying kind (e.g. int for a named
 // `type MyInt int`), which is not assignable to the named element type, so
 // Set-ing it into a *MyInt without converting first panics.
-func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflect.Type, isPtrElem bool) []reflect.Value {
+func setConvertedItem(slot, item reflect.Value, elemT reflect.Type, isPtrElem bool) {
 	if item.Type() != elemT {
 		item = item.Convert(elemT)
 	}
@@ -1345,11 +1366,11 @@ func appendConvertedItem(items []reflect.Value, item reflect.Value, elemT reflec
 		ptr.Elem().Set(item)
 		item = ptr
 	}
-	return append(items, item)
+	slot.Set(item)
 }
 
-// unmarshalerSliceBudget bounds the first allocation: the client chooses how many values arrive.
-const unmarshalerSliceBudget = 4 << 10
+// sliceBudget bounds the first allocation: the client chooses how many values arrive.
+const sliceBudget = 4 << 10
 
 // decodeUnmarshalerSlice unmarshals each value into an element of a detached slice,
 // set on v only if all succeed; empty values are skipped unless ZeroEmpty is set.
@@ -1361,7 +1382,7 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 			continue
 		}
 		if i == room {
-			sl = growUnmarshalerSlice(sl, t, len(values))
+			sl = growSlice(sl, t, len(values))
 			room = sl.Len()
 		}
 		if value != "" { // an empty value kept for ZeroEmpty leaves its slot zero
@@ -1386,15 +1407,15 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 	return nil
 }
 
-// growUnmarshalerSlice returns sl with more room: the budget at first, then doubled, up to limit.
-func growUnmarshalerSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
+// growSlice returns sl with more room: the budget at first, then doubled, up to limit.
+func growSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
 	var n int
 	if sl.IsValid() {
 		n = 2 * sl.Len()
 	} else if size := int(t.Elem().Size()); size == 0 {
 		n = limit
 	} else {
-		n = max(1, unmarshalerSliceBudget/size)
+		n = max(1, sliceBudget/size)
 	}
 	n = min(n, limit)
 	grown := reflect.MakeSlice(t, n, n)

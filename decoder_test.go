@@ -2618,6 +2618,44 @@ func TestShadowedPromotedFieldDecodes(t *testing.T) {
 	}
 }
 
+// An outer field shadows the promoted field of its alias, so a key under that
+// alias neither fills the promoted field nor satisfies its required option.
+func TestShadowedPromotedRequiredField(t *testing.T) {
+	t.Parallel()
+
+	type Contact struct {
+		Name string `schema:"name,required"`
+	}
+	type SignUp struct {
+		Contact
+		Name string `schema:"name"`
+	}
+	d := NewDecoder()
+	missing := MultiError{"Contact.name": EmptyFieldError{Key: "Contact.name"}}
+	var s, v SignUp
+	for _, err := range []error{d.Decode(&s, map[string][]string{"name": {"x"}}), d.DecodeValues(&v, []string{"name"}, []string{"x"})} {
+		if !reflect.DeepEqual(err, missing) {
+			t.Fatalf("got %v, want %v", err, missing)
+		}
+	}
+	if s != (SignUp{Name: "x"}) || v != s {
+		t.Fatalf("decoded %+v and %+v, want only the outer name", s, v)
+	}
+	s = SignUp{}
+	if err := d.Decode(&s, map[string][]string{"name": {"x"}, "Contact.name": {"y"}}); err != nil || s != (SignUp{Contact{"y"}, "x"}) {
+		t.Fatalf("decoded %+v, %v", s, err)
+	}
+
+	type SignUpPtr struct {
+		*Contact
+		Name string `schema:"name"`
+	}
+	var p SignUpPtr
+	if err := d.Decode(&p, map[string][]string{"name": {"x"}}); !reflect.DeepEqual(err, missing) || p.Name != "x" || p.Contact != nil && p.Contact.Name != "" {
+		t.Fatalf("embedded pointer: got %v and %+v, want %v", err, p, missing)
+	}
+}
+
 // Two promoted fields sharing a Go name but carrying distinct aliases must
 // both be addressable by their aliases (the name-based walk used to skip or
 // reject them).
@@ -3340,6 +3378,237 @@ func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 			got = form{}
 			check(t, d.DecodeValues(&got, tc.keys, values))
 		})
+	}
+}
+
+// TextURL is filled by UnmarshalText alone, which admits https only. Its
+// required Host asks for no key of its own.
+type TextURL struct {
+	Scheme string
+	Host   string `schema:"host,required"`
+}
+
+func (u *TextURL) UnmarshalText(text []byte) error {
+	scheme, host, ok := strings.Cut(string(text), "://")
+	if !ok || scheme != "https" {
+		return errors.New("not https")
+	}
+	u.Scheme, u.Host = scheme, host
+	return nil
+}
+
+type ConvItem struct{ V string }
+
+type convEItem struct{ V string }
+
+func TestKeysBelowWholeFieldsAreUnknown(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		TextURL
+		*ConvItem
+		Link   TextURL                 `schema:"link"`
+		Ptr    *TextURL                `schema:"ptr"`
+		Links  []TextURL               `schema:"links"`
+		ConvE  convEItem               `schema:"conve"`
+		Avatar *multipart.FileHeader   `schema:"avatar"`
+		Docs   []*multipart.FileHeader `schema:"docs"`
+	}
+	keys := []string{"TextURL", "ConvItem", "link", "ptr", "links.0", "conve"}
+	values := []string{"https://a", "c", "https://b", "https://c", "https://d", "e"}
+	want := form{
+		TextURL:  TextURL{"https", "a"},
+		ConvItem: &ConvItem{"c"},
+		Link:     TextURL{"https", "b"},
+		Ptr:      &TextURL{"https", "c"},
+		Links:    []TextURL{{"https", "d"}},
+		ConvE:    convEItem{"e"},
+	}
+	unknown := []string{
+		"scheme", "host", "TextURL.host", "v", "ConvItem.v", "link.host", "Link.Scheme", "ptr.host", "links.0.host",
+		"conve.v", "avatar.filename", "avatar.size", "avatar.header.x",
+		"docs.filename", "docs.size", "docs.header.x", "docs.0.filename", "docs.0.size", "docs.0.header.x",
+	}
+	for _, k := range unknown {
+		keys = append(keys, k)
+		values = append(values, "1")
+	}
+	src := map[string][]string{}
+	for i, k := range keys {
+		src[k] = []string{values[i]}
+	}
+
+	for _, ignore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("IgnoreUnknownKeys(%v)", ignore), func(t *testing.T) {
+			t.Parallel()
+
+			d := NewDecoder()
+			d.IgnoreUnknownKeys(ignore)
+			d.RegisterConverter(ConvItem{}, func(s string) reflect.Value { return reflect.ValueOf(ConvItem{s}) })
+			d.RegisterConverterE(convEItem{}, func(s string) (reflect.Value, error) { return reflect.ValueOf(convEItem{s}), nil })
+			check := func(t *testing.T, err error) {
+				t.Helper()
+				if ignore {
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					return
+				}
+				var errs MultiError
+				if !errors.As(err, &errs) || len(errs) != len(unknown) {
+					t.Fatalf("got %v, want an unknown key error for each of %v", err, unknown)
+				}
+				for _, k := range unknown {
+					if _, ok := errs[k].(UnknownKeyError); !ok {
+						t.Fatalf("%s: got %v, want an unknown key error", k, errs[k])
+					}
+				}
+			}
+
+			avatar := &multipart.FileHeader{Filename: "a.png", Size: 3}
+			doc := &multipart.FileHeader{Filename: "b.pdf", Size: 4}
+			var got form
+			check(t, d.Decode(&got, src, map[string][]*multipart.FileHeader{"avatar": {avatar}, "docs": {doc}}))
+			if got.Avatar != avatar || len(got.Docs) != 1 || got.Docs[0] != doc {
+				t.Fatalf("files bound as %v, %v", got.Avatar, got.Docs)
+			}
+			if avatar.Filename != "a.png" || avatar.Size != 3 || avatar.Header != nil ||
+				doc.Filename != "b.pdf" || doc.Size != 4 || doc.Header != nil {
+				t.Fatalf("file headers rewritten: %+v, %+v", avatar, doc)
+			}
+			got.Avatar, got.Docs = nil, nil
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Decode: got %+v, want %+v", got, want)
+			}
+
+			got = form{}
+			check(t, d.DecodeValues(&got, keys, values))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("DecodeValues: got %+v, want %+v", got, want)
+			}
+		})
+	}
+
+	t.Run("required", func(t *testing.T) {
+		t.Parallel()
+
+		type form struct {
+			Link   TextURL               `schema:"link,required"`
+			Avatar *multipart.FileHeader `schema:"avatar,required"`
+		}
+		keys := []string{"link.host", "LINK.SCHEME", "avatar.filename", "Avatar.Size"}
+		values := []string{"x", "x", "x", "1"}
+		src := map[string][]string{}
+		for i, k := range keys {
+			src[k] = []string{values[i]}
+		}
+		d := NewDecoder()
+		d.IgnoreUnknownKeys(true)
+		var got form
+		for _, err := range []error{d.Decode(&got, src), d.DecodeValues(&got, keys, values)} {
+			var errs MultiError
+			if !errors.As(err, &errs) || len(errs) != 2 || errs["link"] == nil || errs["avatar"] == nil {
+				t.Fatalf("got %v, want link and avatar reported empty", err)
+			}
+		}
+		if got != (form{}) {
+			t.Fatalf("decoded %+v, want nothing", got)
+		}
+	})
+}
+
+// A struct's own key fills none of its fields, so an empty value under it must
+// not zero the fields no key names, nor undo the required ones.
+func TestZeroEmptyLeavesStructs(t *testing.T) {
+	t.Parallel()
+
+	type Scope struct {
+		V      string `schema:"v,required"`
+		Dash   string `schema:"-"`
+		hidden string
+	}
+	type form struct {
+		Scope
+		N Scope    `schema:"n"`
+		P *Scope   `schema:"p"`
+		A [1]Scope `schema:"a"`
+		I []Scope  `schema:"i"`
+	}
+	kept := Scope{Dash: "dash", hidden: "hidden"}
+	want := Scope{V: "set", Dash: "dash", hidden: "hidden"}
+	keys := []string{"v", "n.v", "p.v", "i.0.v", "Scope", "n", "p", "a", "i.0"}
+	values := []string{"set", "set", "set", "set", "", "", "", "", ""}
+	src := map[string][]string{}
+	for i, k := range keys {
+		src[k] = []string{values[i]}
+	}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	check := func(name string, decode func(*form) error) {
+		p := kept
+		got := form{Scope: kept, N: kept, P: &p, A: [1]Scope{kept}, I: []Scope{kept}}
+		if err := decode(&got); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.Scope != want || got.N != want || *got.P != want || got.A[0] != kept || got.I[0] != want {
+			t.Fatalf("%s: decoded %+v, %+v, %+v, %+v, %+v", name, got.Scope, got.N, *got.P, got.A, got.I)
+		}
+	}
+	check("Decode", func(f *form) error { return d.Decode(f, src) })
+	check("DecodeValues", func(f *form) error { return d.DecodeValues(f, keys, values) })
+}
+
+func TestRequiredFileNeedsAFile(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		Avatar *multipart.FileHeader    `schema:"avatar,required"`
+		Docs   []*multipart.FileHeader  `schema:"docs,required"`
+		PDocs  *[]*multipart.FileHeader `schema:"pdocs,required"`
+	}
+	keys := []string{"avatar", "Docs", "pdocs"}
+	values := []string{"", "x", "x"}
+	src := map[string][]string{"avatar": {""}, "Docs": {"x"}, "pdocs": {"x"}}
+	file := &multipart.FileHeader{Filename: "a.png"}
+	files := map[string][]*multipart.FileHeader{"avatar": {file}, "DOCS": {file}, "pdocs": {file}}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		var got form
+		for _, err := range []error{d.Decode(&got, src), d.DecodeValues(&got, keys, values)} {
+			var errs MultiError
+			if !errors.As(err, &errs) || len(errs) != 3 || errs["avatar"] == nil || errs["docs"] == nil || errs["pdocs"] == nil {
+				t.Fatalf("ZeroEmpty(%v): got %v, want avatar, docs and pdocs reported empty", zeroEmpty, err)
+			}
+		}
+
+		if err := d.Decode(&got, map[string][]string{"avatar": {"x"}}, files); err != nil {
+			t.Fatalf("ZeroEmpty(%v): %v", zeroEmpty, err)
+		}
+		if got.Avatar != file || len(got.Docs) != 1 || got.PDocs == nil || len(*got.PDocs) != 1 {
+			t.Fatalf("ZeroEmpty(%v): files bound as %+v", zeroEmpty, got)
+		}
+	}
+}
+
+// A text key assigns nothing to a file field, so under ZeroEmpty it must not
+// unsettle a file another spelling of the key bound.
+func TestRequiredFileKeepsFileOverTextKey(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		Avatar *multipart.FileHeader `schema:"avatar,required"`
+	}
+	file := &multipart.FileHeader{Filename: "a.png"}
+	files := map[string][]*multipart.FileHeader{"AVATAR": {file}}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	// The map yields the two keys in either order; 64 runs all miss one with probability 2^-63.
+	for range 64 {
+		var got form
+		if err := d.Decode(&got, map[string][]string{"avatar": {""}}, files); err != nil || got.Avatar != file {
+			t.Fatalf("got %v and %v, want the file", err, got.Avatar)
+		}
 	}
 }
 
@@ -4318,28 +4587,24 @@ func TestHandleMultipartField(t *testing.T) {
 	}
 }
 
-func TestDecodePanicIsCaughtAndReturnedAsError(t *testing.T) {
+// A negative index names no element; on 32-bit ints it would wrap to a large one.
+func TestDecodeNegativeIndexIsUnknown(t *testing.T) {
+	t.Parallel()
+
 	type R struct {
 		N1 []*struct {
 			Value string
 		}
 	}
-	// Simulate a path that uses an invalid (e.g. negative) slice index,
-	// which can trigger a panic (e.g. reflect: slice index out of range).
-	data := map[string][]string{
-		"n1.-1.value": {"Foo"},
-	}
-
-	s := new(R)
-	decoder := NewDecoder()
-	err := decoder.Decode(s, data)
-	if err == nil {
-		t.Fatal("Expected an error when a panic occurs")
-	}
-
-	expected := "schema: panic while decoding: reflect: slice index out of range"
-	if err.Error() != expected {
-		t.Fatalf("Expected panic error message %q, got: %v", expected, err)
+	for _, key := range []string{"n1.-1.value", "n1.-4294951296.value", "n1.-9223372036854775808.value"} {
+		d := NewDecoder()
+		if _, err := d.cache.parsePath(key, reflect.TypeFor[R]()); !errors.Is(err, errInvalidPath) {
+			t.Fatalf("%s: parsed with %v, want an invalid path", key, err)
+		}
+		var s R
+		if err := d.Decode(&s, map[string][]string{key: {"Foo"}}); !reflect.DeepEqual(err, MultiError{key: UnknownKeyError{Key: key}}) || s.N1 != nil {
+			t.Fatalf("%s: got %v and %d elements, want an unknown key and none", key, err, len(s.N1))
+		}
 	}
 }
 
@@ -4599,6 +4864,41 @@ func TestDefaultsWalkThroughEmbeddedRecursion(t *testing.T) {
 	}
 	if err := d.Decode(new(ENode), map[string][]string{strings.Repeat("l.", maxPathDepth-1) + "name": {"x"}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Not parallel: TotalAlloc counts the allocations of every running test.
+func TestDefaultsWalkOfDeepDestinationIsLinear(t *testing.T) {
+	// Another decoder (JSON, say) can nest a recursive type far deeper than any key reaches.
+	const depth = 4096
+	c := new(Category)
+	last := c
+	for range depth {
+		last.Parent = new(Category)
+		last = last.Parent
+	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := NewDecoder().Decode(c, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("defaults walk of %d levels allocated %d bytes, want well under a megabyte", depth, got)
+	}
+	if last.Name != "none" {
+		t.Fatalf("deepest Name = %q, want the default", last.Name)
+	}
+	// The deepest level a key reaches still counts as provided.
+	c = new(Category)
+	if err := NewDecoder().Decode(c, map[string][]string{strings.Repeat("parent.", maxPathDepth-1) + "name": {""}}); err != nil {
+		t.Fatal(err)
+	}
+	for last = c; last.Parent != nil; last = last.Parent {
+	}
+	if last.Name != "" {
+		t.Fatalf("deepest Name = %q, want the provided empty value", last.Name)
 	}
 }
 
@@ -5659,6 +5959,62 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	}
 	if len(s.N) != 2 || *s.N[0] != 1 || *s.N[1] != 2 {
 		t.Fatalf("unexpected values: %v %v", s.N[0], s.N[1])
+	}
+}
+
+// Without ZeroEmpty, empty items leave an empty slice in place of the old one, as for []int.
+func TestDecodePointerSliceOfEmptyItems(t *testing.T) {
+	t.Parallel()
+
+	type target struct {
+		N []*int `schema:"n"`
+	}
+	for _, value := range []string{"", ",,"} {
+		s := target{N: []*int{new(int)}}
+		if err := NewDecoder().Decode(&s, map[string][]string{"n": {value}}); err != nil || s.N == nil || len(s.N) != 0 {
+			t.Fatalf("%q: got %v and %v, want an empty slice", value, err, s.N)
+		}
+	}
+}
+
+// Not parallel: TotalAlloc counts the allocations of every running test.
+func TestDecodeCommaListOfPointersAllocatesPerItem(t *testing.T) {
+	type target struct {
+		Ints []int  `schema:"ints"`
+		Ptrs []*int `schema:"ptrs"`
+	}
+	const items = 4<<20 + 1
+	value := strings.Repeat(",", items-1)
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	decode := func(key string) (allocated uint64) {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		var s target
+		if err := d.Decode(&s, map[string][]string{key: {value}}); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		if n := len(s.Ints) + len(s.Ptrs); n != items {
+			t.Fatalf("%s: decoded %d items, want %d", key, n, items)
+		}
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	ints := decode("ints")
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	ptrs := decode("ptrs")
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	// []int is sized up front; the pointers' slice doubles toward its bound, which costs up to three times as much.
+	if ptrs > 4*ints {
+		t.Fatalf("a list of %d items allocated %d bytes into []*int, %d into []int", items, ptrs, ints)
+	}
+	if retained > 1<<20 {
+		t.Fatalf("decoding into []*int kept %d bytes after the call", retained)
 	}
 }
 
