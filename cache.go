@@ -566,6 +566,10 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			}
 		}
 	}
+	// The shadow check below reads the struct's own fields from fieldsByName.
+	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
+	info.addByName(info.fields)
+	own := len(info.fields)
 	for i, a := range anonymousInfos {
 		others := []*structInfo{info}
 		others = append(others, anonymousInfos[:i]...)
@@ -581,12 +585,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			}
 		}
 	}
-	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
-	for _, field := range info.fields {
-		if _, exists := info.fieldsByName[field.aliasLower]; !exists {
-			info.fieldsByName[field.aliasLower] = field
-		}
-	}
+	info.addByName(info.fields[own:])
 	for _, f := range info.fields {
 		if f.mapValue != nil {
 			// Per field, not per type: a promoted copy's path is its own.
@@ -969,6 +968,15 @@ type structInfo struct {
 	requiredMixedCase bool
 }
 
+// addByName indexes fields by lowercase alias; the first field of an alias wins.
+func (i *structInfo) addByName(fields []*fieldInfo) {
+	for _, field := range fields {
+		if _, exists := i.fieldsByName[field.aliasLower]; !exists {
+			i.fieldsByName[field.aliasLower] = field
+		}
+	}
+}
+
 func (i *structInfo) get(alias string) *fieldInfo {
 	// fieldsByName is keyed by lowercase alias, so the raw probe settles an
 	// already-lowercase one without folding. A mixed-case alias is folded
@@ -1002,8 +1010,9 @@ func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
 		groups = append(groups, requiredGroup{key: key, fields: []fieldWithPrefix{f}})
 	}
 	for _, field := range info.fields {
-		if field.typ.Kind() == reflect.Struct && !field.whole {
-			nested := c.get(field.typ)
+		// Fields promoted through an embedded pointer are required as through a value.
+		if ft := indirectType(field.typ); ft.Kind() == reflect.Struct && (ft == field.typ || field.isAnonymous) && !field.whole {
+			nested := c.get(ft)
 			for _, prefix := range field.paths("") {
 				nestedPrefix := prefix + "."
 				for _, group := range nested.requiredGroups {

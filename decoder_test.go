@@ -2618,6 +2618,44 @@ func TestShadowedPromotedFieldDecodes(t *testing.T) {
 	}
 }
 
+// An outer field shadows the promoted field of its alias, so a key under that
+// alias neither fills the promoted field nor satisfies its required option.
+func TestShadowedPromotedRequiredField(t *testing.T) {
+	t.Parallel()
+
+	type Contact struct {
+		Name string `schema:"name,required"`
+	}
+	type SignUp struct {
+		Contact
+		Name string `schema:"name"`
+	}
+	d := NewDecoder()
+	missing := MultiError{"Contact.name": EmptyFieldError{Key: "Contact.name"}}
+	var s, v SignUp
+	for _, err := range []error{d.Decode(&s, map[string][]string{"name": {"x"}}), d.DecodeValues(&v, []string{"name"}, []string{"x"})} {
+		if !reflect.DeepEqual(err, missing) {
+			t.Fatalf("got %v, want %v", err, missing)
+		}
+	}
+	if s != (SignUp{Name: "x"}) || v != s {
+		t.Fatalf("decoded %+v and %+v, want only the outer name", s, v)
+	}
+	s = SignUp{}
+	if err := d.Decode(&s, map[string][]string{"name": {"x"}, "Contact.name": {"y"}}); err != nil || s != (SignUp{Contact{"y"}, "x"}) {
+		t.Fatalf("decoded %+v, %v", s, err)
+	}
+
+	type SignUpPtr struct {
+		*Contact
+		Name string `schema:"name"`
+	}
+	var p SignUpPtr
+	if err := d.Decode(&p, map[string][]string{"name": {"x"}}); !reflect.DeepEqual(err, missing) || p.Name != "x" || p.Contact != nil && p.Contact.Name != "" {
+		t.Fatalf("embedded pointer: got %v and %+v, want %v", err, p, missing)
+	}
+}
+
 // Two promoted fields sharing a Go name but carrying distinct aliases must
 // both be addressable by their aliases (the name-based walk used to skip or
 // reject them).
