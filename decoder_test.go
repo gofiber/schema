@@ -4528,28 +4528,24 @@ func TestHandleMultipartField(t *testing.T) {
 	}
 }
 
-func TestDecodePanicIsCaughtAndReturnedAsError(t *testing.T) {
+// A negative index names no element; on 32-bit ints it would wrap to a large one.
+func TestDecodeNegativeIndexIsUnknown(t *testing.T) {
+	t.Parallel()
+
 	type R struct {
 		N1 []*struct {
 			Value string
 		}
 	}
-	// Simulate a path that uses an invalid (e.g. negative) slice index,
-	// which can trigger a panic (e.g. reflect: slice index out of range).
-	data := map[string][]string{
-		"n1.-1.value": {"Foo"},
-	}
-
-	s := new(R)
-	decoder := NewDecoder()
-	err := decoder.Decode(s, data)
-	if err == nil {
-		t.Fatal("Expected an error when a panic occurs")
-	}
-
-	expected := "schema: panic while decoding: reflect: slice index out of range"
-	if err.Error() != expected {
-		t.Fatalf("Expected panic error message %q, got: %v", expected, err)
+	for _, key := range []string{"n1.-1.value", "n1.-4294951296.value", "n1.-9223372036854775808.value"} {
+		d := NewDecoder()
+		if _, err := d.cache.parsePath(key, reflect.TypeFor[R]()); !errors.Is(err, errInvalidPath) {
+			t.Fatalf("%s: parsed with %v, want an invalid path", key, err)
+		}
+		var s R
+		if err := d.Decode(&s, map[string][]string{key: {"Foo"}}); !reflect.DeepEqual(err, MultiError{key: UnknownKeyError{Key: key}}) || s.N1 != nil {
+			t.Fatalf("%s: got %v and %d elements, want an unknown key and none", key, err, len(s.N1))
+		}
 	}
 }
 

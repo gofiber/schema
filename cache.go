@@ -259,7 +259,8 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 			if err != nil {
 				return nil, errInvalidPath
 			}
-			if index64, err = utils.ParseInt(segment); err != nil {
+			// A negative index would wrap to a large one where int is 32 bits.
+			if index64, err = utils.ParseInt(segment); err != nil || index64 < 0 {
 				return nil, errInvalidPath
 			}
 			if index64 > maxParserIndex {
