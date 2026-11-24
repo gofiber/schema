@@ -71,7 +71,8 @@ func (d *Decoder) SetAliasTag(tag string) {
 // ZeroEmpty controls the behaviour when the decoder encounters empty values
 // in a map.
 // If z is true and a key in the map has the empty string as a value
-// then the corresponding struct field is set to the zero value.
+// then the corresponding struct field is set to the zero value, unless no
+// value could set it, as for a struct without a converter or TextUnmarshaler.
 // If z is false then empty strings are ignored.
 //
 // The default value is false, that is empty values do not change
@@ -797,6 +798,10 @@ func isEmpty(t reflect.Type, value []string) bool {
 		uintType, uint8Type, uint16Type, uint32Type, uint64Type:
 		return len(value[len(value)-1]) == 0
 	}
+	if isMultipartField(t) {
+		// Only a file fills a file field, and Decode gives each file's key fileKeyValues itself.
+		return &value[0] != &fileKeyValues[0]
+	}
 	return false
 }
 
@@ -1190,7 +1195,9 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				}
 			}
 		} else if val == "" {
-			if d.zeroEmpty {
+			// Clear only what a value could set: a struct's own key must not
+			// reach the fields no key names.
+			if d.zeroEmpty && getBuiltinConverter(t.Kind()) != nil {
 				v.Set(reflect.Zero(t))
 			}
 		} else if handled, ok := setBuiltinKind(v, t.Kind(), val); handled {

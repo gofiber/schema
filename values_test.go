@@ -135,17 +135,7 @@ func TestDecodeValuesMatchesDecode(t *testing.T) {
 				if key == "Str" && slices.Contains(keys, "str") || key == "str" && slices.Contains(keys, "Str") {
 					continue
 				}
-				// An empty value under a struct's own key zeroes the whole
-				// struct with ZeroEmpty, wiping the fields its dotted keys
-				// set before it or not, by map order: give it a value.
-				value := func() string {
-					for {
-						v := valuePool[rng.IntN(len(valuePool))]
-						if v != "" || (key != "nested" && key != "pnested") {
-							return v
-						}
-					}
-				}
+				value := func() string { return valuePool[rng.IntN(len(valuePool))] }
 				keys = append(keys, key)
 				values = append(values, value())
 				// Now and then repeat the key, next to it or later on.

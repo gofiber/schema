@@ -3479,6 +3479,80 @@ func TestKeysBelowWholeFieldsAreUnknown(t *testing.T) {
 	})
 }
 
+// A struct's own key fills none of its fields, so an empty value under it must
+// not zero the fields no key names, nor undo the required ones.
+func TestZeroEmptyLeavesStructs(t *testing.T) {
+	t.Parallel()
+
+	type Scope struct {
+		V      string `schema:"v,required"`
+		Dash   string `schema:"-"`
+		hidden string
+	}
+	type form struct {
+		Scope
+		N Scope    `schema:"n"`
+		P *Scope   `schema:"p"`
+		A [1]Scope `schema:"a"`
+		I []Scope  `schema:"i"`
+	}
+	kept := Scope{Dash: "dash", hidden: "hidden"}
+	want := Scope{V: "set", Dash: "dash", hidden: "hidden"}
+	keys := []string{"v", "n.v", "p.v", "i.0.v", "Scope", "n", "p", "a", "i.0"}
+	values := []string{"set", "set", "set", "set", "", "", "", "", ""}
+	src := map[string][]string{}
+	for i, k := range keys {
+		src[k] = []string{values[i]}
+	}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	check := func(name string, decode func(*form) error) {
+		p := kept
+		got := form{Scope: kept, N: kept, P: &p, A: [1]Scope{kept}, I: []Scope{kept}}
+		if err := decode(&got); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got.Scope != want || got.N != want || *got.P != want || got.A[0] != kept || got.I[0] != want {
+			t.Fatalf("%s: decoded %+v, %+v, %+v, %+v, %+v", name, got.Scope, got.N, *got.P, got.A, got.I)
+		}
+	}
+	check("Decode", func(f *form) error { return d.Decode(f, src) })
+	check("DecodeValues", func(f *form) error { return d.DecodeValues(f, keys, values) })
+}
+
+func TestRequiredFileNeedsAFile(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		Avatar *multipart.FileHeader    `schema:"avatar,required"`
+		Docs   []*multipart.FileHeader  `schema:"docs,required"`
+		PDocs  *[]*multipart.FileHeader `schema:"pdocs,required"`
+	}
+	keys := []string{"avatar", "Docs", "pdocs"}
+	values := []string{"", "x", "x"}
+	src := map[string][]string{"avatar": {""}, "Docs": {"x"}, "pdocs": {"x"}}
+	file := &multipart.FileHeader{Filename: "a.png"}
+	files := map[string][]*multipart.FileHeader{"avatar": {file}, "DOCS": {file}, "pdocs": {file}}
+	for _, zeroEmpty := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zeroEmpty)
+		var got form
+		for _, err := range []error{d.Decode(&got, src), d.DecodeValues(&got, keys, values)} {
+			var errs MultiError
+			if !errors.As(err, &errs) || len(errs) != 3 || errs["avatar"] == nil || errs["docs"] == nil || errs["pdocs"] == nil {
+				t.Fatalf("ZeroEmpty(%v): got %v, want avatar, docs and pdocs reported empty", zeroEmpty, err)
+			}
+		}
+
+		if err := d.Decode(&got, map[string][]string{"avatar": {"x"}}, files); err != nil {
+			t.Fatalf("ZeroEmpty(%v): %v", zeroEmpty, err)
+		}
+		if got.Avatar != file || len(got.Docs) != 1 || got.PDocs == nil || len(*got.PDocs) != 1 {
+			t.Fatalf("ZeroEmpty(%v): files bound as %+v", zeroEmpty, got)
+		}
+	}
+}
+
 // An untagged field's alias is its Go name, which the folded index must lowercase.
 func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
 	t.Parallel()
