@@ -5962,6 +5962,21 @@ func TestDecodeCommaSeparatedPointerSlice(t *testing.T) {
 	}
 }
 
+// Without ZeroEmpty, empty items leave an empty slice in place of the old one, as for []int.
+func TestDecodePointerSliceOfEmptyItems(t *testing.T) {
+	t.Parallel()
+
+	type target struct {
+		N []*int `schema:"n"`
+	}
+	for _, value := range []string{"", ",,"} {
+		s := target{N: []*int{new(int)}}
+		if err := NewDecoder().Decode(&s, map[string][]string{"n": {value}}); err != nil || s.N == nil || len(s.N) != 0 {
+			t.Fatalf("%q: got %v and %v, want an empty slice", value, err, s.N)
+		}
+	}
+}
+
 // Not parallel: TotalAlloc counts the allocations of every running test.
 func TestDecodeCommaListOfPointersAllocatesPerItem(t *testing.T) {
 	type target struct {
