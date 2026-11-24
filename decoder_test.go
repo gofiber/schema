@@ -3343,6 +3343,142 @@ func TestRequiredKeyNeedsADecodablePath(t *testing.T) {
 	}
 }
 
+// TextURL is filled by UnmarshalText alone, which admits https only. Its
+// required Host asks for no key of its own.
+type TextURL struct {
+	Scheme string
+	Host   string `schema:"host,required"`
+}
+
+func (u *TextURL) UnmarshalText(text []byte) error {
+	scheme, host, ok := strings.Cut(string(text), "://")
+	if !ok || scheme != "https" {
+		return errors.New("not https")
+	}
+	u.Scheme, u.Host = scheme, host
+	return nil
+}
+
+type ConvItem struct{ V string }
+
+type convEItem struct{ V string }
+
+func TestKeysBelowWholeFieldsAreUnknown(t *testing.T) {
+	t.Parallel()
+
+	type form struct {
+		TextURL
+		*ConvItem
+		Link   TextURL                 `schema:"link"`
+		Ptr    *TextURL                `schema:"ptr"`
+		Links  []TextURL               `schema:"links"`
+		ConvE  convEItem               `schema:"conve"`
+		Avatar *multipart.FileHeader   `schema:"avatar"`
+		Docs   []*multipart.FileHeader `schema:"docs"`
+	}
+	keys := []string{"TextURL", "ConvItem", "link", "ptr", "links.0", "conve"}
+	values := []string{"https://a", "c", "https://b", "https://c", "https://d", "e"}
+	want := form{
+		TextURL:  TextURL{"https", "a"},
+		ConvItem: &ConvItem{"c"},
+		Link:     TextURL{"https", "b"},
+		Ptr:      &TextURL{"https", "c"},
+		Links:    []TextURL{{"https", "d"}},
+		ConvE:    convEItem{"e"},
+	}
+	unknown := []string{
+		"scheme", "host", "TextURL.host", "v", "ConvItem.v", "link.host", "Link.Scheme", "ptr.host", "links.0.host",
+		"conve.v", "avatar.filename", "avatar.size", "avatar.header.x",
+		"docs.filename", "docs.size", "docs.header.x", "docs.0.filename", "docs.0.size", "docs.0.header.x",
+	}
+	for _, k := range unknown {
+		keys = append(keys, k)
+		values = append(values, "1")
+	}
+	src := map[string][]string{}
+	for i, k := range keys {
+		src[k] = []string{values[i]}
+	}
+
+	for _, ignore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("IgnoreUnknownKeys(%v)", ignore), func(t *testing.T) {
+			t.Parallel()
+
+			d := NewDecoder()
+			d.IgnoreUnknownKeys(ignore)
+			d.RegisterConverter(ConvItem{}, func(s string) reflect.Value { return reflect.ValueOf(ConvItem{s}) })
+			d.RegisterConverterE(convEItem{}, func(s string) (reflect.Value, error) { return reflect.ValueOf(convEItem{s}), nil })
+			check := func(t *testing.T, err error) {
+				t.Helper()
+				if ignore {
+					if err != nil {
+						t.Fatalf("unexpected error: %v", err)
+					}
+					return
+				}
+				var errs MultiError
+				if !errors.As(err, &errs) || len(errs) != len(unknown) {
+					t.Fatalf("got %v, want an unknown key error for each of %v", err, unknown)
+				}
+				for _, k := range unknown {
+					if _, ok := errs[k].(UnknownKeyError); !ok {
+						t.Fatalf("%s: got %v, want an unknown key error", k, errs[k])
+					}
+				}
+			}
+
+			avatar := &multipart.FileHeader{Filename: "a.png", Size: 3}
+			doc := &multipart.FileHeader{Filename: "b.pdf", Size: 4}
+			var got form
+			check(t, d.Decode(&got, src, map[string][]*multipart.FileHeader{"avatar": {avatar}, "docs": {doc}}))
+			if got.Avatar != avatar || len(got.Docs) != 1 || got.Docs[0] != doc {
+				t.Fatalf("files bound as %v, %v", got.Avatar, got.Docs)
+			}
+			if avatar.Filename != "a.png" || avatar.Size != 3 || avatar.Header != nil ||
+				doc.Filename != "b.pdf" || doc.Size != 4 || doc.Header != nil {
+				t.Fatalf("file headers rewritten: %+v, %+v", avatar, doc)
+			}
+			got.Avatar, got.Docs = nil, nil
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("Decode: got %+v, want %+v", got, want)
+			}
+
+			got = form{}
+			check(t, d.DecodeValues(&got, keys, values))
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("DecodeValues: got %+v, want %+v", got, want)
+			}
+		})
+	}
+
+	t.Run("required", func(t *testing.T) {
+		t.Parallel()
+
+		type form struct {
+			Link   TextURL               `schema:"link,required"`
+			Avatar *multipart.FileHeader `schema:"avatar,required"`
+		}
+		keys := []string{"link.host", "LINK.SCHEME", "avatar.filename", "Avatar.Size"}
+		values := []string{"x", "x", "x", "1"}
+		src := map[string][]string{}
+		for i, k := range keys {
+			src[k] = []string{values[i]}
+		}
+		d := NewDecoder()
+		d.IgnoreUnknownKeys(true)
+		var got form
+		for _, err := range []error{d.Decode(&got, src), d.DecodeValues(&got, keys, values)} {
+			var errs MultiError
+			if !errors.As(err, &errs) || len(errs) != 2 || errs["link"] == nil || errs["avatar"] == nil {
+				t.Fatalf("got %v, want link and avatar reported empty", err)
+			}
+		}
+		if got != (form{}) {
+			t.Fatalf("decoded %+v, want nothing", got)
+		}
+	})
+}
+
 // An untagged field's alias is its Go name, which the folded index must lowercase.
 func TestRequiredUntaggedFieldMatchesAnyCase(t *testing.T) {
 	t.Parallel()

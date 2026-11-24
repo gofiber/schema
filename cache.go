@@ -302,7 +302,7 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 		if keyStart >= len(p) {
 			return nil, errInvalidPath
 		}
-		if t.Kind() != reflect.Struct {
+		if t.Kind() != reflect.Struct || field.whole {
 			return nil, errInvalidPath
 		}
 		struc = c.get(t)
@@ -559,7 +559,7 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		if f := c.createField(structField, parentAlias, tag); f != nil {
 			f.index = structField.Index
 			info.fields = append(info.fields, f)
-			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous {
+			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous && !f.whole {
 				anonymousInfos = append(anonymousInfos, c.create(ft, f.canonicalAlias))
 				anonymousIdx = append(anonymousIdx, structField.Index)
 			}
@@ -698,7 +698,7 @@ func (c *cache) buildDirectPaths(info *structInfo) map[string][]pathPart {
 		if len(direct) >= maxDirectPaths {
 			break
 		}
-		if !directEligible(info, f) || f.typ.Kind() != reflect.Struct {
+		if !directEligible(info, f) || f.typ.Kind() != reflect.Struct || f.whole {
 			continue
 		}
 		// Non-pointer struct nesting cannot recurse (the type would be
@@ -863,6 +863,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		isRequired:       options.Contains("required"),
 		defaultValue:     options.getDefaultOptionValue(),
 	}
+	f.whole = f.isMultipart || isStruct && (elemU.IsValid || c.converter(ft) != nil)
 	f.resolveDefault()
 	return f
 }
@@ -1000,7 +1001,7 @@ func (c *cache) buildRequiredFields(info *structInfo) []requiredGroup {
 		groups = append(groups, requiredGroup{key: key, fields: []fieldWithPrefix{f}})
 	}
 	for _, field := range info.fields {
-		if field.typ.Kind() == reflect.Struct {
+		if field.typ.Kind() == reflect.Struct && !field.whole {
 			nested := c.get(field.typ)
 			for _, prefix := range field.paths("") {
 				nestedPrefix := prefix + "."
@@ -1114,6 +1115,9 @@ type fieldInfo struct {
 	// multipart file header shapes, precomputed so the decoder can skip the
 	// type comparisons on every other field.
 	isMultipart bool
+	// whole marks a file field, or a struct (or slice of them) that a converter or
+	// encoding.TextUnmarshaler fills: no key continues into the struct's own fields.
+	whole bool
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.
