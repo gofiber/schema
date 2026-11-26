@@ -4311,8 +4311,9 @@ func TestDecoderMultipartFiles(t *testing.T) {
 		t.Errorf("Expected G to have 2 file headers, got %d", len(*s.G))
 	}
 
-	if s.D.F.Filename != "test.txt" {
-		t.Errorf("Expected D.F.Filename to be 'test.txt', got %s", s.D.F.Filename)
+	// A single file field takes the last header, as a text field takes the last value.
+	if s.D.F.Filename != "test2.txt" {
+		t.Errorf("Expected D.F.Filename to be 'test2.txt', got %s", s.D.F.Filename)
 	}
 
 	if s.D.F2[0].Filename != "test2.txt" {

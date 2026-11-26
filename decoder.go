@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"mime/multipart"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +87,24 @@ func (d *Decoder) IgnoreUnknownKeys(i bool) {
 	d.ignoreUnknownKeys = i
 }
 
+// ExactNames controls how strictly a key has to name a field.
+// If e is true, a field with a name in its tag matches only that name as
+// written, a promoted field only its own name and not through the name of the
+// struct it is embedded in, and a slice index only in plain digits ("items.0",
+// not "items.00"). A field without a name in its tag still matches its Go name
+// in any case. A key in another spelling names no field: it is an unknown
+// key and fills no required field. A field shadows an embedded struct of its
+// name, so a key through that name reaches the field's fields only.
+//
+// The default value is false: keys match case-insensitively, and promoted
+// fields also through the embedded struct's name.
+func (d *Decoder) ExactNames(e bool) {
+	d.cache.l.Lock()
+	d.cache.exact = e
+	d.cache.reset()
+	d.cache.l.Unlock()
+}
+
 // MaxSize limits the size of slices for URL nested arrays or object arrays.
 // Choose MaxSize carefully; large values may create many zero-value slice elements.
 // Example: "items.100000=apple" would create a slice with 100,000 empty strings.
@@ -137,8 +156,7 @@ func (d *Decoder) Decode(dst any, src map[string][]string, files ...map[string][
 		src = merged
 	}
 
-	s := source{m: src}
-	return d.decodeSource(dst, &s, multipartFiles)
+	return d.decodeSource(dst, src, nil, multipartFiles)
 }
 
 // DecodeValues decodes key/value pairs to a struct as Decode decodes the map
@@ -151,11 +169,21 @@ func (d *Decoder) Decode(dst any, src map[string][]string, files ...map[string][
 // do, the keys decode in the order of their first pairs, so the key given
 // first the latest wins; Decode lets whichever its map yields last win.
 //
+// Files decode in the same pass, as Decode decodes them. A map has no order,
+// so the files' keys decode first and in sorted order: of the keys that name
+// one file field the last in that order wins, also over an earlier key's files
+// in a slice field, and a file's key replaces the values a pair gives it, as
+// in Decode.
+//
 // The first parameter must be a pointer to a struct, and keys and values must
 // be the same length. The slices are only read, and only during the call.
-func (d *Decoder) DecodeValues(dst any, keys, values []string) error {
+func (d *Decoder) DecodeValues(dst any, keys, values []string, files ...map[string][]*multipart.FileHeader) error {
 	if len(keys) != len(values) {
 		return errValuesLength
+	}
+	if len(files) > 0 && len(files[0]) > 0 {
+		keys, values = withFileKeys(files[0], keys, values)
+		return d.decodeSource(dst, nil, newPairIndex(keys, values, len(files[0])), files[0])
 	}
 	// The index is set up field by field where it lies. Go puts a literal for
 	// a variable whose address is taken, or a call's result, together
@@ -174,13 +202,27 @@ func (d *Decoder) DecodeValues(dst any, keys, values []string) error {
 		p.table, p.next, p.last = make([]int32, indexSize(n)), make([]int32, n), make([]int32, n)
 	}
 	p.index()
-	s := source{pairs: &p}
-	return d.decodeSource(dst, &s, nil)
+	return d.decodeSource(dst, nil, &p, nil)
 }
 
-// decodeSource decodes src into dst, the pointer to a struct Decode and
-// DecodeValues were given, with the files Decode was.
-func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][]*multipart.FileHeader) (err error) {
+// withFileKeys returns the pairs DecodeValues decodes with files: the files'
+// keys, sorted, then the pairs whose key no file has.
+func withFileKeys(files map[string][]*multipart.FileHeader, keys, values []string) ([]string, []string) {
+	allKeys := slices.AppendSeq(make([]string, 0, len(files)+len(keys)), maps.Keys(files))
+	slices.Sort(allKeys)
+	allValues := make([]string, len(allKeys), cap(allKeys))
+	for i, key := range keys {
+		if _, ok := files[key]; !ok {
+			allKeys, allValues = append(allKeys, key), append(allValues, values[i])
+		}
+	}
+	return allKeys, allValues
+}
+
+// decodeSource decodes the map Decode was given, or the pairs DecodeValues was,
+// into dst, with the files. They come apart so that copying the map's entries
+// cannot take the pairs' index, held on DecodeValues' stack, to the heap.
+func (d *Decoder) decodeSource(dst any, m map[string][]string, pairs *pairIndex, multipartFiles map[string][]*multipart.FileHeader) (err error) {
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
 		return errNotPointerToStruct
@@ -202,6 +244,15 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 	v = v.Elem()
 	t := v.Type()
 	rootInfo := d.cache.get(t)
+	var errs MultiError
+	if rootInfo.exact {
+		if pairs != nil {
+			pairs, errs = d.exactPairs(rootInfo, pairs)
+		} else {
+			m, errs = d.exactMap(rootInfo, m)
+		}
+	}
+	src := &source{m: m, pairs: pairs}
 	// Required-key bookkeeping rides along with the loop below so src is
 	// walked once: the direct lookups settle almost every group here, and
 	// the rest are answered by the nested keys the loop visits anyway.
@@ -227,13 +278,15 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 	// The state decodeKey carries from key to key is kept in variables of
 	// its own rather than a struct: the compiler would let the stack values
 	// above escape along with the errors a struct holding both returns.
-	var errs MultiError
 	if p := src.pairs; p != nil {
+		for _, path := range p.keys[:p.files] {
+			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, path, fileKeyValues, errs, pending)
+		}
 		// A key whose pairs are not adjacent gathers its values here.
 		var scratch [8]string
-		for i, path := range p.keys {
+		for i := p.files; i < len(p.keys); i++ {
 			if p.first(i) {
-				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, path, p.group(i, scratch[:0]), errs, pending)
+				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, p.keys[i], p.group(i, scratch[:0]), errs, pending)
 			}
 		}
 	} else {
@@ -256,6 +309,56 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		return errs
 	}
 	return nil
+}
+
+// exactPairs returns p without the pairs whose key ExactNames refuses, so that
+// no required check or default counts them either, and those keys as unknown.
+func (d *Decoder) exactPairs(info *structInfo, p *pairIndex) (*pairIndex, MultiError) {
+	first := slices.IndexFunc(p.keys, func(key string) bool { return d.cache.otherSpelling(key, info) })
+	if first < 0 {
+		return p, nil
+	}
+	errs := d.unknownKey(nil, p.keys[first])
+	keys, values, files := slices.Clone(p.keys[:first]), slices.Clone(p.values[:first]), min(first, p.files)
+	for i := first + 1; i < len(p.keys); i++ {
+		if d.cache.otherSpelling(p.keys[i], info) {
+			errs = d.unknownKey(errs, p.keys[i])
+			continue
+		}
+		if i < p.files {
+			files++
+		}
+		keys, values = append(keys, p.keys[i]), append(values, p.values[i])
+	}
+	return newPairIndex(keys, values, files), errs
+}
+
+// exactMap is exactPairs for a map, which it copies before it drops a key.
+func (d *Decoder) exactMap(info *structInfo, m map[string][]string) (map[string][]string, MultiError) {
+	var kept map[string][]string
+	var errs MultiError
+	for key := range m {
+		if d.cache.otherSpelling(key, info) {
+			if kept == nil {
+				// not maps.Clone, which would take m, and so Decode's merged map, to the heap
+				kept = make(map[string][]string, len(m))
+				maps.Copy(kept, m)
+			}
+			delete(kept, key)
+			errs = d.unknownKey(errs, key)
+		}
+	}
+	if kept == nil {
+		return m, nil
+	}
+	return kept, errs
+}
+
+func (d *Decoder) unknownKey(errs MultiError, key string) MultiError {
+	if d.ignoreUnknownKeys {
+		return errs
+	}
+	return appendError(errs, key, UnknownKeyError{Key: key})
 }
 
 // decodeKey decodes the values of one source key into v, the struct whose
@@ -622,7 +725,11 @@ func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uin
 			if !p.first(i) {
 				continue
 			}
-			if pending = markProvidedByFoldedKey(c, info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
+			val := fileKeyValues
+			if i >= p.files {
+				val = p.group(i, scratch[:0])
+			}
+			if pending = markProvidedByFoldedKey(c, info, key, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}
@@ -800,7 +907,7 @@ func isEmpty(t reflect.Type, value []string) bool {
 	return false
 }
 
-// isFileValue reports whether value is the fileKeyValues Decode gives a file's key itself.
+// isFileValue reports whether value is the fileKeyValues a file's key decodes with.
 func isFileValue(value []string) bool {
 	return len(value) > 0 && &value[0] == &fileKeyValues[0]
 }
@@ -825,7 +932,7 @@ func handleMultipartField(field reflect.Value, files []*multipart.FileHeader) bo
 
 	// Check for *multipart.FileHeader
 	if fieldType == multipartFileHeaderPointerType {
-		field.Set(reflect.ValueOf(files[0]))
+		field.Set(reflect.ValueOf(files[len(files)-1]))
 		return true
 	}
 

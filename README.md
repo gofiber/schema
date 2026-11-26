@@ -105,7 +105,7 @@ decoder.RegisterConverterE(Level(0), func(s string) (reflect.Value, error) {
 
 A type has at most one converter: registering one of either kind replaces the other.
 
-A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key.
+A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key. A `*multipart.FileHeader` field takes the last file of its key, as a single-value field takes the last value, and a slice of them takes all.
 
 ### Map fields
 
@@ -133,6 +133,12 @@ err := decoder.DecodeValues(&person, keys, values)
 ```
 
 `values[i]` is a value of the key `keys[i]`, and a key given more than once has all of its values in the order given, as it would in the map. The two slices must be the same length.
+
+Multipart files go in as a last argument, as for `Decode`, and decode in the same pass, so a file fills a required file field. A map has no order, so the files' keys decode first and in sorted order: of the keys that name one file field, such as `Avatar` and `avatar`, the last in that order wins, here `avatar`, and a slice field gets that key's files only, as a text slice gets the values of the last of its keys. A file's key replaces the values a pair gives it, as in `Decode`.
+
+## Exact Names
+
+By default a key names a field in any case, and a promoted field also through the name of the struct it is embedded in (`Embedded.name`). With `ExactNames(true)`, a field with a name in its tag matches only that name as written, joined by dots for nested fields (`auth.token`, `items.0.token`, `meta.key`), a promoted field only its own name, and a slice index only in plain digits (`items.0`, not `items.00`). A field without a name in its tag still matches its Go name in any case. A key in another spelling, such as `Token` for a field tagged `token`, names no field: it is an unknown key, reported unless `IgnoreUnknownKeys` is set, and it fills no required field. A field shadows an embedded struct of its name: with a field tagged `auth` beside an embedded `Auth`, `auth.other` is an unknown key.
 
 ## Limits
 
