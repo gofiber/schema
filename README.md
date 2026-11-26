@@ -105,7 +105,7 @@ decoder.RegisterConverterE(Level(0), func(s string) (reflect.Value, error) {
 
 A type has at most one converter: registering one of either kind replaces the other.
 
-A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key.
+A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key. A `*multipart.FileHeader` field takes the last file of its key, as a single-value field takes the last value, and a slice of them takes all.
 
 ### Map fields
 

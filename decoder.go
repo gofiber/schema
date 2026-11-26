@@ -825,7 +825,7 @@ func handleMultipartField(field reflect.Value, files []*multipart.FileHeader) bo
 
 	// Check for *multipart.FileHeader
 	if fieldType == multipartFileHeaderPointerType {
-		field.Set(reflect.ValueOf(files[0]))
+		field.Set(reflect.ValueOf(files[len(files)-1]))
 		return true
 	}
 
