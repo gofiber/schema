@@ -65,6 +65,7 @@ type cache struct {
 	// under l), so readers never touch a map that is being written.
 	regconv atomic.Pointer[converterRegistry]
 	tag     string
+	exact   bool // ExactNames, written under l like tag
 	// gen is bumped (under l) before m is cleared on configuration changes;
 	// cached entries are tagged with the generation they were built under
 	// and ignored on mismatch, so any call starting after a reconfiguration
@@ -328,6 +329,48 @@ func (c *cache) parsePathInfo(p string, rootInfo *structInfo) ([]pathPart, error
 	return cached, nil
 }
 
+// otherSpelling reports whether key names a field, but not as ExactNames
+// spells it.
+func (c *cache) otherSpelling(key string, info *structInfo) bool {
+	parts, err := c.parsePathInfo(key, info)
+	if err != nil {
+		return false
+	}
+	if strings.IndexByte(key, '.') < 0 { // the field parsePathInfo found is the only segment
+		f := parts[len(parts)-1].field
+		return f.promotes() || f.tagged && key != f.alias
+	}
+	return !c.spelledExactly(key, info)
+}
+
+// spelledExactly reports whether p, a path parsePathInfo resolves, names each
+// field as ExactNames wants: by its tag as written, never by the name of an
+// embedded struct, and each index in plain digits.
+func (c *cache) spelledExactly(p string, info *structInfo) bool {
+	for keyStart := 0; ; {
+		keyEnd, segment, _ := nextPathSegment(p, keyStart) //nolint:errcheck // p parsed already
+		f := info.get(segment)
+		if f == nil || f.promotes() || f.tagged && segment != f.alias {
+			return false
+		}
+		if f.mapValue != nil {
+			return true // the rest is a map key, kept as sent
+		}
+		t := indirectType(f.typ)
+		if f.takesIndex() {
+			keyEnd, segment, _ = nextPathSegment(p, keyEnd+1) //nolint:errcheck // p parsed already
+			if c := segment[0]; c == '+' || c == '-' || (c == '0' && len(segment) > 1) {
+				return false
+			}
+			t = indirectType(t.Elem())
+		}
+		if keyEnd == len(p) {
+			return true
+		}
+		keyStart, info = keyEnd+1, c.get(t)
+	}
+}
+
 // maxFastPaths bounds pathCache's copy-on-write map: each publish copies the
 // whole map, so past this many paths further entries spill instead. Real
 // structs stay well inside it.
@@ -532,13 +575,14 @@ func (c *cache) reset() {
 	}
 }
 
-// aliasTag returns the configured tag name under the configuration lock, so
-// metadata builds racing SetAliasTag read a consistent value.
-func (c *cache) aliasTag() string {
+// config returns the configured tag name and ExactNames under the
+// configuration lock, so metadata builds racing a reconfiguration read
+// consistent values.
+func (c *cache) config() (string, bool) {
 	c.l.RLock()
-	tag := c.tag
+	tag, exact := c.tag, c.exact
 	c.l.RUnlock()
-	return tag
+	return tag, exact
 }
 
 // create creates a structInfo with meta-data about a struct.
@@ -546,8 +590,8 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	// Snapshot the alias tag once so every field of this type is analyzed
 	// under a consistent configuration and we don't churn the config lock
 	// per field.
-	tag := c.aliasTag()
-	info := &structInfo{}
+	tag, exact := c.config()
+	info := &structInfo{exact: exact}
 	var anonymousInfos []*structInfo
 	var anonymousIdx [][]int
 	for i := 0; i < t.NumField(); i++ {
@@ -560,22 +604,24 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 		if f := c.createField(structField, parentAlias, tag); f != nil {
 			f.index = structField.Index
 			info.fields = append(info.fields, f)
-			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous && !f.whole {
-				anonymousInfos = append(anonymousInfos, c.create(ft, f.canonicalAlias))
+			if f.promotes() {
+				anonymousInfos = append(anonymousInfos, c.create(indirectType(f.typ), f.canonicalAlias))
 				anonymousIdx = append(anonymousIdx, structField.Index)
 			}
 		}
 	}
 	// The shadow check below reads the struct's own fields from fieldsByName.
 	info.fieldsByName = make(map[string]*fieldInfo, len(info.fields))
-	info.addByName(info.fields)
+	// ExactNames reaches no field through an embedded struct's name, so a field
+	// of that name, also a promoted one, comes first and the struct last.
+	info.addByName(info.fields, exact)
 	own := len(info.fields)
 	for i, a := range anonymousInfos {
 		others := []*structInfo{info}
 		others = append(others, anonymousInfos[:i]...)
 		others = append(others, anonymousInfos[i+1:]...)
 		for _, f := range a.fields {
-			if !containsAlias(others, f.alias) {
+			if !containsAlias(others, f.alias, exact) {
 				// Copy the promoted field so its index chain can be prefixed
 				// with the embedded field's index; the original stays valid
 				// for the embedded type's own structInfo.
@@ -585,7 +631,10 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 			}
 		}
 	}
-	info.addByName(info.fields[own:])
+	info.addByName(info.fields[own:], exact)
+	if exact {
+		info.addByName(info.fields, false)
+	}
 	for _, f := range info.fields {
 		if f.mapValue != nil {
 			// Per field, not per type: a promoted copy's path is its own.
@@ -738,6 +787,11 @@ func (f *fieldInfo) endsPath() bool {
 	return !f.takesIndex() && f.mapValue == nil
 }
 
+// promotes reports whether f is an embedded struct whose fields are promoted.
+func (f *fieldInfo) promotes() bool {
+	return f.isAnonymous && indirectType(f.typ).Kind() == reflect.Struct && !f.whole
+}
+
 // takesIndex reports whether a path through f must carry a slice element
 // index: f is a slice of structs walked element by element, not one handed to
 // a multipart binder or a TextUnmarshaler whole.
@@ -792,9 +846,11 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	if parentAlias != "" {
 		canonicalAlias = parentAlias + "." + alias
 	}
+	name, _ := parseTag(field.Tag.Get(tag))
+	tagged := name != ""
 	if field.Type.Kind() == reflect.Map && c.converter(field.Type) == nil &&
 		!isTextUnmarshaler(reflect.Zero(field.Type)).IsValid {
-		return c.createMapField(field, alias, canonicalAlias, options, tag)
+		return c.createMapField(field, alias, canonicalAlias, options, tag, tagged)
 	}
 	// Check if the type is supported and don't cache it if not.
 	// First let's get the basic type.
@@ -854,6 +910,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		alias:            alias,
 		aliasLower:       utilstrings.ToLower(alias),
 		canonicalAlias:   canonicalAlias,
+		tagged:           tagged,
 		unmarshalerInfo:  m,
 		derefUnmarshaler: derefU,
 		elemUnmarshaler:  elemU,
@@ -874,7 +931,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 // scalars, types with a converter or encoding.TextUnmarshaler, pointers to
 // them, and slices of them. A map with no converter of its own is not
 // otherwise decodable, so any other map field is ignored, as before.
-func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias string, options tagOptions, tag string) *fieldInfo {
+func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias string, options tagOptions, tag string, tagged bool) *fieldInfo {
 	t := field.Type
 	if t.Key().Kind() != reflect.String || t.Elem().Kind() == reflect.Map {
 		return nil
@@ -892,6 +949,7 @@ func (c *cache) createMapField(field reflect.StructField, alias, canonicalAlias 
 		alias:          alias,
 		aliasLower:     utilstrings.ToLower(alias),
 		canonicalAlias: canonicalAlias,
+		tagged:         tagged,
 		isAnonymous:    field.Anonymous,
 		isRequired:     options.Contains("required"),
 		defaultValue:   options.getDefaultOptionValue(),
@@ -966,11 +1024,17 @@ type structInfo struct {
 	needsDefaultsWalk bool
 	// requiredMixedCase is set if a required path or prefix is not lowercase.
 	requiredMixedCase bool
+	// exact is set when the info was built for ExactNames
+	exact bool
 }
 
-// addByName indexes fields by lowercase alias; the first field of an alias wins.
-func (i *structInfo) addByName(fields []*fieldInfo) {
+// addByName indexes fields by lowercase alias, without the embedded structs if
+// skipEmbedded is set; the first field of an alias wins.
+func (i *structInfo) addByName(fields []*fieldInfo, skipEmbedded bool) {
 	for _, field := range fields {
+		if skipEmbedded && field.promotes() {
+			continue
+		}
 		if _, exists := i.fieldsByName[field.aliasLower]; !exists {
 			i.fieldsByName[field.aliasLower] = field
 		}
@@ -1078,10 +1142,12 @@ func addRequiredOwner(index map[string][]requiredPrefix, key string, gi int, typ
 	index[key] = append(owners, requiredPrefix{group: gi, typ: typ})
 }
 
-func containsAlias(infos []*structInfo, alias string) bool {
+// containsAlias reports whether a field of infos takes alias; under ExactNames
+// an embedded struct takes none.
+func containsAlias(infos []*structInfo, alias string, exact bool) bool {
 	aliasKey := utilstrings.ToLower(alias)
 	for _, info := range infos {
-		if _, ok := info.fieldsByName[aliasKey]; ok {
+		if f, ok := info.fieldsByName[aliasKey]; ok && (!exact || !f.promotes()) {
 			return true
 		}
 	}
@@ -1108,6 +1174,9 @@ type fieldInfo struct {
 	// For instance, if the alias is "N" and this field is an embedded field
 	// in a struct "X", canonicalAlias will be "X.N".
 	canonicalAlias string
+	// tagged is set when the alias comes from the tag, which ExactNames then
+	// matches as written.
+	tagged bool
 	// unmarshalerInfo contains information regarding the
 	// encoding.TextUnmarshaler implementation of the field type.
 	unmarshalerInfo unmarshaler
