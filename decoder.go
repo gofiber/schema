@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"mime/multipart"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,11 +152,22 @@ func (d *Decoder) Decode(dst any, src map[string][]string, files ...map[string][
 // do, the keys decode in the order of their first pairs, so the key given
 // first the latest wins; Decode lets whichever its map yields last win.
 //
+// Files decode in the same pass, as Decode decodes them. A map has no order,
+// so the files' keys decode first and in sorted order: of the keys that name
+// one file field the last in that order wins, also over an earlier key's files
+// in a slice field, and a file's key replaces the values a pair gives it, as
+// in Decode.
+//
 // The first parameter must be a pointer to a struct, and keys and values must
 // be the same length. The slices are only read, and only during the call.
-func (d *Decoder) DecodeValues(dst any, keys, values []string) error {
+func (d *Decoder) DecodeValues(dst any, keys, values []string, files ...map[string][]*multipart.FileHeader) error {
 	if len(keys) != len(values) {
 		return errValuesLength
+	}
+	if len(files) > 0 && len(files[0]) > 0 {
+		keys, values = withFileKeys(files[0], keys, values)
+		s := source{pairs: newPairIndex(keys, values, len(files[0]))}
+		return d.decodeSource(dst, &s, files[0])
 	}
 	// The index is set up field by field where it lies. Go puts a literal for
 	// a variable whose address is taken, or a call's result, together
@@ -178,8 +190,22 @@ func (d *Decoder) DecodeValues(dst any, keys, values []string) error {
 	return d.decodeSource(dst, &s, nil)
 }
 
+// withFileKeys returns the pairs DecodeValues decodes with files: the files'
+// keys, sorted, then the pairs whose key no file has.
+func withFileKeys(files map[string][]*multipart.FileHeader, keys, values []string) ([]string, []string) {
+	allKeys := slices.AppendSeq(make([]string, 0, len(files)+len(keys)), maps.Keys(files))
+	slices.Sort(allKeys)
+	allValues := make([]string, len(allKeys), cap(allKeys))
+	for i, key := range keys {
+		if _, ok := files[key]; !ok {
+			allKeys, allValues = append(allKeys, key), append(allValues, values[i])
+		}
+	}
+	return allKeys, allValues
+}
+
 // decodeSource decodes src into dst, the pointer to a struct Decode and
-// DecodeValues were given, with the files Decode was.
+// DecodeValues were given, with the files either was.
 func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][]*multipart.FileHeader) (err error) {
 	v := reflect.ValueOf(dst)
 	if v.Kind() != reflect.Pointer || v.Elem().Kind() != reflect.Struct {
@@ -229,11 +255,14 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 	// above escape along with the errors a struct holding both returns.
 	var errs MultiError
 	if p := src.pairs; p != nil {
+		for _, path := range p.keys[:p.files] {
+			errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, path, fileKeyValues, errs, pending)
+		}
 		// A key whose pairs are not adjacent gathers its values here.
 		var scratch [8]string
-		for i, path := range p.keys {
+		for i := p.files; i < len(p.keys); i++ {
 			if p.first(i) {
-				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, path, p.group(i, scratch[:0]), errs, pending)
+				errs, pending = d.decodeKey(v, rootInfo, multipartFiles, &grow, satisfied, decided, p.keys[i], p.group(i, scratch[:0]), errs, pending)
 			}
 		}
 	} else {
@@ -622,7 +651,11 @@ func markProvidedFolded(c *cache, info *structInfo, src *source, satisfied []uin
 			if !p.first(i) {
 				continue
 			}
-			if pending = markProvidedByFoldedKey(c, info, key, p.group(i, scratch[:0]), satisfied, pending); pending == 0 {
+			val := fileKeyValues
+			if i >= p.files {
+				val = p.group(i, scratch[:0])
+			}
+			if pending = markProvidedByFoldedKey(c, info, key, val, satisfied, pending); pending == 0 {
 				break
 			}
 		}
@@ -800,7 +833,7 @@ func isEmpty(t reflect.Type, value []string) bool {
 	return false
 }
 
-// isFileValue reports whether value is the fileKeyValues Decode gives a file's key itself.
+// isFileValue reports whether value is the fileKeyValues a file's key decodes with.
 func isFileValue(value []string) bool {
 	return len(value) > 0 && &value[0] == &fileKeyValues[0]
 }

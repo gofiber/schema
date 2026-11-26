@@ -134,6 +134,8 @@ err := decoder.DecodeValues(&person, keys, values)
 
 `values[i]` is a value of the key `keys[i]`, and a key given more than once has all of its values in the order given, as it would in the map. The two slices must be the same length.
 
+Multipart files go in as a last argument, as for `Decode`, and decode in the same pass, so a file fills a required file field. A map has no order, so the files' keys decode first and in sorted order: of the keys that name one file field, such as `Avatar` and `avatar`, the last in that order wins, here `avatar`, and a slice field gets that key's files only, as a text slice gets the values of the last of its keys. A file's key replaces the values a pair gives it, as in `Decode`.
+
 ## Limits
 
 Keys usually come from a client, so the decoder bounds what they can make it allocate: a key may name at most 64 fields, and a slice index may be at most 1000 (or `MaxSize`, if lower). One call may also allocate at most 8 MiB in all for the values behind nil pointers on its keys' paths and for the slices it grows, counting the capacity each growth reserves. Maps and file fields are not counted, nor are the slice fields declared on the destination struct itself unless the struct embeds an exported pointer or the call grew eight other slices at a key's first index before them. The first eight slices a call grows at a key's first index grow geometrically, any other slice to exactly the index plus one. A key past a limit is not decoded and is reported under its own name in the returned `MultiError`, also when `IgnoreUnknownKeys` is set.

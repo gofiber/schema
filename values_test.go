@@ -3,6 +3,7 @@ package schema
 import (
 	"errors"
 	"math/rand/v2"
+	"mime/multipart"
 	"reflect"
 	"slices"
 	"strconv"
@@ -380,6 +381,156 @@ func TestDecodeValuesDoesNotAllocate(t *testing.T) { //nolint:paralleltest // te
 	}
 }
 
+// requireMissing requires err to report exactly the required keys missing.
+func requireMissing(t *testing.T, err error, missing ...string) {
+	t.Helper()
+	var multi MultiError
+	if !errors.As(err, &multi) || len(multi) != len(missing) {
+		t.Fatalf("expected %v missing, got %v", missing, err)
+	}
+	for _, key := range missing {
+		if !errors.As(multi[key], new(EmptyFieldError)) {
+			t.Fatalf("expected %q missing, got %v", key, err)
+		}
+	}
+}
+
+// Files decode in the same pass as the pairs: a file fills a required file
+// field, and the defaults and required checks see both.
+func TestDecodeValuesFiles(t *testing.T) {
+	t.Parallel()
+
+	type upload struct {
+		Avatar *multipart.FileHeader   `schema:"avatar,required"`
+		Name   string                  `schema:"name,required"`
+		Lang   string                  `schema:"lang,default:en"`
+		Docs   []*multipart.FileHeader `schema:"docs"`
+	}
+	avatar, doc := &multipart.FileHeader{Filename: "avatar.png"}, &multipart.FileHeader{Filename: "doc.pdf"}
+	files := map[string][]*multipart.FileHeader{"avatar": {avatar}, "docs": {doc}}
+	d := NewDecoder()
+
+	var got upload
+	if err := d.DecodeValues(&got, []string{"name"}, []string{"john"}, files); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := upload{Avatar: avatar, Name: "john", Lang: "en", Docs: []*multipart.FileHeader{doc}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %+v, want %+v", got, want)
+	}
+	var viaMap upload
+	if err := d.Decode(&viaMap, map[string][]string{"name": {"john"}}, files); err != nil || !reflect.DeepEqual(viaMap, want) {
+		t.Fatalf("Decode decoded %+v, %v", viaMap, err)
+	}
+
+	requireMissing(t, d.DecodeValues(&upload{}, []string{"name"}, []string{"john"}), "avatar")
+	requireMissing(t, d.DecodeValues(&upload{}, nil, nil, files), "name")
+
+	// The file does not hide the empty value of the later of two names.
+	z := NewDecoder()
+	z.ZeroEmpty(true)
+	for range 50 {
+		requireMissing(t, z.DecodeValues(&upload{}, []string{"Name", "name"}, []string{"john", ""}, files), "name")
+	}
+}
+
+// files is a map, so its keys decode in sorted order, each as Decode decodes
+// it: of the keys that name one file field the last wins, also for a slice.
+func TestDecodeValuesFileKeysOrder(t *testing.T) {
+	t.Parallel()
+
+	type user struct {
+		Avatar *multipart.FileHeader `schema:"avatar"`
+	}
+	type target struct {
+		Avatar *multipart.FileHeader   `schema:"avatar"`
+		User   user                    `schema:"user"`
+		Docs   []*multipart.FileHeader `schema:"docs"`
+	}
+	h := func(name string) *multipart.FileHeader { return &multipart.FileHeader{Filename: name} }
+	first, second, upper, d1, d2, d3, u1, u2 := h("first"), h("second"), h("upper"), h("d1"), h("d2"), h("d3"), h("u1"), h("u2")
+	files := map[string][]*multipart.FileHeader{
+		"avatar": {first, second}, "Avatar": {upper},
+		"docs": {d1, d2}, "Docs": {d3},
+		"user.avatar": {u1}, "User.Avatar": {u2},
+	}
+	// The last key in sorted order wins: a single field takes its last header,
+	// and a slice its headers, replacing an earlier key's as text values do.
+	want := target{Avatar: second, User: user{Avatar: u1}, Docs: []*multipart.FileHeader{d1, d2}}
+	d := NewDecoder()
+	for range 50 {
+		var got target
+		if err := d.DecodeValues(&got, nil, nil, files); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("got %+v, want %+v", got, want)
+		}
+	}
+}
+
+// A text value never fills a file field, and a file's key replaces the values
+// under it, as in Decode. A file of another spelling decodes before the pairs,
+// so it cannot zero a text field a pair sets.
+func TestDecodeValuesPairAndFile(t *testing.T) {
+	t.Parallel()
+
+	type target struct {
+		Avatar *multipart.FileHeader `schema:"avatar"`
+		Note   string                `schema:"note"`
+		Name   string                `schema:"name"`
+	}
+	file := &multipart.FileHeader{Filename: "a.png"}
+	files := map[string][]*multipart.FileHeader{"avatar": {file}, "note": {file}, "Name": {file}}
+	keys, values := []string{"avatar", "note", "name"}, []string{"text", "hi", "john"}
+	for _, zero := range []bool{false, true} {
+		d := NewDecoder()
+		d.ZeroEmpty(zero)
+		for range 50 {
+			var got target
+			if err := d.DecodeValues(&got, keys, values, files); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if want := (target{Avatar: file, Name: "john"}); got != want {
+				t.Fatalf("ZeroEmpty %v: got %+v, want %+v", zero, got, want)
+			}
+		}
+		var viaMap target
+		src := map[string][]string{"avatar": {"text"}, "note": {"hi"}}
+		if err := d.Decode(&viaMap, src, map[string][]*multipart.FileHeader{"avatar": {file}, "note": {file}}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := (target{Avatar: file}); viaMap != want {
+			t.Fatalf("ZeroEmpty %v: Decode decoded %+v, want %+v", zero, viaMap, want)
+		}
+	}
+}
+
+// A file reaches a promoted field through an unexported embedded pointer that
+// is set, at any depth the keys walk.
+func TestDecodeValuesFilesThroughUnexportedEmbeddedPointer(t *testing.T) {
+	t.Parallel()
+
+	type upload struct {
+		Avatar *multipart.FileHeader `schema:"avatar"`
+		Count  int                   `schema:"count"`
+	}
+	type elem struct{ *upload }
+	out := struct {
+		*upload
+		Profile elem   `schema:"profile"`
+		Items   []elem `schema:"items"`
+	}{upload: &upload{}, Profile: elem{&upload{}}, Items: []elem{{&upload{}}, {&upload{}}}}
+	a, p, i := &multipart.FileHeader{Filename: "a"}, &multipart.FileHeader{Filename: "p"}, &multipart.FileHeader{Filename: "i"}
+	files := map[string][]*multipart.FileHeader{"avatar": {a}, "profile.avatar": {p}, "items.1.avatar": {i}}
+	if err := NewDecoder().DecodeValues(&out, []string{"count"}, []string{"3"}, files); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if out.Avatar != a || out.Count != 3 || out.Profile.Avatar != p || out.Items[0].Avatar != nil || out.Items[1].Avatar != i {
+		t.Fatalf("unexpected result %+v", out)
+	}
+}
+
 func BenchmarkDecodeValues(b *testing.B) {
 	type target struct {
 		Name  string   `schema:"name"`
@@ -402,6 +553,19 @@ func BenchmarkDecodeValues(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
 			_ = d.Decode(&s, m) //nolint:errcheck // benchmark
+		}
+	})
+	var u struct {
+		Avatar *multipart.FileHeader `schema:"avatar"`
+		Name   string                `schema:"name"`
+		Hobby  []string              `schema:"hobby"`
+		ID     int                   `schema:"id"`
+	}
+	files := map[string][]*multipart.FileHeader{"avatar": {{Filename: "a.png"}}}
+	b.Run("files", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = d.DecodeValues(&u, keys, values, files) //nolint:errcheck // benchmark
 		}
 	})
 }

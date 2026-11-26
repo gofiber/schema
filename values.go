@@ -35,9 +35,11 @@ type source struct {
 // gathering them. It reports whether src has the key.
 func (src *source) lookup(key string) ([]string, bool) {
 	if src.pairs != nil {
-		if i := src.pairs.find(key); i >= 0 {
+		if i := src.pairs.find(key); i >= src.pairs.files {
 			l := src.pairs.last[i]
 			return src.pairs.values[l : l+1 : l+1], true
+		} else if i >= 0 {
+			return fileKeyValues, true
 		}
 		return nil, false
 	}
@@ -83,6 +85,9 @@ type pairIndex struct {
 	// every other pair
 	last []int32
 	mask uint64
+	// files is how many pairs, from the first, are the keys of multipart files,
+	// whose values are fileKeyValues; see withFileKeys
+	files int
 }
 
 // pairSeed seeds the hash of pairIndex. A hash an attacker could predict,
@@ -97,6 +102,18 @@ var pairSeed = maphash.MakeSeed()
 func pairHash(key string) uint64 { return maphash.String(pairSeed, key) }
 
 func pairHashBytes(key []byte) uint64 { return maphash.Bytes(pairSeed, key) }
+
+// newPairIndex indexes pairs in slices of its own, the first files of them
+// the keys of multipart files.
+func newPairIndex(keys, values []string, files int) *pairIndex {
+	n := len(keys)
+	p := &pairIndex{keys: keys, values: values, next: make([]int32, n), last: make([]int32, n), files: files}
+	if n > maxScanPairs {
+		p.table = make([]int32, indexSize(n))
+	}
+	p.index()
+	return p
+}
 
 // indexSize returns the table length that indexes n pairs.
 func indexSize(n int) int {
