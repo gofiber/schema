@@ -66,6 +66,8 @@ The supported field types in the destination struct are:
   - string
   - uint variants (uint, uint8, uint16, uint32, uint64)
   - struct
+  - a type with a registered converter or a TextUnmarshaler implementation,
+    whatever its kind, such as net.IP or a map type
   - a pointer to one of the above types
   - a slice or a pointer to a slice of one of the above types
 
@@ -164,6 +166,9 @@ a converter, like:
 
 A struct type with a converter or a TextUnmarshaler, like Email, is decoded as
 a whole from its field's own key, and so is a multipart file field: a key
-below one, like "Emails.0.Name", is an unknown key.
+below one, like "Emails.0.Name", is an unknown key. In a slice, an array of
+structs that unmarshals itself is decoded from the key naming its index too,
+while a slice of any other type that unmarshals itself, like []net.IP, is
+decoded from the field's own key, an element per value.
 */
 package schema

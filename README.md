@@ -81,6 +81,7 @@ The supported field types in the struct are:
 * string
 * uint variants (uint, uint8, uint16, uint32, uint64)
 * struct
+* a type with a registered converter or an `encoding.TextUnmarshaler` implementation, whatever its kind, such as `net.IP` or a map type
 * a pointer to one of the above types
 * a slice or a pointer to a slice of one of the above types
 * a map with string keys whose values are one of the non-struct types above, a type with a registered converter or an `encoding.TextUnmarshaler` implementation, or a pointer or slice of those (see below)
@@ -105,7 +106,7 @@ decoder.RegisterConverterE(Level(0), func(s string) (reflect.Value, error) {
 
 A type has at most one converter: registering one of either kind replaces the other.
 
-A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key.
+A struct type with a converter or an `encoding.TextUnmarshaler` implementation is decoded as a whole from its field's own key, and so is a multipart file field: a key below one, such as `link.host` or `avatar.filename`, is an unknown key. In a slice field, such a struct, or an array of structs that unmarshals itself, is decoded from the key naming its index, such as `emails.0`, while a slice of any other type that unmarshals itself, such as `[]net.IP`, is decoded from the field's own key, an element per value.
 
 ### Map fields
 

@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"mime/multipart"
+	"net"
 	"reflect"
 	"runtime"
 	"slices"
@@ -7446,22 +7447,22 @@ func TestDecodeTextUnmarshalerMap(t *testing.T) {
 	}
 }
 
-func TestDecodeSliceOfTextUnmarshalerMapsIgnored(t *testing.T) {
+// A slice of a map type that unmarshals itself is decoded element by element, as a slice of any
+// other type that unmarshals itself is.
+func TestDecodeSliceOfTextUnmarshalerMaps(t *testing.T) {
 	t.Parallel()
-
-	// Only the map type itself is decoded as a whole; a slice of such maps is
-	// unsupported, so it is ignored as on main.
 	var s struct {
 		M []textMap  `schema:"m"`
 		P []*textMap `schema:"p"`
 	}
-	d := NewDecoder()
-	d.IgnoreUnknownKeys(true)
-	if err := d.Decode(&s, map[string][]string{"m": {"a", "b"}, "p": {"c"}}); err != nil {
+	if err := NewDecoder().Decode(&s, map[string][]string{"m": {"a", "b"}, "p": {"c"}}); err != nil {
 		t.Fatal(err)
 	}
-	if s.M != nil || s.P != nil {
-		t.Fatalf("M = %v, P = %v, want both nil", s.M, s.P)
+	if want := []textMap{{"raw": "a"}, {"raw": "b"}}; !reflect.DeepEqual(s.M, want) {
+		t.Errorf("M = %v, want %v", s.M, want)
+	}
+	if len(s.P) != 1 || !reflect.DeepEqual(*s.P[0], textMap{"raw": "c"}) {
+		t.Errorf("P = %v, want one map holding c", s.P)
 	}
 }
 
@@ -8816,5 +8817,102 @@ func TestDefaultsSkipFieldsBelowUnexportedFields(t *testing.T) {
 	}
 	if s.page.Cursor != nil || s.n != 0 || s.p != nil || s.l != nil || s.Name != "n" || s.Count != 3 {
 		t.Errorf("got %+v", s)
+	}
+}
+
+// ipList is a slice type that unmarshals itself from IP addresses separated by spaces.
+type ipList []net.IP
+
+func (l *ipList) UnmarshalText(text []byte) error {
+	var ips ipList
+	for field := range strings.FieldsSeq(string(text)) {
+		var ip net.IP
+		if err := ip.UnmarshalText([]byte(field)); err != nil {
+			return err
+		}
+		ips = append(ips, ip)
+	}
+	*l = ips
+	return nil
+}
+
+type plainItem struct{ S string }
+
+// plainPair is an array of plain structs that unmarshals itself from "a,b".
+type plainPair [2]plainItem
+
+func (p *plainPair) UnmarshalText(text []byte) error {
+	a, b, ok := strings.Cut(string(text), ",")
+	if !ok {
+		return errors.New("want a,b")
+	}
+	p[0].S, p[1].S = a, b
+	return nil
+}
+
+// A slice of a type that unmarshals itself is decoded element by element whatever the type's
+// kind: one of slices, such as net.IP, from the field's own key, as a []uuid.UUID is, and one of
+// arrays of structs from the key naming an index, as a slice of structs that unmarshal themselves
+// is. A slice type that unmarshals itself is decoded as a whole, as a map type is.
+func TestDecodeSlicesOfSelfUnmarshalingTypes(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		IPs    []net.IP               `schema:"ips,required"`
+		PIPs   []*net.IP              `schema:"pips"`
+		IPP    *[]net.IP              `schema:"ipp"`
+		List   ipList                 `schema:"list"`
+		Lists  []ipList               `schema:"lists"`
+		MIPs   map[string][]net.IP    `schema:"mips"`
+		Pairs  []plainPair            `schema:"pairs"`
+		PPairs []*plainPair           `schema:"ppairs"`
+		MPairs map[string][]plainPair `schema:"mpairs"`
+	}
+	var s S
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"ips":      {"10.0.0.1", "::1"},
+		"pips":     {"10.0.0.2"},
+		"ipp":      {"10.0.0.3"},
+		"list":     {"10.0.0.4 10.0.0.5"},
+		"lists":    {"10.0.0.6", "10.0.0.7 10.0.0.8"},
+		"mips.k":   {"10.0.0.9"},
+		"pairs.1":  {"c,d"},
+		"ppairs.0": {"e,f"},
+		"mpairs.k": {"g,h"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ip := net.ParseIP
+	for name, c := range map[string]struct{ got, want any }{
+		"IPs":    {s.IPs, []net.IP{ip("10.0.0.1"), ip("::1")}},
+		"PIPs":   {len(s.PIPs) == 1 && s.PIPs[0].Equal(ip("10.0.0.2")), true},
+		"IPP":    {s.IPP != nil && reflect.DeepEqual(*s.IPP, []net.IP{ip("10.0.0.3")}), true},
+		"List":   {s.List, ipList{ip("10.0.0.4"), ip("10.0.0.5")}},
+		"Lists":  {s.Lists, []ipList{{ip("10.0.0.6")}, {ip("10.0.0.7"), ip("10.0.0.8")}}},
+		"MIPs":   {s.MIPs, map[string][]net.IP{"k": {ip("10.0.0.9")}}},
+		"Pairs":  {s.Pairs, []plainPair{{}, {{"c"}, {"d"}}}},
+		"PPairs": {len(s.PPairs) == 1 && *s.PPairs[0] == plainPair{{"e"}, {"f"}}, true},
+		"MPairs": {s.MPairs, map[string][]plainPair{"k": {{{"g"}, {"h"}}}}},
+	} {
+		if !reflect.DeepEqual(c.got, c.want) {
+			t.Errorf("%s = %v, want %v", name, c.got, c.want)
+		}
+	}
+	// Such a field is checked and reported as any other: a value that does not unmarshal is
+	// reported with its index, a required one that is missing as empty.
+	err = NewDecoder().Decode(new(S), map[string][]string{"pips": {"10.0.0.2", "bad"}})
+	want := MultiError{
+		"pips": ConversionError{Key: "pips", Type: reflect.TypeFor[[]*net.IP](), Index: 1, Err: &net.ParseError{Type: "IP address", Text: "bad"}},
+		"ips":  EmptyFieldError{Key: "ips"},
+	}
+	if !reflect.DeepEqual(err, want) {
+		t.Errorf("got %#v, want %#v", err, want)
+	}
+	// An array of structs takes an index, and no key reaches past it.
+	for _, key := range []string{"pairs", "pairs.0.s"} {
+		err := NewDecoder().Decode(new(S), map[string][]string{key: {"x,y"}, "ips": {"10.0.0.1"}})
+		if want := (MultiError{key: UnknownKeyError{Key: key}}); !reflect.DeepEqual(err, want) {
+			t.Errorf("%s: got %v, want %v", key, err, want)
+		}
 	}
 }

@@ -817,11 +817,10 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		}
 	}
 	if isStruct = ft.Kind() == reflect.Struct; !isStruct {
-		// A map type that unmarshals itself is decoded as a whole; a slice of
-		// them stays unsupported, though the unmarshaler slice paths could
-		// now fill one.
-		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil &&
-			(isSlice || ft.Kind() != reflect.Map || !m.IsValid) {
+		// A type that unmarshals itself is decoded as a whole, and a slice of
+		// them element by element, whatever their kind: a map, a slice such
+		// as net.IP, or a slice of either.
+		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil && !m.IsValid {
 			// Type is not supported.
 			return nil
 		}
@@ -834,9 +833,16 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	if derefT != field.Type {
 		derefU = isTextUnmarshaler(reflect.Zero(derefT))
 	}
+	// An element's facts are its own: a slice's element after one pointer,
+	// not what an array element of it holds, so an array type that
+	// unmarshals itself is decoded as one.
+	elemT := ft
+	if isSlice {
+		elemT = indirectType(derefT.Elem())
+	}
 	elemU := derefU
-	if ft != derefT {
-		elemU = isTextUnmarshaler(reflect.Zero(ft))
+	if elemT != derefT {
+		elemU = isTextUnmarshaler(reflect.Zero(elemT))
 	}
 
 	// Non-pointer builtin scalars without unmarshalers or custom converters
