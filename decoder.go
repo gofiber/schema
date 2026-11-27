@@ -23,9 +23,9 @@ import (
 
 const (
 	defaultMaxSize = 16000
-	// maxAllocBytes bounds the slices and pointer targets one call allocates, bar what the destination's own
-	// slice fields reserve as they grow, which their index limit bounds: keys reach new ones per parent element
-	// or pointer path, and a key's values size the slice they decode to, so no per-field limit bounds them.
+	// maxAllocBytes bounds the slices and pointer targets one call allocates: keys reach new ones per parent
+	// element or pointer path, a key's values size the slice they decode to, and the index limit bounds how
+	// many elements a slice grows to but not their size, so no per-field limit bounds them.
 	maxAllocBytes = 8 << 20
 )
 
@@ -1104,11 +1104,15 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			} else {
 				// Otherwise grow into a fresh array, as the caller may still alias the old one;
 				// a root field reserves room from its first growth, other slices from their second.
+				// Every array counts, the room it reserves too, so a reservation the budget
+				// cannot take gives way to exactly the index's room.
 				c := d.growCap(n, slot >= 0 && (root || ours))
-				// Only a tracked slice field of the destination struct is left to its index limit.
-				if slot < 0 || !root {
-					if err := grow.charge(c, t.Elem().Size()); err != nil {
-						return err
+				if size := t.Elem().Size(); grow.charge(c, size) != nil {
+					if c == n {
+						return errAllocLimit
+					}
+					if c = n; grow.charge(c, size) != nil {
+						return errAllocLimit
 					}
 				}
 				value := reflect.MakeSlice(t, n, c)

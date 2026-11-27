@@ -4684,11 +4684,14 @@ func TestDecodeNestedSliceLimit(t *testing.T) {
 	}
 	// The refused key takes nothing from the budget, so what is left still fits a small one.
 	keys[fit+1] = "children." + strconv.Itoa(fit+1) + ".children.0.name"
+	// The outer slice has its length already, so only the slices below its elements grow;
+	// TestDecodeCountsRootSliceGrowth counts the outer one growing.
+	presized := func(n int) *node { return &node{Children: make([]node, n)} }
 	d := NewDecoder()
-	if err := d.DecodeValues(new(node), keys[:fit], values[:fit]); err != nil {
+	if err := d.DecodeValues(presized(fit+2), keys[:fit], values[:fit]); err != nil {
 		t.Fatalf("%d keys: %v", fit, err)
 	}
-	err := d.DecodeValues(new(node), keys, values)
+	err := d.DecodeValues(presized(fit+2), keys, values)
 	if want := (MultiError{keys[fit]: errAllocLimit}); !reflect.DeepEqual(err, want) {
 		t.Fatalf("%d keys: got %v, want %v", fit+2, err, want)
 	}
@@ -4701,7 +4704,7 @@ func TestDecodeNestedSliceLimit(t *testing.T) {
 	for i := range keys {
 		keys[i], values[i] = "children.0.children."+strconv.Itoa(i)+".name", "x"
 	}
-	err = NewDecoder().DecodeValues(new(node), keys, values)
+	err = NewDecoder().DecodeValues(presized(1), keys, values)
 	if want := (MultiError{keys[refused]: errAllocLimit}); !reflect.DeepEqual(err, want) {
 		t.Fatalf("ascending fill: got %v, want %v", err, want)
 	}
@@ -4800,6 +4803,44 @@ func TestDecodeFirstIndexGrowsGeometrically(t *testing.T) {
 	}
 }
 
+// A slice field of the destination itself counts each array it grows into by index, as any
+// other slice does: an index into a large element type is refused once the array would pass the
+// budget, and room reserved ahead that the budget cannot take gives way to the index's own.
+func TestDecodeCountsRootSliceGrowth(t *testing.T) {
+	t.Parallel()
+	type row struct {
+		Name string `schema:"name"`
+		Pad  [64 << 10]byte
+	}
+	type dst struct {
+		Rows []row `schema:"rows"`
+	}
+	size := int(reflect.TypeFor[row]().Size())
+	most, doubled := maxAllocBytes/size, maxAllocBytes/(2*size) // rows the budget holds, and holds twice over
+	for _, tt := range []struct {
+		n, room int // rows a key's index asks for, and the room the slice gets, 0 if refused
+	}{
+		{doubled, 2 * doubled},
+		{doubled + 1, doubled + 1},
+		{most, most},
+		{most + 1, 0},
+		{maxParserIndex + 1, 0},
+	} {
+		var s dst
+		key := "rows." + strconv.Itoa(tt.n-1) + ".name"
+		err := NewDecoder().Decode(&s, map[string][]string{key: {"x"}})
+		if tt.room == 0 {
+			if want := (MultiError{key: errAllocLimit}); !reflect.DeepEqual(err, want) || s.Rows != nil {
+				t.Errorf("%s: got %v and %d rows, want %v and none", key, err, len(s.Rows), want)
+			}
+			continue
+		}
+		if err != nil || len(s.Rows) != tt.n || cap(s.Rows) != tt.room || s.Rows[tt.n-1].Name != "x" {
+			t.Errorf("%s: got %v and %d rows with room for %d, want %d with room for %d", key, err, len(s.Rows), cap(s.Rows), tt.n, tt.room)
+		}
+	}
+}
+
 func TestDecodeCountsPointerTargets(t *testing.T) {
 	t.Parallel()
 	type Pad struct{ B [maxAllocBytes / 40]byte }
@@ -4873,7 +4914,9 @@ func TestDecodeCountsValueSlices(t *testing.T) {
 		{"ints", true, maxAllocBytes / intSize, commas, func(d *dst) any { return d.Ints }, true},
 		{"i32", true, maxAllocBytes / int(reflect.TypeFor[int32]().Size()), commas, func(d *dst) any { return d.I32 }, true},
 		{"strs", false, maxAllocBytes / int(reflect.TypeFor[string]().Size()), words, func(d *dst) any { return d.Strs }, true},
-		{"items.0.nums", true, maxAllocBytes / intSize, commas, func(d *dst) any {
+		// The slice of the destination the path grows comes out of the same budget, with the room
+		// it reserves ahead.
+		{"items.0.nums", true, (maxAllocBytes - 2*int(reflect.TypeFor[item]().Size())) / intSize, commas, func(d *dst) any {
 			if len(d.Items) == 0 {
 				return []int(nil)
 			}
