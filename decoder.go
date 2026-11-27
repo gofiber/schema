@@ -23,8 +23,9 @@ import (
 
 const (
 	defaultMaxSize = 16000
-	// maxAllocBytes bounds the slices and pointer targets one call allocates besides the destination's own
-	// slice fields: keys reach new ones per parent element or pointer path, so no per-field limit bounds them.
+	// maxAllocBytes bounds the slices and pointer targets one call allocates, bar what the destination's own
+	// slice fields reserve as they grow, which their index limit bounds: keys reach new ones per parent element
+	// or pointer path, and a key's values size the slice they decode to, so no per-field limit bounds them.
 	maxAllocBytes = 8 << 20
 )
 
@@ -33,6 +34,11 @@ const (
 var errNotPointerToStruct = errors.New("schema: interface must be a pointer to struct")
 
 var errAllocLimit = errors.New("schema: keys allocate past the per-call limit")
+
+// errValuesChanged reports values that yield more items than the commas they
+// held when their decode began allow for, as values a converter rewrites
+// while it runs can.
+var errValuesChanged = errors.New("schema: values changed while being decoded")
 
 // fileKeyValues stands in for the value of a multipart file's key in the
 // decode view. Nothing writes through a source map's values and the map it
@@ -360,9 +366,10 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 	var errs MultiError
 
 	// Allocate nil anonymous embedded pointer fields so their promoted
-	// fields stay reachable.
+	// fields stay reachable. One reached through an unexported field cannot
+	// be set, and no key reaches past it, so it stays nil.
 	for _, chain := range struc.defaults.allocs {
-		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() {
+		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() && field.CanSet() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
 	}
@@ -416,6 +423,12 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			if def.err != nil {
 				errs = appendError(errs, "default-"+f.name, def.err)
 			}
+			// A field reached through an unexported field cannot be set, and
+			// decode leaves it alone, so the default does too; so do the
+			// pointer and scalar cases.
+			if !vCurrent.CanSet() {
+				continue
+			}
 			fresh := reflect.MakeSlice(f.typ, def.slice.Len(), def.slice.Cap())
 			reflect.Copy(fresh, def.slice)
 			vCurrent.Set(fresh)
@@ -424,7 +437,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
 				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
 			}
-			if def.val.IsValid() {
+			if def.val.IsValid() && vCurrent.CanSet() {
 				// *elem is assignable to the field even when the field's
 				// type is itself a named pointer type (type MyIntPtr *MyInt),
 				// where converting a *int directly would panic.
@@ -435,7 +448,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		default:
 			if getBuiltinConverter(kind) == nil {
 				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
-			} else if def.val.IsValid() {
+			} else if def.val.IsValid() && vCurrent.CanSet() {
 				vCurrent.Set(def.val)
 			}
 		}
@@ -879,8 +892,9 @@ func isMultipartField(typ reflect.Type) bool {
 
 // walkHops follows a path to the target field, dereferencing pointers and
 // allocating the embedded pointers promoted fields need on the way. It
-// returns the zero Value when an unsettable nil embedded pointer blocks the
-// walk, and an error once the call's allocation budget is spent.
+// returns the zero Value when a nil pointer it cannot set, one reached
+// through an unexported field, blocks the walk, and an error once the call's
+// allocation budget is spent.
 func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value, error) {
 	var err error
 	for _, hop := range hops {
@@ -891,6 +905,11 @@ func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value
 		}
 		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
+				// A nil pointer reached through an unexported field cannot be
+				// allocated, and nothing behind it can be set.
+				if !v.CanSet() {
+					return reflect.Value{}, nil
+				}
 				if err = grow.alloc(v, v.Type().Elem()); err != nil {
 					return v, err
 				}
@@ -901,6 +920,11 @@ func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value
 		// Allocate embedded anonymous pointers required for promoted fields.
 		for _, idx := range hop.ensure {
 			if f := v.Field(idx); f.IsNil() {
+				// v itself was reached through an unexported field, so no
+				// field below it can be set either.
+				if !f.CanSet() {
+					return reflect.Value{}, nil
+				}
 				if err = grow.alloc(f, f.Type().Elem()); err != nil {
 					return v, err
 				}
@@ -949,22 +973,28 @@ type growTracker struct {
 	used   int
 }
 
-// charge counts n values of size sz toward maxAllocBytes. Checked before
-// adding, so the count cannot wrap and what is refused costs nothing.
+// charge counts n values of size sz toward maxAllocBytes, unless g is nil, as
+// it is for the setDefaults walk. Checked before adding, so the count cannot
+// wrap and what is refused costs nothing. The product is taken in full, as a
+// slice of pointers charges once per element and a division would cost more
+// than the rest of the check; a high word means it cannot fit.
 func (g *growTracker) charge(n int, sz uintptr) error {
-	if s := int(sz); s != 0 && n > (maxAllocBytes-g.used)/s {
+	if g == nil {
+		return nil
+	}
+	hi, lo := bits.Mul(uint(n), uint(sz))
+	if hi != 0 || lo > uint(maxAllocBytes-g.used) {
 		return errAllocLimit
 	}
-	g.used += n * int(sz)
+	g.used += int(lo)
 	return nil
 }
 
-// alloc points the nil pointer v at a new t, counted unless g is nil.
+// alloc points the nil pointer v at a new t, counted toward maxAllocBytes
+// unless g is nil, as it is for the setDefaults walk.
 func (g *growTracker) alloc(v reflect.Value, t reflect.Type) error {
-	if g != nil {
-		if err := g.charge(1, t.Size()); err != nil {
-			return err
-		}
+	if err := g.charge(1, t.Size()); err != nil {
+		return err
 	}
 	v.Set(reflect.New(t))
 	return nil
@@ -999,7 +1029,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	} else {
 		var err error
 		if v, err = walkHops(v, parts[0].hops, grow); err != nil || !v.IsValid() {
-			// Past the budget, or unreachable behind an unsettable nil embedded pointer.
+			// Past the budget, or unreachable behind a nil pointer that cannot be set.
 			return err
 		}
 	}
@@ -1038,7 +1068,7 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	}
 
 	if parts[0].field.mapValue != nil {
-		return d.decodeMapEntry(v, path, &parts[0], values)
+		return d.decodeMapEntry(v, path, &parts[0], values, grow)
 	}
 
 	// Dereference if needed.
@@ -1119,24 +1149,26 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 			conv = *customConv
 		} else if builtin := getBuiltinConverter(elemT.Kind()); builtin != nil {
 			conv.plain = builtin
-		} else {
-			// As we are not dealing with slice of structs here, we don't need to check if the type
-			// implements TextUnmarshaler interface
+		} else if !m.IsValid {
+			// An element that unmarshals itself, such as an array type, needs
+			// no converter: the unmarshaler paths below never consult conv.
 			return fmt.Errorf("schema: converter not found for %v", elemT)
 		}
 
 		// Fast path: builtin element kinds without unmarshalers, custom
 		// converters or pointer elements decode straight into a fresh slice,
-		// avoiding one reflect.Value allocation per element.
+		// avoiding one reflect.Value allocation per element. A part naming an
+		// element never gets here (see nativeSlice), so the field's own facts
+		// describe t.
 		if customConv == nil && !m.IsValid && !isPtrElem {
-			return d.decodeBuiltinSlice(v, t, path, values)
+			return d.decodeBuiltinSlice(v, t, path, values, grow, parts[0].field.nativeSlice)
 		}
 
 		if m.IsValid && !isPtrElem {
-			return d.decodeUnmarshalerSlice(v, t, path, values)
+			return d.decodeUnmarshalerSlice(v, t, path, values, grow)
 		}
 
-		return d.decodeBoxedSlice(v, t, elemT, path, values, conv, m, isPtrElem)
+		return d.decodeBoxedSlice(v, t, elemT, path, values, conv, m, isPtrElem, grow)
 	} else {
 		val := ""
 		// Use the last value provided if any values were provided
@@ -1165,7 +1197,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				if !inPlace {
 					u = reflect.New(v.Type())
 				}
-				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
+				um, ok := reflect.TypeAssert[encoding.TextUnmarshaler](u)
+				if !ok {
+					return errNoUnmarshaler(t)
+				}
 				if err := um.UnmarshalText([]byte(val)); err != nil {
 					if inPlace {
 						v.SetZero()
@@ -1184,7 +1219,10 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 				// If the value implements the encoding.TextUnmarshaler interface
 				// apply UnmarshalText as the converter, binding it to the
 				// live value.
-				um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](v)
+				um, ok := reflect.TypeAssert[encoding.TextUnmarshaler](v)
+				if !ok {
+					return errNoUnmarshaler(t)
+				}
 				if err := um.UnmarshalText([]byte(val)); err != nil {
 					return ConversionError{
 						Key:   path,
@@ -1215,6 +1253,14 @@ func (d *Decoder) decode(v reflect.Value, path string, parts []pathPart, values 
 	return nil
 }
 
+// errNoUnmarshaler reports a value of type t that the field's
+// encoding.TextUnmarshaler facts do not describe, as an array of unmarshalers
+// that a path ending at an index reaches: the facts are those of its element,
+// and nothing decodes the array itself.
+func errNoUnmarshaler(t reflect.Type) error {
+	return fmt.Errorf("schema: converter not found for %v", t)
+}
+
 type mapEntry struct {
 	key, val reflect.Value
 }
@@ -1229,8 +1275,9 @@ func newMapEntryPool(t reflect.Type) *sync.Pool {
 // rest of path from part.keyStart names, allocating the map on first use. The value is decoded as
 // a field of the map's value type, so it converts, reports errors and takes
 // the last of several values the way such a field does; the key is stored
-// exactly as sent.
-func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string) error {
+// exactly as sent. What decoding the value allocates counts toward grow, as it
+// does for a field; the map itself does not.
+func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, values []string, grow *growTracker) error {
 	f := part.field
 	// A plain scalar field ignores an empty value unless ZeroEmpty is set, so
 	// such a value leaves the map as it is rather than storing a zero value.
@@ -1243,7 +1290,22 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 		keyStart = strings.IndexByte(path, '.') + 1
 	}
 	e, _ := f.entries.Get().(*mapEntry)
-	err := d.decode(e.val, path, f.mapValue, values, nil, nil, false)
+	var err error
+	if k := f.mapValue[0].field.fastKind; k != reflect.Invalid {
+		// decode's fast path for a plain scalar, without the call that reaches
+		// it: an empty value, kept only under ZeroEmpty, leaves e.val zero.
+		if n := len(values); n > 0 && values[n-1] != "" {
+			if _, ok := setBuiltinKind(e.val, k, values[n-1]); !ok {
+				err = ConversionError{
+					Key:   path,
+					Type:  f.mapValue[0].field.typ,
+					Index: -1,
+				}
+			}
+		}
+	} else {
+		err = d.decode(e.val, path, f.mapValue, values, nil, grow, false)
+	}
 	if err == nil {
 		if v.IsNil() {
 			v.Set(reflect.MakeMap(v.Type()))
@@ -1262,32 +1324,66 @@ func (d *Decoder) decodeMapEntry(v reflect.Value, path string, part *pathPart, v
 // decodeBoxedSlice decodes values into the slice field v whose elements have
 // to round-trip through a reflect.Value: a custom converter, or pointer
 // elements. Each item goes straight into a slot of a detached slice, set on v
-// only if all convert.
-func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv valueConverter, m unmarshaler, isPtrElem bool) error {
+// only if all convert. Each growth of the slice counts toward grow before it
+// is allocated, and so does the value behind each pointer element.
+func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path string, values []string, conv valueConverter, m unmarshaler, isPtrElem bool, grow *growTracker) error {
 	limit := len(values) // a value yields at most one item more than it has commas
-	for _, value := range values {
-		limit += strings.Count(value, ",")
+	if !m.IsValid {      // an unmarshaler takes each value whole
+		for _, value := range values {
+			limit += strings.Count(value, ",")
+		}
 	}
 	var sl reflect.Value
+	var base unsafe.Pointer // sl's first element, where pointer elements are stored
 	room, n := 0, 0
-	slot := func() reflect.Value {
+	// slot returns the index of the next slot, growing sl when it is full, once
+	// extra bytes, the value a pointer element is about to point to, count
+	// toward grow too.
+	slot := func(extra uintptr) (int, error) {
 		if n == room {
-			sl = growSlice(sl, t, limit)
+			if n == limit {
+				// Full, and growSlice would add no room: the values changed
+				// under the loop, and the index would be past the end, where
+				// storePointer would write unchecked.
+				return 0, errValuesChanged
+			}
+			var err error
+			if sl, err = growSlice(sl, t, limit, grow); err != nil {
+				return 0, err
+			}
 			room = sl.Len()
+			if isPtrElem {
+				base = sl.UnsafePointer()
+			}
+		}
+		if extra != 0 {
+			if err := grow.charge(1, extra); err != nil {
+				return 0, err
+			}
 		}
 		n++
-		return sl.Index(n - 1)
+		return n - 1, nil
+	}
+	var pointee uintptr // the size of what a pointer element points to
+	if isPtrElem {
+		pointee = elemT.Size()
 	}
 
 	for key, value := range values {
 		if value == "" {
 			if d.zeroEmpty {
-				slot() // stays zero
+				if _, err := slot(0); err != nil { // stays zero
+					return err
+				}
 			}
 			continue
 		}
 		if m.IsValid {
 			// Only pointer elements get here, so u itself is the element.
+			i, err := slot(pointee)
+			if err != nil {
+				return err
+			}
 			u := reflect.New(elemT)
 			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](u)
 			if err := um.UnmarshalText([]byte(value)); err != nil {
@@ -1298,7 +1394,7 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 					Err:   err,
 				}
 			}
-			slot().Set(u)
+			storePointer(base, i, u)
 			continue
 		}
 		// conv.convert, spelled out: it is too big to inline, and this
@@ -1311,7 +1407,11 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 			item, err = conv.withErr(value)
 		}
 		if err == nil && item.IsValid() {
-			setConvertedItem(slot(), item, elemT, isPtrElem)
+			i, err := slot(pointee)
+			if err != nil {
+				return err
+			}
+			setConvertedItem(sl, base, i, item, elemT, isPtrElem)
 			continue
 		}
 		if strings.IndexByte(value, ',') == -1 {
@@ -1328,10 +1428,16 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 		for value := range strings.SplitSeq(value, ",") {
 			if value == "" {
 				if d.zeroEmpty {
-					slot()
+					if _, err := slot(0); err != nil {
+						return err
+					}
 				}
 			} else if item, err := conv.convert(value); err == nil && item.IsValid() {
-				setConvertedItem(slot(), item, elemT, isPtrElem)
+				i, err := slot(pointee)
+				if err != nil {
+					return err
+				}
+				setConvertedItem(sl, base, i, item, elemT, isPtrElem)
 			} else {
 				return ConversionError{
 					Key:   path,
@@ -1352,21 +1458,59 @@ func (d *Decoder) decodeBoxedSlice(v reflect.Value, t, elemT reflect.Type, path 
 }
 
 // setConvertedItem converts a builtin/custom converter result to the slice
-// element type and stores it in slot, wrapping it in a freshly allocated pointer for
-// pointer-element slices. The conversion must happen before the pointer wrap:
-// builtin converters return the underlying kind (e.g. int for a named
-// `type MyInt int`), which is not assignable to the named element type, so
-// Set-ing it into a *MyInt without converting first panics.
-func setConvertedItem(slot, item reflect.Value, elemT reflect.Type, isPtrElem bool) {
+// element type and stores it as element i of sl, whose first element is at
+// base, wrapping it in a freshly allocated pointer for pointer-element slices.
+// The conversion must happen before the pointer wrap: builtin converters
+// return the underlying kind (e.g. int for a named `type MyInt int`), which is
+// not assignable to the named element type, so Set-ing it into a *MyInt
+// without converting first panics.
+func setConvertedItem(sl reflect.Value, base unsafe.Pointer, i int, item reflect.Value, elemT reflect.Type, isPtrElem bool) {
 	if item.Type() != elemT {
 		item = item.Convert(elemT)
 	}
-	if isPtrElem {
-		ptr := reflect.New(elemT)
-		ptr.Elem().Set(item)
-		item = ptr
+	if !isPtrElem {
+		setValue(sl.Index(i), item)
+		return
 	}
-	slot.Set(item)
+	ptr := reflect.New(elemT)
+	setValue(ptr.Elem(), item)
+	storePointer(base, i, ptr)
+}
+
+// setValue stores item in dst, a settable value of the same type. A scalar
+// goes through its kind's setter, which skips the assignability checks Set
+// repeats for every element; anything else goes through Set. So does a value
+// read through an unexported field, which Set refuses, as it does for a
+// field, and a float32: SetFloat would take it through float64 and back,
+// which quiets a signaling NaN, where Set copies its bits.
+func setValue(dst, item reflect.Value) {
+	if !item.CanInterface() {
+		dst.Set(item)
+		return
+	}
+	switch item.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		dst.SetInt(item.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		dst.SetUint(item.Uint())
+	case reflect.Float64:
+		dst.SetFloat(item.Float())
+	case reflect.String:
+		dst.SetString(item.String())
+	case reflect.Bool:
+		dst.SetBool(item.Bool())
+	default:
+		dst.Set(item)
+	}
+}
+
+// storePointer stores p, a pointer to a slice's element type, as element i of
+// the slice of pointers whose first element is at base. Index and Set would
+// only check again what the caller knows, that a word-sized pointer fits the
+// slot; the store through *unsafe.Pointer keeps the write barrier the garbage
+// collector needs.
+func storePointer(base unsafe.Pointer, i int, p reflect.Value) {
+	*(*unsafe.Pointer)(unsafe.Add(base, uintptr(i)*unsafe.Sizeof(base))) = p.UnsafePointer()
 }
 
 // sliceBudget bounds the first allocation: the client chooses how many values arrive.
@@ -1374,19 +1518,25 @@ const sliceBudget = 4 << 10
 
 // decodeUnmarshalerSlice unmarshals each value into an element of a detached slice,
 // set on v only if all succeed; empty values are skipped unless ZeroEmpty is set.
-func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
+func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path string, values []string, grow *growTracker) error {
 	var sl reflect.Value
+	var base unsafe.Pointer // sl's first element
+	elemT := t.Elem()
+	size := elemT.Size()
 	room, i := 0, 0
 	for key, value := range values {
 		if value == "" && !d.zeroEmpty {
 			continue
 		}
 		if i == room {
-			sl = growSlice(sl, t, len(values))
-			room = sl.Len()
+			var err error
+			if sl, err = growSlice(sl, t, len(values), grow); err != nil {
+				return err
+			}
+			room, base = sl.Len(), sl.UnsafePointer()
 		}
 		if value != "" { // an empty value kept for ZeroEmpty leaves its slot zero
-			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](sl.Index(i).Addr())
+			um, _ := reflect.TypeAssert[encoding.TextUnmarshaler](reflect.NewAt(elemT, unsafe.Add(base, uintptr(i)*size)))
 			if err := um.UnmarshalText([]byte(value)); err != nil {
 				return ConversionError{
 					Key:   path,
@@ -1408,21 +1558,26 @@ func (d *Decoder) decodeUnmarshalerSlice(v reflect.Value, t reflect.Type, path s
 }
 
 // growSlice returns sl with more room: the budget at first, then doubled, up to limit.
-func growSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
+// Each growth counts toward grow before it is allocated, as the client chooses how far it goes.
+func growSlice(sl reflect.Value, t reflect.Type, limit int, grow *growTracker) (reflect.Value, error) {
+	size := t.Elem().Size()
 	var n int
 	if sl.IsValid() {
 		n = 2 * sl.Len()
-	} else if size := int(t.Elem().Size()); size == 0 {
+	} else if size == 0 {
 		n = limit
 	} else {
-		n = max(1, sliceBudget/size)
+		n = max(1, sliceBudget/int(size))
 	}
 	n = min(n, limit)
+	if err := grow.charge(n, size); err != nil {
+		return sl, err
+	}
 	grown := reflect.MakeSlice(t, n, n)
 	if sl.IsValid() {
 		reflect.Copy(grown, sl)
 	}
-	return grown
+	return grown, nil
 }
 
 // decodeBuiltinSlice decodes values into the slice field v of type t whose
@@ -1436,8 +1591,12 @@ func growSlice(sl reflect.Value, t reflect.Type, limit int) reflect.Value {
 // whole (no builtin syntax admits commas — pinned by a test), and string
 // values always parse, so item boundaries are knowable upfront: the slice is
 // sized by a cheap comma count (an upper bound, since empty items may be
-// skipped) and truncated to the filled length at the end.
-func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path string, values []string) error {
+// skipped) and truncated to the filled length at the end, or copied to a slice
+// of that length when at least half of it, and more than sliceBudget, is left
+// unfilled, so that the result does not pin the rest. The client chooses that
+// count, so what it reserves counts toward grow before it is allocated, and so
+// does such a copy.
+func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path string, values []string, grow *growTracker, native uint8) error {
 	elemT := t.Elem()
 	k := elemT.Kind()
 	split := k != reflect.String
@@ -1451,24 +1610,36 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 		// when none does the per-value scans below have nothing to find.
 		split = n > len(values)
 	}
+	if err := grow.charge(n, builtinKindSize[k]); err != nil {
+		return err
+	}
 
 	// Exact builtin slice types decode without per-element reflect calls;
-	// named slice or element types fall through to the generic path.
-	switch t {
-	case typSliceString:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeString)
-	case typSliceInt:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeInt)
-	case typSliceInt64:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeInt64)
-	case typSliceUint:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeUint)
-	case typSliceUint64:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeUint64)
-	case typSliceFloat64:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeFloat64)
-	case typSliceBool:
-		return decodeNativeSlice(d.zeroEmpty, v, path, values, elemT, n, split, parseNativeBool)
+	// named slice or element types fall through to the generic path. native,
+	// cached with the field, says which exact type t is, as comparing two
+	// reflect.Types calls into the runtime.
+	switch native {
+	case nativeString:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeString)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeInt:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeInt)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeInt64:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeInt64)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeUint:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeUint)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeUint64:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeUint64)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeFloat64:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeFloat64)
+		return storeNativeSlice(v, out, err, n, grow)
+	case nativeBool:
+		out, err := decodeNativeSlice(d.zeroEmpty, path, values, elemT, n, split, parseNativeBool)
+		return storeNativeSlice(v, out, err, n, grow)
 	}
 
 	sl := reflect.MakeSlice(t, n, n)
@@ -1509,11 +1680,43 @@ func (d *Decoder) decodeBuiltinSlice(v reflect.Value, t reflect.Type, path strin
 			i++
 		}
 	}
-	if i < n {
+	if size := builtinKindSize[k]; i == 0 || i <= n/2 && uintptr(n-i)*size > sliceBudget {
+		// Empty items dropped without ZeroEmpty left at least half the room
+		// the counts reserved, and more than sliceBudget, unfilled: keep a
+		// copy of what was kept, counted as the reservation was, as a
+		// truncation would pin the whole array. A smaller waste is bounded as
+		// a growing slice's is, and not worth an allocation.
+		if err := grow.charge(i, size); err != nil {
+			return err
+		}
+		kept := reflect.MakeSlice(t, i, i)
+		reflect.Copy(kept, sl)
+		sl = kept
+	} else if i < n {
 		sl = sl.Slice(0, i)
 	}
 	v.Set(sl)
 	return nil
+}
+
+// builtinKindSize is the size of an element of each kind a builtin converter
+// decodes, which decodeBuiltinSlice charges without asking the element type:
+// a named type has the size of its kind.
+var builtinKindSize = [...]uintptr{
+	reflect.Bool:    unsafe.Sizeof(false),
+	reflect.Int:     unsafe.Sizeof(int(0)),
+	reflect.Int8:    unsafe.Sizeof(int8(0)),
+	reflect.Int16:   unsafe.Sizeof(int16(0)),
+	reflect.Int32:   unsafe.Sizeof(int32(0)),
+	reflect.Int64:   unsafe.Sizeof(int64(0)),
+	reflect.Uint:    unsafe.Sizeof(uint(0)),
+	reflect.Uint8:   unsafe.Sizeof(uint8(0)),
+	reflect.Uint16:  unsafe.Sizeof(uint16(0)),
+	reflect.Uint32:  unsafe.Sizeof(uint32(0)),
+	reflect.Uint64:  unsafe.Sizeof(uint64(0)),
+	reflect.Float32: unsafe.Sizeof(float32(0)),
+	reflect.Float64: unsafe.Sizeof(float64(0)),
+	reflect.String:  unsafe.Sizeof(""),
 }
 
 // Exact (unnamed) builtin slice types eligible for the native decode path.
@@ -1527,10 +1730,45 @@ var (
 	typSliceBool    = reflect.TypeFor[[]bool]()
 )
 
+// The exact builtin slice types, as nativeSliceOf names them for the cache.
+const (
+	nativeNone uint8 = iota
+	nativeString
+	nativeInt
+	nativeInt64
+	nativeUint
+	nativeUint64
+	nativeFloat64
+	nativeBool
+)
+
+// nativeSliceOf returns which exact builtin slice type t is, or nativeNone.
+func nativeSliceOf(t reflect.Type) uint8 {
+	switch t {
+	case typSliceString:
+		return nativeString
+	case typSliceInt:
+		return nativeInt
+	case typSliceInt64:
+		return nativeInt64
+	case typSliceUint:
+		return nativeUint
+	case typSliceUint64:
+		return nativeUint64
+	case typSliceFloat64:
+		return nativeFloat64
+	case typSliceBool:
+		return nativeBool
+	}
+	return nativeNone
+}
+
 // decodeNativeSlice mirrors the generic decodeBuiltinSlice loop for a field
-// typed exactly []T, parsing into a native slice assigned only if every value
-// parsed (all-or-nothing). n is the precomputed element upper bound.
-func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, values []string, elemT reflect.Type, n int, split bool, parse func(string) (T, bool)) error {
+// typed exactly []T, parsing into a native slice it returns only if every value
+// parsed (all-or-nothing), for storeNativeSlice to set. n is the precomputed
+// element upper bound. The budget and the field stay out of this loop, which
+// measured slower for every parameter it carried.
+func decodeNativeSlice[T any](zeroEmpty bool, path string, values []string, elemT reflect.Type, n int, split bool, parse func(string) (T, bool)) ([]T, error) {
 	out := make([]T, 0, n)
 	var zero T
 	for key, value := range values {
@@ -1551,7 +1789,7 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 				}
 				ev, ok := parse(item)
 				if !ok {
-					return ConversionError{
+					return nil, ConversionError{
 						Key:   path,
 						Type:  elemT,
 						Index: key,
@@ -1562,7 +1800,7 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 		default:
 			ev, ok := parse(value)
 			if !ok {
-				return ConversionError{
+				return nil, ConversionError{
 					Key:   path,
 					Type:  elemT,
 					Index: key,
@@ -1570,6 +1808,27 @@ func decodeNativeSlice[T any](zeroEmpty bool, v reflect.Value, path string, valu
 			}
 			out = append(out, ev)
 		}
+	}
+	return out, nil
+}
+
+// storeNativeSlice sets out, what decodeNativeSlice kept of the n elements the
+// counts reserved, on the field v of type []T, unless err says the values did
+// not parse. As in decodeBuiltinSlice, a list that leaves at least half of the
+// reservation, and more than sliceBudget, unfilled is set as a copy counted
+// toward grow rather than as a truncation, which would pin the whole array; so
+// is an empty one, which stays non-nil and holds no array.
+func storeNativeSlice[T any](v reflect.Value, out []T, err error, n int, grow *growTracker) error {
+	if err != nil {
+		return err
+	}
+	if size := unsafe.Sizeof(*new(T)); len(out) == 0 || len(out) <= n/2 && uintptr(n-len(out))*size > sliceBudget {
+		if err := grow.charge(len(out), size); err != nil {
+			return err
+		}
+		kept := make([]T, len(out))
+		copy(kept, out)
+		out = kept
 	}
 	// v's type is exactly []T here (the dispatch switch guarantees it), and v
 	// is settable (decode returns before reaching here for a field it cannot

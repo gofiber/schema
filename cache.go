@@ -818,7 +818,8 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 	}
 	if isStruct = ft.Kind() == reflect.Struct; !isStruct {
 		// A map type that unmarshals itself is decoded as a whole; a slice of
-		// them has no decode path, so it stays unsupported.
+		// them stays unsupported, though the unmarshaler slice paths could
+		// now fill one.
 		if c.converter(ft) == nil && getBuiltinConverter(ft.Kind()) == nil &&
 			(isSlice || ft.Kind() != reflect.Map || !m.IsValid) {
 			// Type is not supported.
@@ -858,6 +859,7 @@ func (c *cache) createField(field reflect.StructField, parentAlias, tag string) 
 		derefUnmarshaler: derefU,
 		elemUnmarshaler:  elemU,
 		isMultipart:      isMultipartField(field.Type),
+		nativeSlice:      nativeSliceOf(derefT),
 		isSliceOfStructs: isSlice && isStruct,
 		isAnonymous:      field.Anonymous,
 		isRequired:       options.Contains("required"),
@@ -1128,6 +1130,11 @@ type fieldInfo struct {
 	// whole marks a file field, or a struct (or slice of them) that a converter or
 	// encoding.TextUnmarshaler fills: no key continues into the struct's own fields.
 	whole bool
+	// nativeSlice says which exact builtin slice type, if any, the field type
+	// is after one pointer dereference, as for derefUnmarshaler. A path ending
+	// at an index never meets one: only a slice of structs takes an index, and
+	// its element is a struct or an array.
+	nativeSlice uint8
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
 	// isAnonymous indicates whether the field is embedded in the struct.

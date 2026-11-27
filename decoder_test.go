@@ -445,8 +445,14 @@ func BenchmarkAll(b *testing.B) {
 	}
 
 	decoder := NewDecoder()
+	// f9 names a field tagged "-", which the decoder reports as unknown, as in TestAll. Any other
+	// error means the loop measures less than the whole decode, so it is checked once here.
+	if err := decoder.Decode(new(S1), v); !reflect.DeepEqual(err, MultiError{"f9": UnknownKeyError{Key: "f9"}}) {
+		b.Fatalf("got %v, want only f9 reported unknown", err)
+	}
 	for b.Loop() {
-		_ = decoder.Decode(S1{}, v)
+		var s S1
+		_ = decoder.Decode(&s, v)
 	}
 }
 
@@ -4833,6 +4839,336 @@ func TestDecodeCountsPointerTargets(t *testing.T) {
 	}
 }
 
+// A slice decoded from a key's values counts toward the budget wherever it is: the room it
+// reserves is the client's count of values and commas, so it counts even when the empty items
+// are dropped, as they are without ZeroEmpty.
+func TestDecodeCountsValueSlices(t *testing.T) {
+	t.Parallel()
+	type item struct {
+		Nums []int `schema:"nums"`
+	}
+	type dst struct {
+		P     *item            `schema:"p"`
+		PI    *[]int           `schema:"pi"`
+		M     map[string][]int `schema:"m"`
+		Ints  []int            `schema:"ints"`
+		I32   []int32          `schema:"i32"`
+		Strs  []string         `schema:"strs"`
+		Items []item           `schema:"items"`
+	}
+	// The destination's own slices start out set, so a refused key can be seen to leave them be.
+	fresh := func() *dst { return &dst{Ints: []int{7}, I32: []int32{7}, Strs: []string{"7"}} }
+	intSize := int(reflect.TypeFor[int]().Size())
+	commas := func(n int) []string { return []string{strings.Repeat(",", n-1)} } // n empty items
+	words := func(n int) []string { return slices.Repeat([]string{"x"}, n) }
+	tests := []struct {
+		key       string
+		zeroEmpty bool
+		fit       int                  // elements the budget holds
+		values    func(n int) []string // values that decode to n elements
+		get       func(*dst) any       // the slice the key decodes to
+		keepsAll  bool                 // whether a key that fits keeps every element, or none
+	}{
+		{"ints", false, maxAllocBytes / intSize, commas, func(d *dst) any { return d.Ints }, false},
+		{"ints", true, maxAllocBytes / intSize, commas, func(d *dst) any { return d.Ints }, true},
+		{"i32", true, maxAllocBytes / int(reflect.TypeFor[int32]().Size()), commas, func(d *dst) any { return d.I32 }, true},
+		{"strs", false, maxAllocBytes / int(reflect.TypeFor[string]().Size()), words, func(d *dst) any { return d.Strs }, true},
+		{"items.0.nums", true, maxAllocBytes / intSize, commas, func(d *dst) any {
+			if len(d.Items) == 0 {
+				return []int(nil)
+			}
+			return d.Items[0].Nums
+		}, true},
+		// The node the path allocates comes out of the same budget.
+		{"p.nums", true, (maxAllocBytes - int(reflect.TypeFor[item]().Size())) / intSize, commas, func(d *dst) any {
+			if d.P == nil {
+				return []int(nil)
+			}
+			return d.P.Nums
+		}, true},
+		// So does the slice a pointer field points to, after the pointer's target.
+		{"pi", true, (maxAllocBytes - int(reflect.TypeFor[[]int]().Size())) / intSize, commas, func(d *dst) any {
+			if d.PI == nil {
+				return []int(nil)
+			}
+			return *d.PI
+		}, true},
+		{"m.k", true, maxAllocBytes / intSize, commas, func(d *dst) any { return d.M["k"] }, true},
+	}
+	for _, tt := range tests {
+		d := NewDecoder()
+		d.ZeroEmpty(tt.zeroEmpty)
+		s := fresh()
+		if err := d.Decode(s, map[string][]string{tt.key: tt.values(tt.fit)}); err != nil {
+			t.Fatalf("%s, %d elements: %v", tt.key, tt.fit, err)
+		}
+		want := 0
+		if tt.keepsAll {
+			want = tt.fit
+		}
+		if got := reflect.ValueOf(tt.get(s)).Len(); got != want {
+			t.Fatalf("%s, %d elements: decoded %d, want %d", tt.key, tt.fit, got, want)
+		}
+		s = fresh()
+		err := d.Decode(s, map[string][]string{tt.key: tt.values(tt.fit + 1)})
+		if want := (MultiError{tt.key: errAllocLimit}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%s, %d elements: got %v, want %v", tt.key, tt.fit+1, err, want)
+		}
+		// The slice the key names is not set. The pointers and elements its path walked through
+		// stay allocated, as they do for a value that does not convert, and so does a pointer
+		// field's target, which the slice would have gone into.
+		was := fresh()
+		switch tt.key {
+		case "items.0.nums":
+			was.Items = make([]item, 1)
+		case "p.nums":
+			was.P = new(item)
+		case "pi":
+			was.PI = new([]int)
+		}
+		if !reflect.DeepEqual(s, was) {
+			t.Fatalf("%s, %d elements: the refused key left P %v, PI %v, %d items, %d map entries and %d, %d and %d elements",
+				tt.key, tt.fit+1, s.P, s.PI, len(s.Items), len(s.M), len(s.Ints), len(s.I32), len(s.Strs))
+		}
+	}
+}
+
+// decodeBuiltinSlice charges an element by its kind's entry in builtinKindSize, so every kind a
+// builtin converter decodes needs its true size there: a missing one would count for nothing.
+func TestBuiltinKindSizeCoversEveryConverterKind(t *testing.T) {
+	t.Parallel()
+	byKind := map[reflect.Kind]reflect.Type{}
+	for _, typ := range []reflect.Type{
+		reflect.TypeFor[bool](), reflect.TypeFor[string](), reflect.TypeFor[float32](), reflect.TypeFor[float64](),
+		reflect.TypeFor[int](), reflect.TypeFor[int8](), reflect.TypeFor[int16](), reflect.TypeFor[int32](), reflect.TypeFor[int64](),
+		reflect.TypeFor[uint](), reflect.TypeFor[uint8](), reflect.TypeFor[uint16](), reflect.TypeFor[uint32](), reflect.TypeFor[uint64](),
+	} {
+		byKind[typ.Kind()] = typ
+	}
+	for k := range builtinConverters {
+		typ, ok := byKind[k]
+		if !ok {
+			t.Fatalf("no type to check builtin converter kind %v against", k)
+		}
+		if int(k) >= len(builtinKindSize) || builtinKindSize[k] != typ.Size() {
+			t.Errorf("%v: builtinKindSize has no entry of %d bytes", k, typ.Size())
+		}
+	}
+}
+
+// A list that keeps none of what its counts reserved, as empty items are dropped without
+// ZeroEmpty, holds an empty slice with no room, however little it reserved; one that keeps at
+// most half and leaves more than sliceBudget unfilled holds a slice of exactly what it keeps.
+func TestDecodeDroppedItemsKeepNoRoom(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Ints []int    `schema:"ints"` // the native loop
+		I32  []int32  `schema:"i32"`  // the reflect loop
+		Strs []string `schema:"strs"` // values, which are not split
+	}
+	commas := strings.Repeat(",", 2000)
+	for _, c := range []struct {
+		kept int
+		data map[string][]string
+	}{
+		{0, map[string][]string{"ints": {commas}, "i32": {commas, ""}, "strs": make([]string, 1000)}},
+		// Too small to leave sliceBudget unfilled: only keeping nothing calls for the empty slice.
+		{0, map[string][]string{"ints": {""}, "i32": {",,"}, "strs": {""}}},
+		{1, map[string][]string{"ints": {"5" + commas}, "i32": {commas + "5", ""}, "strs": append(make([]string, 1000), "x")}},
+	} {
+		kept, data := c.kept, c.data
+		var s S
+		if err := NewDecoder().Decode(&s, data); err != nil {
+			t.Fatal(err)
+		}
+		for name, got := range map[string]reflect.Value{"ints": reflect.ValueOf(s.Ints), "i32": reflect.ValueOf(s.I32), "strs": reflect.ValueOf(s.Strs)} {
+			if got.IsNil() || got.Len() != kept || got.Cap() != kept {
+				t.Errorf("%s: nil %v, len %d, cap %d, want %d elements and no more room", name, got.IsNil(), got.Len(), got.Cap(), kept)
+			}
+		}
+	}
+}
+
+// A small list that drops some of its empty items keeps the room it reserved rather than paying
+// for a copy: what it leaves unfilled is bounded as a growing slice's is.
+func TestDecodeSmallDroppedListAllocatesOnce(t *testing.T) { //nolint:paralleltest // testing.AllocsPerRun panics in a parallel test
+	type S struct {
+		Ints []int `schema:"ints"`
+	}
+	d := NewDecoder()
+	src := map[string][]string{"ints": {"5", ""}}
+	var s S
+	if err := d.Decode(&s, src); err != nil || !reflect.DeepEqual(s.Ints, []int{5}) {
+		t.Fatalf("decoded %v, %v; want [5]", s.Ints, err)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		s = S{}
+		_ = d.Decode(&s, src) //nolint:errcheck // checked above
+	}); allocs != 1 {
+		t.Fatalf("Decode allocated %v times per run, want 1", allocs)
+	}
+}
+
+// A list that drops empty items keeps what it reserved rather than paying for a copy when it
+// keeps more than half of it, however much is left unfilled, or leaves at most sliceBudget.
+func TestDecodeDroppedItemsKeepTheirRoom(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Ints []int   `schema:"ints"` // the native loop
+		I32  []int32 `schema:"i32"`  // the reflect loop
+	}
+	for _, c := range []struct {
+		key        string
+		values     []string
+		kept, room int
+	}{
+		// More than half kept, though 4800 and 4120 bytes are left unfilled.
+		{"ints", []string{strings.Repeat("5,", 1400) + strings.Repeat(",", 599)}, 1400, 2000},
+		{"i32", []string{strings.Repeat("5,", 1100) + strings.Repeat(",", 1029)}, 1100, 2130},
+		// Half kept, with too little left unfilled to pay for a copy.
+		{"ints", []string{"5", ""}, 1, 2},
+		{"i32", []string{"5", ""}, 1, 2},
+	} {
+		var s S
+		if err := NewDecoder().Decode(&s, map[string][]string{c.key: c.values}); err != nil {
+			t.Fatal(err)
+		}
+		got := reflect.ValueOf(s.Ints)
+		if c.key == "i32" {
+			got = reflect.ValueOf(s.I32)
+		}
+		if got.Len() != c.kept || got.Cap() != c.room {
+			t.Errorf("%s: %d with room for %d, want %d with room for %d", c.key, got.Len(), got.Cap(), c.kept, c.room)
+		}
+	}
+}
+
+// The copy of what a list keeps counts toward the budget, so a list that fills the budget with
+// its reservation and keeps one item is refused, leaving the field as it was; one item fewer fits.
+func TestDecodeDroppedItemsCopyCounts(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Ints []int   `schema:"ints"` // the native loop
+		I32  []int32 `schema:"i32"`  // the reflect loop
+	}
+	for _, tc := range []struct {
+		key string
+		fit int // elements the budget holds
+		get func(*S) reflect.Value
+	}{
+		{"ints", maxAllocBytes / int(reflect.TypeFor[int]().Size()), func(s *S) reflect.Value { return reflect.ValueOf(s.Ints) }},
+		{"i32", maxAllocBytes / int(reflect.TypeFor[int32]().Size()), func(s *S) reflect.Value { return reflect.ValueOf(s.I32) }},
+	} {
+		one := func(n int) map[string][]string { // n items, of which only the first is kept
+			return map[string][]string{tc.key: {"5" + strings.Repeat(",", n-1)}}
+		}
+		s := S{Ints: []int{7}, I32: []int32{7}}
+		err := NewDecoder().Decode(&s, one(tc.fit))
+		if want := (MultiError{tc.key: errAllocLimit}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%s, %d items: got %v, want %v", tc.key, tc.fit, err, want)
+		}
+		if !reflect.DeepEqual(s, S{Ints: []int{7}, I32: []int32{7}}) {
+			t.Fatalf("%s, %d items: the refused key left %+v", tc.key, tc.fit, s)
+		}
+		s = S{}
+		if err := NewDecoder().Decode(&s, one(tc.fit-1)); err != nil {
+			t.Fatalf("%s, %d items: %v", tc.key, tc.fit-1, err)
+		}
+		if got := tc.get(&s); got.Len() != 1 || got.Cap() != 1 || got.Index(0).Int() != 5 {
+			t.Fatalf("%s, %d items: len %d, cap %d, want the one item kept", tc.key, tc.fit-1, got.Len(), got.Cap())
+		}
+	}
+}
+
+// Slices decoded from values share one budget. A list of a built-in type reserves its room in
+// one charge, so a key refused for it takes nothing from the budget; what a key has allocated
+// before it fails or is refused stays counted, or each failing key could allocate the budget again.
+func TestDecodeValueSlicesShareTheBudget(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		A []int `schema:"a"`
+		B []int `schema:"b"`
+		C []int `schema:"c"`
+	}
+	fit := maxAllocBytes / int(reflect.TypeFor[int]().Size())
+	list := func(n int) string { return strings.Repeat(",", n-1) } // n empty items
+	// b asks for one element more than a left, so it is refused, and c, which fits, is not.
+	keys := []string{"a", "b", "c"}
+	values := []string{list(fit - 10), list(11), list(10)}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	var s S
+	err := d.DecodeValues(&s, keys, values)
+	if want := (MultiError{"b": errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+	if len(s.A) != fit-10 || s.B != nil || len(s.C) != 10 {
+		t.Fatalf("decoded %d, %d and %d elements, want %d, none and 10", len(s.A), len(s.B), len(s.C), fit-10)
+	}
+	// a reserves the whole budget, then its last item does not convert: what it reserved stays
+	// counted, so b finds no room left.
+	s = S{}
+	err = d.DecodeValues(&s, []string{"a", "b"}, []string{strings.Repeat("1,", fit-1) + "x", "1"})
+	if want := (MultiError{"a": ConversionError{Key: "a", Type: reflect.TypeFor[int](), Index: 0}, "b": errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("got %v, want %v", err, want)
+	}
+}
+
+type DefaultsDeep struct {
+	X int `schema:"x,default:5"`
+}
+
+type DefaultsMid struct {
+	*DefaultsDeep
+}
+
+// DefaultsOuter's defaulted embedded pointer leaves its own embedded pointer to the
+// setDefaults walk, which allocates it without a growTracker.
+type DefaultsOuter struct {
+	*DefaultsMid `schema:"mid,default:1"`
+}
+
+func TestDefaultsWalkAllocatesWithoutTracker(t *testing.T) {
+	t.Parallel()
+	var s DefaultsOuter
+	if err := NewDecoder().Decode(&s, map[string][]string{}); err != nil {
+		t.Fatalf("got %v, want nil", err)
+	}
+	if s.DefaultsMid == nil || s.DefaultsDeep == nil {
+		t.Fatalf("embedded pointers left nil: %+v", s.DefaultsMid)
+	}
+}
+
+// padText fills the budget with forty values; it unmarshals from any text.
+type padText [maxAllocBytes / 40]byte
+
+func (*padText) UnmarshalText([]byte) error { return nil }
+
+// The value a map entry's pointer points to counts as it would behind a pointer field.
+func TestDecodeCountsMapPointerValues(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		M map[string]*padText `schema:"m"`
+	}
+	fit := maxAllocBytes / int(reflect.TypeFor[padText]().Size())
+	keys, values := make([]string, fit+1), make([]string, fit+1)
+	for i := range keys {
+		keys[i], values[i] = "m."+strconv.Itoa(i), "x"
+	}
+	d := NewDecoder()
+	if err := d.DecodeValues(new(S), keys[:fit], values[:fit]); err != nil {
+		t.Fatalf("%d keys: %v", fit, err)
+	}
+	var s S
+	err := d.DecodeValues(&s, keys, values)
+	if want := (MultiError{keys[fit]: errAllocLimit}); !reflect.DeepEqual(err, want) {
+		t.Fatalf("%d keys: got %v, want %v", fit+1, err, want)
+	}
+	if len(s.M) != fit {
+		t.Fatalf("%d entries, want %d", len(s.M), fit)
+	}
+}
+
 type TreeNode[T any] struct {
 	Parent *T `schema:"parent"`
 }
@@ -5983,7 +6319,9 @@ func TestDecodeCommaListOfPointersAllocatesPerItem(t *testing.T) {
 		Ints []int  `schema:"ints"`
 		Ptrs []*int `schema:"ptrs"`
 	}
-	const items = 4<<20 + 1
+	// A power of two plus one, the worst case for the doubling, and few enough that
+	// both slices stay within the per-call budget.
+	const items = 1<<18 + 1
 	value := strings.Repeat(",", items-1)
 	d := NewDecoder()
 	d.ZeroEmpty(true)
@@ -6008,12 +6346,16 @@ func TestDecodeCommaListOfPointersAllocatesPerItem(t *testing.T) {
 	ptrs := decode("ptrs")
 	runtime.GC()
 	runtime.ReadMemStats(&after)
+	// Freed by that collection, value would offset a leak of a byte per item.
+	runtime.KeepAlive(value)
 	retained := int64(after.HeapAlloc) - int64(before.HeapAlloc)
 	// []int is sized up front; the pointers' slice doubles toward its bound, which costs up to three times as much.
 	if ptrs > 4*ints {
 		t.Fatalf("a list of %d items allocated %d bytes into []*int, %d into []int", items, ptrs, ints)
 	}
-	if retained > 1<<20 {
+	// An eighth of the []*int array: the array itself, the one it last outgrew or a buffer of a
+	// word per item would each keep eight times as much.
+	if retained > int64(items)*int64(reflect.TypeFor[*int]().Size())/8 {
 		t.Fatalf("decoding into []*int kept %d bytes after the call", retained)
 	}
 }
@@ -7268,6 +7610,22 @@ func BenchmarkUnmarshalerSliceDecode(b *testing.B) {
 	}
 }
 
+// The same values into pointer elements, which go through decodeBoxedSlice.
+func BenchmarkUnmarshalerPointerSliceDecode(b *testing.B) {
+	type S struct {
+		Flags []*rudeBool `schema:"flags"`
+	}
+	data := map[string][]string{"flags": {"Yup", "Nope", "Yup", "Yup", "Nope", "Yup"}}
+	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // Keys that name no field, with and without a separator, under IgnoreUnknownKeys.
 func BenchmarkUnknownKeysDecode(b *testing.B) {
 	type S struct {
@@ -7352,6 +7710,36 @@ func BenchmarkCommaListNamedDecode(b *testing.B) {
 	}
 	data := map[string][]string{"a": {strings.Join(a, ",")}, "b": {strings.Join(a[:20], ",")}}
 	decoder := NewDecoder()
+	b.ReportAllocs()
+	for b.Loop() {
+		var s S
+		if err := decoder.Decode(&s, data); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// Slices whose elements round-trip through a reflect.Value, pointers and a type with a
+// converter. ptrs and convs include a comma list; strings are never split.
+func BenchmarkBoxedSliceDecode(b *testing.B) {
+	type S struct {
+		Ptrs  []*int        `schema:"ptrs"`
+		Strs  []*string     `schema:"strs"`
+		Convs []convECustom `schema:"convs"`
+	}
+	data := map[string][]string{
+		"ptrs":  {"1", "22", "333", "4,5,6,7"},
+		"strs":  {"a", "b", "c"},
+		"convs": {"10", "20", "30,40"},
+	}
+	decoder := NewDecoder()
+	decoder.RegisterConverter(convECustom(0), func(s string) reflect.Value {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return reflect.Value{}
+		}
+		return reflect.ValueOf(convECustom(n))
+	})
 	b.ReportAllocs()
 	for b.Loop() {
 		var s S
@@ -7844,6 +8232,181 @@ func TestDecodeUnmarshalerSliceClaimsWhatItAccepts(t *testing.T) {
 	}
 }
 
+// A slice of unmarshalers counts each growth toward the budget, so it holds what the budget
+// holds of its doublings, however many values are sent; values that are skipped take nothing.
+func TestDecodeCountsUnmarshalerSlices(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Big []bigUnmarshaler `schema:"big"`
+	}
+	size := int(reflect.TypeFor[bigUnmarshaler]().Size())
+	for _, tc := range []struct {
+		name      string
+		zeroEmpty bool
+		skipped   int    // empty values sent ahead of the accepted ones
+		accepted  string // each accepted value
+	}{
+		{"empty values kept", true, 0, ""},
+		{"values", false, 0, "x"},
+		{"empty values skipped", false, 1000, "x"},
+	} {
+		values := func(k int) []string {
+			return append(make([]string, tc.skipped), slices.Repeat([]string{tc.accepted}, k)...)
+		}
+		fit := 0
+		for grownBytes(fit+1, tc.skipped+fit+1, size) <= maxAllocBytes {
+			fit++
+		}
+		d := NewDecoder()
+		d.ZeroEmpty(tc.zeroEmpty)
+		d.RegisterConverter(bigUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+		var s S
+		if err := d.Decode(&s, map[string][]string{"big": values(fit)}); err != nil {
+			t.Fatalf("%s, %d accepted: %v", tc.name, fit, err)
+		}
+		if len(s.Big) != fit {
+			t.Fatalf("%s, %d accepted: decoded %d", tc.name, fit, len(s.Big))
+		}
+		s = S{Big: make([]bigUnmarshaler, 1)}
+		err := d.Decode(&s, map[string][]string{"big": values(fit + 1)})
+		if want := (MultiError{"big": errAllocLimit}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%s, %d accepted: got %v, want %v", tc.name, fit+1, err, want)
+		}
+		if len(s.Big) != 1 {
+			t.Fatalf("%s, %d accepted: the refused key replaced the field with %d elements", tc.name, fit+1, len(s.Big))
+		}
+	}
+}
+
+// grownBytes is what a slice of size-byte elements that grows as values are accepted reserves
+// to hold k elements when it may hold at most limit: a first slice of at most sliceBudget,
+// doubled up to limit until it holds k.
+func grownBytes(k, limit, size int) int {
+	total, n := 0, 0
+	for n < k {
+		if n == 0 {
+			n = max(1, sliceBudget/size)
+		} else {
+			n *= 2
+		}
+		n = min(n, limit)
+		total += n * size
+	}
+	return total
+}
+
+// A slice of boxed elements, pointers or values from a converter, counts each growth toward
+// the budget, and each value a pointer element points to; an empty item kept for ZeroEmpty
+// points to none.
+func TestDecodeCountsBoxedSlices(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Ptrs   []*int              `schema:"ptrs"`
+		Chunks []*chunkUnmarshaler `schema:"chunks"`
+		Convs  []convECustom       `schema:"convs"`
+	}
+	ptrSize := int(reflect.TypeFor[*int]().Size())
+	intSize := int(reflect.TypeFor[int]().Size())
+	chunkSize := int(reflect.TypeFor[chunkUnmarshaler]().Size())
+	convSize := int(reflect.TypeFor[convECustom]().Size())
+	// list gives k items in one comma-separated value, each k values.
+	list := func(item string) func(int) []string {
+		return func(k int) []string { return []string{strings.Repeat(item+",", k-1) + item} }
+	}
+	each := func(item string) func(int) []string {
+		return func(k int) []string { return slices.Repeat([]string{item}, k) }
+	}
+	tests := []struct {
+		name, key string
+		zeroEmpty bool
+		values    func(k int) []string // values that decode to k elements
+		counted   func(k int) int      // what decoding them counts
+	}{
+		{"nil pointers", "ptrs", true, list(""), func(k int) int { return grownBytes(k, k, ptrSize) }},
+		{"pointers", "ptrs", false, list("1"), func(k int) int { return grownBytes(k, k, ptrSize) + k*intSize }},
+		{"unmarshaled pointers", "chunks", false, each("x"), func(k int) int { return grownBytes(k, k, ptrSize) + k*chunkSize }},
+		{"converted items", "convs", false, list("7"), func(k int) int { return grownBytes(k, k, convSize) }},
+	}
+	// field is the slice a key decodes to.
+	field := func(s *S, key string) reflect.Value {
+		switch key {
+		case "ptrs":
+			return reflect.ValueOf(&s.Ptrs).Elem()
+		case "chunks":
+			return reflect.ValueOf(&s.Chunks).Elem()
+		}
+		return reflect.ValueOf(&s.Convs).Elem()
+	}
+	for _, tt := range tests {
+		fit := 0
+		for tt.counted(fit+1) <= maxAllocBytes {
+			fit++
+		}
+		d := NewDecoder()
+		d.ZeroEmpty(tt.zeroEmpty)
+		d.RegisterConverter(chunkUnmarshaler{}, func(string) reflect.Value { return reflect.Value{} })
+		d.RegisterConverter(convECustom(0), func(s string) reflect.Value {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				return reflect.Value{}
+			}
+			return reflect.ValueOf(convECustom(n))
+		})
+		var s S
+		if err := d.Decode(&s, map[string][]string{tt.key: tt.values(fit)}); err != nil {
+			t.Fatalf("%s, %d elements: %v", tt.name, fit, err)
+		}
+		if got := field(&s, tt.key).Len(); got != fit {
+			t.Fatalf("%s, %d elements: decoded %d", tt.name, fit, got)
+		}
+		// The field starts out set, so the refused key can be seen to leave it be.
+		s = S{}
+		f := field(&s, tt.key)
+		f.Set(reflect.MakeSlice(f.Type(), 1, 1))
+		err := d.Decode(&s, map[string][]string{tt.key: tt.values(fit + 1)})
+		if want := (MultiError{tt.key: errAllocLimit}); !reflect.DeepEqual(err, want) {
+			t.Fatalf("%s, %d elements: got %v, want %v", tt.name, fit+1, err, want)
+		}
+		if got := f.Len(); got != 1 {
+			t.Fatalf("%s, %d elements: the refused key replaced the field with %d elements", tt.name, fit+1, got)
+		}
+	}
+}
+
+// A converter may take a value with commas whole, so only the values it refuses are split,
+// and the slice needs room for an element per value and per comma when every one is.
+func TestDecodeBoxedSliceSplitsWhatDoesNotConvert(t *testing.T) {
+	t.Parallel()
+	type pair string
+	type S struct {
+		P []pair `schema:"p"`
+	}
+	d := NewDecoder()
+	d.ZeroEmpty(true)
+	d.RegisterConverter(pair(""), func(s string) reflect.Value {
+		if strings.Count(s, ",") > 1 {
+			return reflect.Value{}
+		}
+		return reflect.ValueOf(pair(s))
+	})
+	for _, tc := range []struct {
+		values []string
+		want   []pair
+	}{
+		{[]string{"a,b", "c,d,e"}, []pair{"a,b", "c", "d", "e"}},
+		// Every value splits, the last into three empty items, so the slice is as long as it may be.
+		{[]string{"c,d,e", ",,"}, []pair{"c", "d", "e", "", "", ""}},
+	} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{"p": tc.values}); err != nil {
+			t.Fatalf("%q: %v", tc.values, err)
+		}
+		if !reflect.DeepEqual(s.P, tc.want) {
+			t.Fatalf("%q: P = %q, want %q", tc.values, s.P, tc.want)
+		}
+	}
+}
+
 // chunkUnmarshaler is 1 KiB, so the first slice holds four and a longer list must grow it.
 type chunkUnmarshaler [1 << 10]byte
 
@@ -7948,5 +8511,267 @@ func TestDecodeCommaListsSplitAlike(t *testing.T) {
 		if !reflect.DeepEqual(s.Strs, []string{"a,b", ",c"}) {
 			t.Errorf("zeroEmpty=%v: Strs = %q", zeroEmpty, s.Strs)
 		}
+	}
+}
+
+// rewrittenItem has a converter that rewrites the source while the decoder reads it.
+type rewrittenItem int
+
+// A converter that rewrites a later value of the source while the decoder runs makes that value
+// yield more items than its commas allowed for when the decode began. The key is reported and
+// its field left unset, nothing is stored past the end of the slice it fills, and the other keys
+// still decode.
+func TestDecodeBoxedSliceValuesChangedMidDecode(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		P []*rewrittenItem `schema:"p"`
+		N []rewrittenItem  `schema:"n"`
+		Q string           `schema:"q"`
+	}
+	for _, key := range []string{"p", "n"} {
+		src := map[string][]string{key: {"1", "2"}, "q": {"kept"}}
+		d := NewDecoder()
+		d.RegisterConverter(rewrittenItem(0), func(s string) reflect.Value {
+			if s == "1" {
+				src[key][1] = strings.Repeat("7,", 63) + "7"
+			}
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				return reflect.Value{}
+			}
+			return reflect.ValueOf(rewrittenItem(n))
+		})
+		var s S
+		err := d.Decode(&s, src)
+		if want := (MultiError{key: errValuesChanged}); !reflect.DeepEqual(err, want) || s.P != nil || s.N != nil || s.Q != "kept" {
+			t.Errorf("%s: err %v, %d and %d elements, Q %q; want only %v, the field unset and q decoded", key, err, len(s.P), len(s.N), s.Q, want)
+		}
+	}
+}
+
+// A converter's value read through an unexported field is refused in a slice element as it is
+// in a field: Set refuses it, and the kind setters that stand in for Set must not let it through.
+func TestDecodeConverterReadOnlyValueRefusedAlike(t *testing.T) {
+	t.Parallel()
+	type cents int64
+	type money struct{ c cents }
+	type S struct {
+		One  cents    `schema:"one"`
+		Many []cents  `schema:"many"`
+		Ptrs []*cents `schema:"ptrs"`
+	}
+	d := NewDecoder()
+	d.RegisterConverter(cents(0), func(s string) reflect.Value {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			return reflect.Value{}
+		}
+		return reflect.ValueOf(money{c: cents(n)}).Field(0)
+	})
+	for _, key := range []string{"one", "many", "ptrs"} {
+		var s S
+		if err := d.Decode(&s, map[string][]string{key: {"7"}}); err == nil || !strings.Contains(err.Error(), "unexported field") {
+			t.Errorf("%s: got %v, want Set's refusal of a value read through an unexported field", key, err)
+		}
+	}
+}
+
+// A converter's float32 reaches a slice element bit for bit, as it reaches a field: SetFloat would
+// take it through float64 and back, which quiets a signaling NaN.
+func TestDecodeFloat32SliceKeepsConverterBits(t *testing.T) {
+	t.Parallel()
+	type f32 float32
+	type S struct {
+		One  f32    `schema:"one"`
+		Many []f32  `schema:"many"`
+		Ptrs []*f32 `schema:"ptrs"`
+	}
+	const signaling = 0x7f800001
+	d := NewDecoder()
+	d.RegisterConverter(f32(0), func(string) reflect.Value {
+		return reflect.ValueOf(f32(math.Float32frombits(signaling)))
+	})
+	var s S
+	if err := d.Decode(&s, map[string][]string{"one": {"x"}, "many": {"x"}, "ptrs": {"x"}}); err != nil {
+		t.Fatal(err)
+	}
+	for name, got := range map[string]f32{"one": s.One, "many": s.Many[0], "ptrs": *s.Ptrs[0]} {
+		if bits := math.Float32bits(float32(got)); bits != signaling {
+			t.Errorf("%s: stored %#08x, the converter returned %#08x", name, bits, signaling)
+		}
+	}
+}
+
+// textPair is a struct that unmarshals itself from "a:b".
+type textPair struct{ A, B string }
+
+func (p *textPair) UnmarshalText(text []byte) error {
+	a, b, ok := strings.Cut(string(text), ":")
+	if !ok {
+		return errors.New("want a:b")
+	}
+	p.A, p.B = a, b
+	return nil
+}
+
+// A slice of a type that unmarshals itself needs no converter though its kind has none: an array
+// type, as a UUID is, and a struct as a map value.
+func TestDecodeSliceOfUnmarshalersNeedsNoConverter(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		IDs   []hexID               `schema:"ids"`
+		PIDs  []*hexID              `schema:"pids"`
+		Pairs map[string][]textPair `schema:"pairs"`
+	}
+	var s S
+	err := NewDecoder().Decode(&s, map[string][]string{
+		"ids":     {"01", "0a0b"},
+		"pids":    {"01"},
+		"pairs.k": {"a:b", "c:d"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []hexID{{0x01}, {0x0a, 0x0b}}; !reflect.DeepEqual(s.IDs, want) {
+		t.Errorf("IDs = %x, want %x", s.IDs, want)
+	}
+	if len(s.PIDs) != 1 || *s.PIDs[0] != (hexID{0x01}) {
+		t.Errorf("PIDs = %v, want one ID", s.PIDs)
+	}
+	if want := []textPair{{"a", "b"}, {"c", "d"}}; !reflect.DeepEqual(s.Pairs["k"], want) {
+		t.Errorf("Pairs = %v, want k: %v", s.Pairs, want)
+	}
+	// A value that does not unmarshal is reported with its index.
+	err = NewDecoder().Decode(&s, map[string][]string{"ids": {"01", "zz"}})
+	if me, ok := err.(MultiError); !ok || !reflect.DeepEqual(me["ids"], ConversionError{
+		Key: "ids", Type: reflect.TypeFor[[]hexID](), Index: 1, Err: hex.InvalidByteError('z'),
+	}) {
+		t.Errorf("got %#v, want a conversion error at index 1", err)
+	}
+}
+
+// valuePair unmarshals itself through a value receiver, so it can only check its text.
+type valuePair struct{ A string }
+
+func (valuePair) UnmarshalText(text []byte) error {
+	if len(text) == 0 {
+		return errors.New("empty")
+	}
+	return nil
+}
+
+// A key ending at an index into a slice of arrays of unmarshalers names an array, which nothing
+// decodes: it is reported under its own name rather than ending the whole decode in a panic,
+// whether the element unmarshals through a pointer or a value receiver.
+func TestDecodeIndexIntoSliceOfUnmarshalerArrays(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		Pairs  [][2]textPair  `schema:"pairs"`
+		Values [][2]valuePair `schema:"values"`
+		Name   string         `schema:"name"`
+	}
+	for _, key := range []string{"pairs.0", "values.0"} {
+		for _, zero := range []bool{true, false} {
+			var s S
+			if !zero {
+				s.Pairs = [][2]textPair{{{A: "x"}}}
+				s.Values = [][2]valuePair{{{A: "x"}}}
+			}
+			err := NewDecoder().DecodeValues(&s, []string{key, "name"}, []string{"a:b", "n"})
+			if me, ok := err.(MultiError); !ok || len(me) != 1 || me[key] == nil {
+				t.Errorf("%s, zero %v: got %v (%T), want an error for %s alone", key, zero, err, err, key)
+			}
+			if s.Name != "n" {
+				t.Errorf("%s, zero %v: Name = %q, want the other key decoded", key, zero, s.Name)
+			}
+		}
+	}
+}
+
+// pageInfo is unexported, so a struct that embeds a nil pointer to it cannot allocate one.
+type pageInfo struct {
+	Page int `schema:"page"`
+}
+
+// A key through an unexported nil embedded pointer reaches nothing, as a key naming an unexported
+// field does: it does not panic, which would end the whole decode, and the other keys still
+// decode and report.
+func TestDecodeKeyThroughUnexportedNilEmbeddedPointer(t *testing.T) {
+	t.Parallel()
+	type S struct {
+		*pageInfo
+		Name string `schema:"name"`
+	}
+	for _, key := range []string{"pageInfo.page", "PAGEINFO.PAGE"} {
+		var s S
+		err := NewDecoder().DecodeValues(&s, []string{"bogus", key, "name"}, []string{"1", "3", "n"})
+		if want := (MultiError{"bogus": UnknownKeyError{Key: "bogus"}}); !reflect.DeepEqual(err, want) {
+			t.Errorf("%s: got %v, want %v", key, err, want)
+		}
+		if s.Name != "n" || s.pageInfo != nil {
+			t.Errorf("%s: Name %q, embedded pointer %v", key, s.Name, s.pageInfo)
+		}
+	}
+	// One that is set is written through, as before.
+	s := S{pageInfo: &pageInfo{}}
+	if err := NewDecoder().Decode(&s, map[string][]string{"pageInfo.page": {"3"}}); err != nil || s.Page != 3 {
+		t.Errorf("set embedded pointer: err %v, Page %d", err, s.Page)
+	}
+}
+
+// A key through a nil pointer below an unexported field reaches nothing either: one the field
+// itself holds, or one embedded in a struct it holds.
+func TestDecodeKeyThroughNilPointerBelowUnexportedField(t *testing.T) {
+	t.Parallel()
+	type Cursor struct {
+		At int `schema:"at"`
+	}
+	type page struct{ *Cursor }
+	type item struct {
+		page page
+		next *Cursor
+		N    int `schema:"n"`
+	}
+	// In a slice element, which the defaults walk skips, so walkHops alone meets the pointers.
+	type S struct {
+		Items []item `schema:"items"`
+		Name  string `schema:"name"`
+	}
+	var s S
+	err := NewDecoder().DecodeValues(&s,
+		[]string{"bogus", "items.0.page.at", "items.0.next.at", "items.0.n", "name"},
+		[]string{"1", "3", "5", "4", "n"})
+	if want := (MultiError{"bogus": UnknownKeyError{Key: "bogus"}}); !reflect.DeepEqual(err, want) {
+		t.Errorf("got %v, want %v", err, want)
+	}
+	if len(s.Items) != 1 || s.Items[0].N != 4 || s.Items[0].page.Cursor != nil || s.Items[0].next != nil || s.Name != "n" {
+		t.Errorf("other keys: got %+v", s)
+	}
+}
+
+// The defaults walk leaves alone what it reaches through an unexported field, as decode does:
+// allocating an embedded pointer there or setting a default would panic in Set and end the
+// whole decode, dropping the other keys' errors and the defaults still to come.
+func TestDefaultsSkipFieldsBelowUnexportedFields(t *testing.T) {
+	t.Parallel()
+	type Cursor struct {
+		At int `schema:"at"`
+	}
+	type page struct{ *Cursor }
+	type S struct {
+		page  page
+		n     int    `schema:"n,default:5"`
+		p     *int   `schema:"p,default:6"`
+		l     []int  `schema:"l,default:7|8"`
+		Name  string `schema:"name"`
+		Count int    `schema:"count,default:3"`
+	}
+	var s S
+	err := NewDecoder().DecodeValues(&s, []string{"bogus", "name"}, []string{"1", "n"})
+	if want := (MultiError{"bogus": UnknownKeyError{Key: "bogus"}}); !reflect.DeepEqual(err, want) {
+		t.Errorf("got %v, want %v", err, want)
+	}
+	if s.page.Cursor != nil || s.n != 0 || s.p != nil || s.l != nil || s.Name != "n" || s.Count != 3 {
+		t.Errorf("got %+v", s)
 	}
 }
