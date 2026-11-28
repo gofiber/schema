@@ -87,7 +87,19 @@ const typeCacheSlots = 32
 // type descriptor, the data word of the reflect.Type interface, read
 // directly since reflect.ValueOf(t).Pointer() costs several times as much.
 func typeSlot(t reflect.Type) uintptr {
-	return (*[2]uintptr)(unsafe.Pointer(&t))[1] >> 4 & (typeCacheSlots - 1)
+	return typeAddr(t) >> 4 & (typeCacheSlots - 1)
+}
+
+// typeAddr returns the address of t's type descriptor, which is one per type
+// and so tells types apart as t itself does, in one word.
+func typeAddr(t reflect.Type) uintptr {
+	return (*[2]uintptr)(unsafe.Pointer(&t))[1]
+}
+
+// typeBit returns one of 64 bits for the type at addr, for a set of types
+// that is asked which types it may hold before it is searched.
+func typeBit(addr uintptr) uint64 {
+	return 1 << (addr >> 4 & 63)
 }
 
 // cacheEntry tags a structInfo with its type and the configuration
@@ -547,17 +559,31 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	// under a consistent configuration and we don't churn the config lock
 	// per field.
 	tag := c.aliasTag()
-	info := &structInfo{}
+	info := &structInfo{typ: t}
+	// The setDefaults walk also allocates nil anonymous embedded pointers,
+	// so it can only be skipped when neither defaults nor such pointers
+	// exist anywhere in the tree. Settled first: what the defaults plan
+	// descends into decides which embedded pointers lead back (see leadsBack).
+	info.needsDefaultsWalk = c.needsDefaultsWalk(t, tag, map[reflect.Type]bool{})
 	var anonymousInfos []*structInfo
 	var anonymousIdx [][]int
 	for i := 0; i < t.NumField(); i++ {
 		structField := t.Field(i)
+		f := c.createField(structField, parentAlias, tag)
+		if f != nil && f.isAnonymous && c.leadsBack(f, t, tag, info.needsDefaultsWalk) {
+			// Expanding it would build t again inside itself, without end.
+			// It is a named struct pointer instead: nothing is promoted
+			// through it, and keys name its fields under its alias.
+			f.isAnonymous = false
+		}
 		// Only exported anonymous pointers can be allocated; unexported ones
-		// are not settable and Set would panic.
-		if structField.Anonymous && structField.Type.Kind() == reflect.Pointer && structField.IsExported() {
+		// are not settable and Set would panic. One leading back to t is not
+		// allocated either, as a named pointer is not: a fresh one would
+		// hold another such pointer for the walk to allocate, and so on.
+		if structField.Anonymous && structField.Type.Kind() == reflect.Pointer && structField.IsExported() && (f == nil || f.isAnonymous) {
 			info.anonymousPtrFields = append(info.anonymousPtrFields, i)
 		}
-		if f := c.createField(structField, parentAlias, tag); f != nil {
+		if f != nil {
 			f.index = structField.Index
 			info.fields = append(info.fields, f)
 			if ft := indirectType(f.typ); ft.Kind() == reflect.Struct && f.isAnonymous && !f.whole {
@@ -598,12 +624,8 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 	buildRequiredIndex(info)
 	info.direct = c.buildDirectPaths(info)
 	info.directIndex = newFoldIndex(info.direct)
-	// The setDefaults walk also allocates nil anonymous embedded pointers,
-	// so it can only be skipped when neither defaults nor such pointers
-	// exist anywhere in the tree.
-	info.needsDefaultsWalk = c.needsDefaultsWalk(t, tag, map[reflect.Type]bool{})
 	if info.needsDefaultsWalk && parentAlias == "" { // promotion-only builds never walk
-		info.defaults = c.buildDefaults(info)
+		info.defaults = c.buildDefaults(info, t)
 	}
 	return info
 }
@@ -612,9 +634,10 @@ func (c *cache) create(t reflect.Type, parentAlias string) *structInfo {
 // be spelled or skipped, so they double per level.
 const maxDefaultKeys = 8
 
-// buildDefaults plans every defaulted field with its spellings through embedded
-// structs, so the walk joins prefixes only at named pointers.
-func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
+// buildDefaults plans every defaulted field of t, the struct info describes,
+// with its spellings through embedded structs, so the walk joins prefixes only
+// at named pointers.
+func (c *cache) buildDefaults(info *structInfo, t reflect.Type) defaultsPlan {
 	var p defaultsPlan
 	at := map[string]int{} // index chain -> step, merging the paths to one field
 	add := func(f *fieldInfo, index []int, keys ...string) {
@@ -646,6 +669,9 @@ func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
 		switch {
 		case f.def != nil && !f.isAnonymous: // a defaulted named struct is reported, never descended
 		case k == reflect.Struct || structPtr && f.isAnonymous:
+			// A struct decoded as a whole included: no key names its fields,
+			// so one left zero takes its default, and the embedded pointers
+			// in it are allocated, as in any other struct.
 			child := c.get(indirectType(f.typ)).defaults
 			if len(f.index) == 1 && f.def == nil { // a defaulted embedded struct stays zero, so its error is reported
 				for _, a := range child.allocs {
@@ -671,7 +697,53 @@ func (c *cache) buildDefaults(info *structInfo) defaultsPlan {
 			p.steps[i].keys = append(keys[:maxDefaultKeys-1], keys[len(keys)-1])
 		}
 	}
+	p.locateSteps(t)
 	return p
+}
+
+// locateSteps finds the structs the steps lie in from their index chains: all
+// but the last index of a chain lead through structs held by value and
+// through embedded pointers, from the plan's own struct, of type t.
+func (p *defaultsPlan) locateSteps(t reflect.Type) {
+	var types []reflect.Type // of p.structs
+	for i := range p.steps {
+		s := &p.steps[i]
+		s.in = -1
+		holder := t
+		for n := 1; n < len(s.index); n++ {
+			// The steps of a struct mostly follow each other, so it is
+			// mostly the last one found, and few plans hold many.
+			j := len(p.structs) - 1
+			for j >= 0 && !slices.Equal(p.structs[j].index, s.index[:n]) {
+				j--
+			}
+			if j < 0 {
+				held := holder.Field(s.index[n-1]).Type
+				ptr := held.Kind() == reflect.Pointer
+				if ptr {
+					held = held.Elem()
+				}
+				j = len(p.structs)
+				p.structs = append(p.structs, planStruct{index: s.index[:n], typ: typeAddr(held), parent: s.in, ptr: ptr})
+				p.types |= typeBit(typeAddr(held))
+				types = append(types, held)
+			}
+			s.in, holder = j, types[j]
+		}
+	}
+	if len(p.structs) < 2 {
+		return
+	}
+	// Two structs held by value in one struct are apart. One behind a pointer
+	// is wherever the caller pointed it, which can be at another.
+	byPointer := make([]bool, len(p.structs))
+	seen := map[uintptr]bool{} // whether one of the type seen so far is behind a pointer
+	for i, s := range p.structs {
+		byPointer[i] = s.ptr || s.parent >= 0 && byPointer[s.parent]
+		other, ok := seen[s.typ]
+		p.aliases = p.aliases || ok && (other || byPointer[i])
+		seen[s.typ] = other || byPointer[i]
+	}
 }
 
 // buildDirectPaths precomputes, keyed by lowercase path, the parsed paths for
@@ -761,8 +833,10 @@ func (c *cache) needsDefaultsWalk(t reflect.Type, tag string, visited map[reflec
 	visited[t] = true
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
-		// Mirror the anonymousPtrFields filter: only exported anonymous
-		// pointers are ever allocated, so only they justify the walk.
+		// Only exported anonymous pointers are ever allocated, so only they
+		// justify the walk. One that leads back to t counts as well, though
+		// it is not allocated: leadsBack is settled by this answer, so the
+		// answer cannot wait for it, and the walk then finds nothing to do.
 		if field.Anonymous && field.Type.Kind() == reflect.Pointer && field.IsExported() {
 			return true
 		}
@@ -774,6 +848,123 @@ func (c *cache) needsDefaultsWalk(t reflect.Type, tag string, visited map[reflec
 			return true
 		}
 		if c.needsDefaultsWalk(field.Type, tag, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+// pointedSet is the set of types of the structs that a pointer field leads to
+// anywhere in the tree of a struct: the types as typeAddr gives them, and the
+// typeBit of each.
+type pointedSet struct {
+	types []uintptr
+	bits  uint64
+}
+
+// pointedTypes returns the pointedSet of the struct info describes. A walk
+// that starts there can come to a struct a second time only through a
+// pointer, so only to a struct of one of these types: the others it need not
+// record. It is worked out when a walk first asks, as few do.
+func (c *cache) pointedTypes(info *structInfo) *pointedSet {
+	if p := info.pointed.Load(); p != nil {
+		return p
+	}
+	tag := c.aliasTag()
+	found := &pointedSet{}
+	visited := map[reflect.Type]bool{}
+	var visit func(reflect.Type)
+	visit = func(t reflect.Type) {
+		if visited[t] {
+			return
+		}
+		visited[t] = true
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			if alias, _ := fieldAlias(field, tag); alias == "-" {
+				continue
+			}
+			ft := field.Type
+			if ft.Kind() == reflect.Pointer {
+				if ft = ft.Elem(); ft.Kind() == reflect.Struct && !slices.Contains(found.types, typeAddr(ft)) {
+					found.types = append(found.types, typeAddr(ft))
+					found.bits |= typeBit(typeAddr(ft))
+				}
+			}
+			if ft.Kind() == reflect.Struct {
+				visit(ft)
+			}
+		}
+	}
+	visit(info.typ)
+	info.pointed.Store(found)
+	return found
+}
+
+// leadsBack reports whether f, an embedded field of struct t, is a pointer to
+// a struct that leads back to t. A build descends into struct values and
+// embedded struct pointers, and no struct holds itself through values alone,
+// so every way back to a type being built passes through such a pointer: with
+// none expanded, every build ends. The answer depends on the types and the
+// configuration alone, not on the order the types are built in, so the
+// metadata can be cached.
+//
+// Go shadows all a pointer back to t reaches. What one back to another struct
+// of the cycle reaches, as when two structs embed pointers to each other, Go
+// promotes; here keys reach it only by naming the embedded fields.
+//
+// planned reports whether t has a defaults plan, see reaches.
+func (c *cache) leadsBack(f *fieldInfo, t reflect.Type, tag string, planned bool) bool {
+	// Only the plan expands a pointer to a struct decoded as a whole.
+	if f.typ.Kind() != reflect.Pointer || f.whole && !planned {
+		return false
+	}
+	et := f.typ.Elem()
+	return et.Kind() == reflect.Struct && c.reaches(et, t, tag, planned, map[reflect.Type]bool{})
+}
+
+// reaches reports whether struct type from is target, or holds it through the
+// fields a build descends into: struct values and embedded struct pointers,
+// other than the skipped ones. It follows embedded pointers whether or not
+// they lead back themselves, so that the answer does not depend on the order
+// the types are built in.
+//
+// Nothing but the defaults plan descends into a struct decoded as a whole, so
+// one is followed only where there is a plan. planned reports whether target
+// has one, which then holds for every struct on a way back to it: each holds
+// all the others, and with them the same defaults and pointers to allocate.
+// Without a plan no build comes back through such a field, and the embedded
+// pointers before it are expanded as they always were.
+func (c *cache) reaches(from, target reflect.Type, tag string, planned bool, seen map[reflect.Type]bool) bool {
+	if from == target {
+		return true
+	}
+	if seen[from] {
+		return false
+	}
+	seen[from] = true
+	for i := 0; i < from.NumField(); i++ {
+		sf := from.Field(i)
+		ft := sf.Type
+		if sf.Anonymous && ft.Kind() == reflect.Pointer {
+			ft = ft.Elem()
+		}
+		if ft.Kind() != reflect.Struct {
+			continue
+		}
+		alias, options := fieldAlias(sf, tag)
+		if alias == "-" {
+			continue
+		}
+		// The plan leaves a defaulted named struct alone as well. Whether the
+		// field is decoded whole only matters in these two cases, and is
+		// costly to find out, so no other case asks.
+		if !planned || !sf.Anonymous && options.getDefaultOptionValue() != "" {
+			if f := c.createField(sf, "", tag); f != nil && f.whole {
+				continue
+			}
+		}
+		if c.reaches(ft, target, tag, planned, seen) {
 			return true
 		}
 	}
@@ -935,6 +1126,7 @@ func (c *cache) converter(t reflect.Type) *valueConverter {
 // ----------------------------------------------------------------------------
 
 type structInfo struct {
+	typ                reflect.Type // the struct described
 	fields             []*fieldInfo
 	fieldsByName       map[string]*fieldInfo
 	anonymousPtrFields []int
@@ -959,6 +1151,8 @@ type structInfo struct {
 	hasMapFields bool
 	// defaults is the setDefaults walk of this struct tree, see buildDefaults.
 	defaults defaultsPlan
+	// pointed caches pointedTypes for a walk that starts at this struct.
+	pointed atomic.Pointer[pointedSet]
 	// needsDefaultsWalk reports whether the setDefaults walk can have any
 	// effect on this struct tree: it is set when a default tag option or an
 	// anonymous embedded pointer field (which the walk allocates) exists
@@ -1130,7 +1324,9 @@ type fieldInfo struct {
 	whole bool
 	// isSliceOfStructs indicates if the field type is a slice of structs.
 	isSliceOfStructs bool
-	// isAnonymous indicates whether the field is embedded in the struct.
+	// isAnonymous indicates whether the field is embedded in the struct, and
+	// expanded as such: an embedded pointer leading back to the struct is a
+	// named field instead (see leadsBack).
 	isAnonymous  bool
 	isRequired   bool
 	defaultValue string
@@ -1149,6 +1345,24 @@ type fieldInfo struct {
 type defaultsPlan struct {
 	allocs [][]int // nil embedded pointers to allocate, parents first
 	steps  []defaultStep
+	// structs lists the structs the steps lie in other than the plan's own,
+	// each after the one that holds it; see defaultsWalk.
+	structs []planStruct
+	// types has the typeBit of each of structs set.
+	types uint64
+	// aliases reports that two of structs could be one struct in a
+	// destination the caller filled: they are of one type, and at least one
+	// of them is reached through a pointer.
+	aliases bool
+}
+
+// planStruct is a struct a defaults plan reaches without a pointer step: one
+// held by value, or behind an embedded pointer the plan expands.
+type planStruct struct {
+	index  []int   // to the struct, or to the embedded pointer to it
+	typ    uintptr // the struct's type, as typeAddr gives it
+	parent int     // the one of defaultsPlan.structs holding it, or -1
+	ptr    bool    // index ends at an embedded pointer
 }
 
 // defaultStep is a defaulted field, or a named struct pointer walked when set,
@@ -1157,6 +1371,7 @@ type defaultStep struct {
 	field *fieldInfo
 	index []int
 	keys  []string
+	in    int // the one of defaultsPlan.structs holding the field, or -1
 }
 
 // fieldDefault is what setDefaults assigns for a field's default option:
