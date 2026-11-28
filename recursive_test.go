@@ -627,12 +627,82 @@ func TestLeadsBack(t *testing.T) {
 		{reflect.TypeFor[wholeSelfPlain](), false},
 		{reflect.TypeFor[defaultedWhole](), false},
 		{reflect.TypeFor[embedsPlain](), false},
+		{reflect.TypeFor[CycleOutside](), false},
+		{reflect.TypeFor[SkipOuter](), false},
 	} {
 		f := c.createField(tc.t.Field(0), "", "schema")
 		planned := c.needsDefaultsWalk(tc.t, "schema", map[reflect.Type]bool{})
 		if got := c.leadsBack(f, tc.t, "schema", planned); got != tc.want {
 			t.Errorf("%v: leadsBack = %v, want %v", tc.t, got, tc.want)
 		}
+	}
+}
+
+// CycleOutside embeds a pointer into a cycle it is not part of: CycleLeft and
+// CycleRight embed pointers to each other.
+type CycleOutside struct {
+	*CycleLeft
+	Z int `schema:"z"`
+}
+
+type CycleLeft struct {
+	*CycleRight
+	L int `schema:"l,default:1"`
+}
+
+type CycleRight struct {
+	*CycleLeft
+	R int `schema:"r,default:2"`
+}
+
+// SkipOuter embeds a pointer to SkipInner, which holds a SkipOuter in a field
+// the decoder skips.
+type SkipOuter struct {
+	*SkipInner
+	X int `schema:"x"`
+}
+
+type SkipInner struct {
+	Outer SkipOuter `schema:"-"`
+	Y     int       `schema:"y,default:7"`
+}
+
+// An embedded pointer that does not lead back to its struct is expanded as
+// ever, and promotes its fields: also where the search for a way back comes
+// into a cycle of other structs, which it goes round once, and where the only
+// way back is a field the decoder skips, which no build descends into.
+func TestEmbeddedPointerNotLeadingBack(t *testing.T) {
+	t.Parallel()
+
+	var o CycleOutside
+	if err := NewDecoder().Decode(&o, map[string][]string{"z": {"1"}, "l": {"5"}}); err != nil {
+		t.Fatal(err)
+	}
+	if left := o.CycleLeft; o.Z != 1 || left == nil || left.L != 5 || left.CycleRight != nil {
+		t.Errorf("into a cycle of others: got z=%d, embedded=%+v, want 1 and {l=5, embedded=nil}", o.Z, left)
+	}
+	// The pointer inside the cycle leads back, and is a named field there.
+	o = CycleOutside{}
+	if err := NewDecoder().Decode(&o, map[string][]string{"CycleRight.r": {"0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if left := o.CycleLeft; left == nil || left.L != 1 || left.CycleRight == nil {
+		t.Errorf("into a cycle of others, key below it: got embedded=%+v, want l=1 and its pointer set", left)
+	} else if right := left.CycleRight; right.R != 0 || right.CycleLeft != nil {
+		t.Errorf("into a cycle of others, key below it: got %+v behind the pointer, want the 0 sent and nil", right)
+	}
+
+	var s SkipOuter
+	if err := NewDecoder().Decode(&s, map[string][]string{"x": {"1"}, "y": {"3"}}); err != nil {
+		t.Fatal(err)
+	}
+	if in := s.SkipInner; s.X != 1 || in == nil || in.Y != 3 {
+		t.Errorf("back through a skipped field: got x=%d, embedded=%+v, want 1 and y=3", s.X, in)
+	}
+	s = SkipOuter{}
+	err := NewDecoder().Decode(&s, map[string][]string{})
+	if in := s.SkipInner; err != nil || in == nil || in.Y != 7 {
+		t.Errorf("back through a skipped field, nothing sent: got %v, embedded=%+v, want nil and y=7", err, in)
 	}
 }
 
@@ -836,6 +906,78 @@ func TestDefaultsWalkRecordsOnlyWhatCanBeReachedTwice(t *testing.T) {
 	// the other could be pointed to as well, and is recorded for itself.
 	if w := walk(&dest{Q: &onceSelf{}}); !w.tracking || w.n != 4 {
 		t.Errorf("pointer set: tracking=%v with %d structs recorded, want true and 4", w.tracking, w.n)
+	}
+}
+
+type pointedSkipped struct {
+	V int `schema:"v,default:1"`
+}
+
+type pointedLeaf struct {
+	V int `schema:"v,default:1"`
+}
+
+type pointedHolder struct {
+	P *pointedLeaf `schema:"p"`
+}
+
+type pointedDest struct {
+	Skip *pointedSkipped `schema:"-"`
+	In   pointedHolder   `schema:"in"`
+	Self *pointedDest    `schema:"self"`
+}
+
+// The types a pointer can lead a walk to are those behind the pointers of the
+// destination's whole tree, in the fields the decoder reads: no walk follows a
+// pointer in a field it skips. They are worked out once for a destination
+// type.
+func TestPointedTypes(t *testing.T) {
+	t.Parallel()
+
+	c := newCache()
+	info := c.get(reflect.TypeFor[pointedDest]())
+	set := c.pointedTypes(info)
+	want := []uintptr{typeAddr(reflect.TypeFor[pointedLeaf]()), typeAddr(reflect.TypeFor[pointedDest]())}
+	if !reflect.DeepEqual(set.types, want) {
+		t.Errorf("got %d types %v, want those of pointedLeaf and pointedDest, %v", len(set.types), set.types, want)
+	}
+	if bits := typeBit(want[0]) | typeBit(want[1]); set.bits != bits {
+		t.Errorf("got bits %b, want %b", set.bits, bits)
+	}
+	if again := c.pointedTypes(info); again != set {
+		t.Error("worked out a second time")
+	}
+}
+
+type claimLeaf struct {
+	V int `schema:"v,default:1"`
+}
+
+// claimMid holds a leaf by value. A pointer to it embedded under its
+// unexported name is not allocated.
+type claimMid struct {
+	Leaf claimLeaf `schema:"leaf"`
+}
+
+// A struct of the plan can lie behind a nil pointer that cannot be set. There
+// is no struct there for a walk to claim, as there is no field to default.
+func TestDefaultsWalkClaimsNothingBehindNilPointer(t *testing.T) {
+	t.Parallel()
+
+	type dest struct {
+		*claimMid
+		P *claimLeaf `schema:"p"`
+	}
+	d := dest{P: &claimLeaf{}}
+	if err := NewDecoder().Decode(&d, map[string][]string{}); err != nil || d.claimMid != nil || d.P.V != 1 {
+		t.Errorf("got %v, embedded=%v, p.v=%d, want nil, nil and 1", err, d.claimMid, d.P.V)
+	}
+	// Set by the caller, the struct and the leaf in it are the walk's own: a
+	// pointer to that leaf finds it walked, under the prefix its key has.
+	set := dest{claimMid: &claimMid{}}
+	set.P = &set.Leaf
+	if err := NewDecoder().Decode(&set, map[string][]string{"leaf.v": {"0"}}); err != nil || set.Leaf.V != 0 {
+		t.Errorf("set by the caller: got %v, leaf.v=%d, want nil and the 0 sent", err, set.Leaf.V)
 	}
 }
 
