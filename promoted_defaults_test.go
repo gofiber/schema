@@ -1,9 +1,12 @@
 package schema
 
 import (
+	"fmt"
+	"net/mail"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // See https://github.com/gofiber/schema/issues/117.
@@ -535,5 +538,89 @@ func TestDefaultsBehindPromotedPointerWithReembedding(t *testing.T) {
 		if v.Next == nil || v.Next.V != 0 {
 			t.Errorf("%s=0: got %+v, want v=0", key, v.Next)
 		}
+	}
+}
+
+// wholeMoney is decoded as a whole by a converter.
+type wholeMoney struct {
+	Amount int    `schema:"amount,default:7"`
+	Cur    string `schema:"cur"`
+}
+
+// wholeEmail unmarshals itself and embeds a pointer, as the Email of the
+// package documentation does.
+type wholeEmail struct {
+	*mail.Address
+}
+
+func (e *wholeEmail) UnmarshalText(text []byte) (err error) {
+	e.Address, err = mail.ParseAddress(string(text))
+	return err
+}
+
+// wholeStamp unmarshals itself only through the time.Time it embeds.
+type wholeStamp struct {
+	time.Time
+	Zone string `schema:"zone,default:UTC"`
+}
+
+// A struct that a converter or encoding.TextUnmarshaler decodes as a whole
+// takes the defaults of its fields as any other struct does. No key names
+// such a field, so one left zero is defaulted whether the struct's own key
+// was sent or not, and the nil embedded pointers in the struct are allocated,
+// so that the fields promoted through them can be read.
+func TestDefaultsInsideStructsDecodedWhole(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		Price   wholeMoney  `schema:"price"`
+		PP      *wholeMoney `schema:"pp"`
+		Primary wholeEmail  `schema:"primary"`
+		At      wholeStamp  `schema:"at"`
+	}
+	newDecoder := func() *Decoder {
+		d := NewDecoder()
+		d.RegisterConverter(wholeMoney{}, func(s string) reflect.Value {
+			var m wholeMoney
+			if _, err := fmt.Sscanf(s, "%d %s", &m.Amount, &m.Cur); err != nil {
+				return reflect.Value{}
+			}
+			return reflect.ValueOf(m)
+		})
+		return d
+	}
+
+	// Nothing sent: a nil pointer stays nil, and one the caller set is walked.
+	var unset S
+	if err := newDecoder().Decode(&unset, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if unset.Price.Amount != 7 || unset.PP != nil || unset.At.Zone != "UTC" || unset.Primary.Address == nil {
+		t.Errorf("nothing sent: got %+v", unset)
+	}
+	set := S{PP: &wholeMoney{}}
+	if err := newDecoder().Decode(&set, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if set.PP.Amount != 7 {
+		t.Errorf("nothing sent, pointer set: got amount %d, want 7", set.PP.Amount)
+	}
+
+	// Every key sent: what the converter or the unmarshaler left zero is defaulted.
+	var sent S
+	src := map[string][]string{
+		"price":   {"0 USD"},
+		"pp":      {"0 EUR"},
+		"primary": {"a@b.c"},
+		"at":      {"2026-01-02T03:04:05Z"},
+	}
+	if err := newDecoder().Decode(&sent, src); err != nil {
+		t.Fatal(err)
+	}
+	if sent.Price != (wholeMoney{Amount: 7, Cur: "USD"}) || sent.PP == nil || *sent.PP != (wholeMoney{Amount: 7, Cur: "EUR"}) {
+		t.Errorf("sent: got price %+v, pp %+v", sent.Price, sent.PP)
+	}
+	if addr := sent.Primary.Address; sent.At.Zone != "UTC" || sent.At.Year() != 2026 || addr == nil || addr.Address != "a@b.c" {
+		t.Errorf("sent: got at %+v, primary %+v", sent.At, addr)
 	}
 }
