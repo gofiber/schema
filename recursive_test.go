@@ -7,6 +7,78 @@ import (
 	"testing"
 )
 
+type cycleNode struct {
+	Next *cycleNode `schema:"next"`
+	V    int        `schema:"v,default:1"`
+}
+
+// A destination holding a cycle is walked for defaults once around it.
+// Walking it again recursed until the stack ran out, a fatal error that kills
+// the process, and would read each struct again under a longer prefix, under
+// which the key that set it is missing.
+func TestDefaultsWalkStopsAtCycles(t *testing.T) {
+	t.Parallel()
+
+	self := &cycleNode{}
+	self.Next = self
+	if err := NewDecoder().Decode(self, map[string][]string{"v": {"0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if self.V != 0 {
+		t.Errorf("self loop: v=%d, want the 0 sent", self.V)
+	}
+
+	// A ring longer than the structs the walk keeps inline, back to the destination.
+	ring := make([]*cycleNode, len(defaultsWalk{}.walked)+2)
+	for i := range ring {
+		ring[i] = &cycleNode{}
+	}
+	for i, n := range ring {
+		n.Next = ring[(i+1)%len(ring)]
+	}
+	if err := NewDecoder().Decode(ring[0], map[string][]string{"next.v": {"0"}}); err != nil {
+		t.Fatal(err)
+	}
+	for i, n := range ring {
+		if want := map[bool]int{true: 0, false: 1}[i == 1]; n.V != want {
+			t.Errorf("ring[%d]: v=%d, want %d", i, n.V, want)
+		}
+	}
+
+	// A cycle that does not pass through the destination.
+	type holder struct {
+		Head *cycleNode `schema:"head"`
+		V    int        `schema:"v,default:2"`
+	}
+	a, b := &cycleNode{}, &cycleNode{}
+	a.Next, b.Next = b, a
+	h := holder{Head: a}
+	if err := NewDecoder().Decode(&h, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	if h.V != 2 || a.V != 1 || b.V != 1 {
+		t.Errorf("got v=%d, a.v=%d, b.v=%d, want 2, 1 and 1", h.V, a.V, b.V)
+	}
+
+	// A cycle of two at the end of a chain longer than the structs kept inline.
+	chain := make([]*cycleNode, len(defaultsWalk{}.walked)+2)
+	for i := range chain {
+		chain[i] = &cycleNode{}
+	}
+	for i, n := range chain[:len(chain)-1] {
+		n.Next = chain[i+1]
+	}
+	chain[len(chain)-1].Next = chain[len(chain)-2]
+	if err := NewDecoder().Decode(chain[0], map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	for i, n := range chain {
+		if n.V != 1 {
+			t.Errorf("chain[%d]: v=%d, want 1", i, n.V)
+		}
+	}
+}
+
 // SelfEmbedded embeds a pointer to its own type. Building its metadata
 // expanded that pointer without end, until memory ran out.
 type SelfEmbedded struct {
@@ -219,6 +291,45 @@ func TestSelfEmbeddedPointerWithoutDefaults(t *testing.T) {
 	}
 	if p := s.SelfEmbeddedPlain; s.X != 1 || p == nil || p.SelfEmbeddedPlain == nil || p.SelfEmbeddedPlain.X != 2 || p.SelfEmbeddedPlain.SelfEmbeddedPlain != nil {
 		t.Errorf("got x=%d parent=%+v", s.X, p)
+	}
+}
+
+type walkNoDefaults struct {
+	X int `schema:"x"`
+}
+
+// A set struct pointer whose struct holds no default and no embedded pointer
+// to allocate is not walked, so it is not recorded either: recording each
+// made a destination with a handful of them allocate a map on every Decode.
+func TestDefaultsWalkSkipsStructsWithNothingToDo(t *testing.T) {
+	t.Parallel()
+
+	type S struct {
+		A, B, C, D, E *walkNoDefaults
+		N             *cycleNode `schema:"n"`
+		V             int        `schema:"v,default:1"`
+	}
+	d := NewDecoder()
+	set := S{A: &walkNoDefaults{}, B: &walkNoDefaults{}, C: &walkNoDefaults{}, D: &walkNoDefaults{}, E: &walkNoDefaults{}, N: &cycleNode{}}
+	v := reflect.ValueOf(&set).Elem()
+	info := d.cache.get(v.Type())
+	w := defaultsWalk{root: info, n: 1}
+	w.walked[0] = structAt(v.Addr().UnsafePointer(), v.Type())
+	if errs := d.setDefaults(info, v, &w, &source{m: map[string][]string{}}, "", "", 0); errs != nil {
+		t.Fatal(errs)
+	}
+	// The destination, and the one struct that holds a default.
+	if w.n != 2 || w.more.n != 0 || set.V != 1 || set.N.V != 1 {
+		t.Errorf("recorded %d structs and %d more, v=%d, n.v=%d; want 2, none, 1 and 1", w.n, w.more.n, set.V, set.N.V)
+	}
+
+	var s S
+	src := map[string][]string{"a.x": {"1"}, "b.x": {"1"}, "c.x": {"1"}, "d.x": {"1"}, "e.x": {"1"}, "n.next.v": {"0"}}
+	if err := d.Decode(&s, src); err != nil {
+		t.Fatal(err)
+	}
+	if s.V != 1 || s.E == nil || s.E.X != 1 || s.N == nil || s.N.V != 1 || s.N.Next == nil || s.N.Next.V != 0 {
+		t.Errorf("got %+v, n %+v", s, s.N)
 	}
 }
 
@@ -522,5 +633,208 @@ func TestLeadsBack(t *testing.T) {
 		if got := c.leadsBack(f, tc.t, "schema", planned); got != tc.want {
 			t.Errorf("%v: leadsBack = %v, want %v", tc.t, got, tc.want)
 		}
+	}
+}
+
+type onceLeaf struct {
+	V int `schema:"v,default:1"`
+}
+
+// onceHolder holds a leaf by value.
+type onceHolder struct {
+	Leaf onceLeaf `schema:"leaf"`
+	N    int      `schema:"n,default:2"`
+}
+
+// onceFinder points to a leaf that another struct holds.
+type onceFinder struct {
+	P *onceLeaf `schema:"p"`
+}
+
+// OnceBase is held through an embedded pointer, and points back to itself.
+type OnceBase struct {
+	Back *OnceBase `schema:"back"`
+	W    int       `schema:"w,default:1"`
+}
+
+type onceSelf struct {
+	Self *onceSelf `schema:"self"`
+	V    int       `schema:"v,default:1"`
+}
+
+// OnceShared is embedded by pointer at two levels of one struct.
+type OnceShared struct {
+	W int `schema:"w,default:1"`
+}
+
+type onceSharedSub struct {
+	*OnceShared
+	X int `schema:"x"`
+}
+
+type onceOuter struct {
+	In onceHolder `schema:"in"`
+	M  int        `schema:"m,default:3"`
+}
+
+// The defaults walk comes to a struct once, also where it is held in two
+// places: under a pointer and by value, under a pointer and behind an embedded
+// one, or behind two embedded ones. The walk that comes first sees the keys
+// that name the struct's fields under its own prefix. A second one would look
+// under another prefix, find none, and replace a zero that a key set by the
+// default.
+func TestDefaultsWalkReachesEachStructOnce(t *testing.T) {
+	t.Parallel()
+
+	// Behind an embedded pointer, with a pointer back to it.
+	type child struct {
+		*OnceBase
+		V int `schema:"v"`
+	}
+	base := &OnceBase{}
+	base.Back = base
+	if err := NewDecoder().Decode(&child{OnceBase: base}, map[string][]string{"w": {"0"}}); err != nil || base.W != 0 {
+		t.Errorf("embedded pointer: got %v, w=%d, want nil and the 0 sent", err, base.W)
+	}
+
+	// Held by value, with a pointer to it from inside it.
+	type selfRoot struct {
+		In onceSelf `schema:"in"`
+	}
+	var self selfRoot
+	self.In.Self = &self.In
+	if err := NewDecoder().Decode(&self, map[string][]string{"in.v": {"0"}}); err != nil || self.In.V != 0 {
+		t.Errorf("struct value: got %v, v=%d, want nil and the 0 sent", err, self.In.V)
+	}
+
+	// Behind two embedded pointers of one struct, which no pointer step
+	// leads to.
+	type sharedReq struct {
+		*OnceShared
+		Sub onceSharedSub `schema:"sub"`
+	}
+	shared := &OnceShared{}
+	req := sharedReq{OnceShared: shared, Sub: onceSharedSub{OnceShared: shared}}
+	if err := NewDecoder().Decode(&req, map[string][]string{"w": {"0"}}); err != nil || shared.W != 0 {
+		t.Errorf("two embedded pointers: got %v, w=%d, want nil and the 0 sent", err, shared.W)
+	}
+
+	// Under two pointers.
+	type both struct {
+		A *onceLeaf `schema:"a"`
+		B *onceLeaf `schema:"b"`
+	}
+	leaf := &onceLeaf{}
+	if err := NewDecoder().Decode(&both{A: leaf, B: leaf}, map[string][]string{"a.v": {"0"}}); err != nil || leaf.V != 0 {
+		t.Errorf("two pointers: got %v, v=%d, want nil and the 0 sent", err, leaf.V)
+	}
+
+	// A pointer followed before the walk of the struct that holds its target:
+	// the struct is the pointer's then, and its holder leaves it alone.
+	type later struct {
+		First  *onceFinder `schema:"first"`
+		Second *onceHolder `schema:"second"`
+	}
+	holder := &onceHolder{}
+	if err := NewDecoder().Decode(&later{First: &onceFinder{P: &holder.Leaf}, Second: holder}, map[string][]string{"first.p.v": {"0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if holder.Leaf.V != 0 || holder.N != 2 {
+		t.Errorf("pointer first: got v=%d n=%d, want the 0 sent and the default 2", holder.Leaf.V, holder.N)
+	}
+
+	// A pointer followed from the walk of the struct that holds its target:
+	// the struct is its holder's from the start, though its fields come
+	// after the pointer.
+	type owner struct {
+		Far  *onceFinder `schema:"far"`
+		Leaf onceLeaf    `schema:"leaf"`
+	}
+	var own owner
+	own.Far = &onceFinder{P: &own.Leaf}
+	if err := NewDecoder().Decode(&own, map[string][]string{"leaf.v": {"0"}}); err != nil || own.Leaf.V != 0 {
+		t.Errorf("holder first: got %v, v=%d, want nil and the 0 sent", err, own.Leaf.V)
+	}
+
+	// A struct another walk came to is left alone with all it holds, also a
+	// struct no pointer can lead to, which is not recorded for itself.
+	type two struct {
+		B *onceHolder `schema:"b"`
+		A *onceOuter  `schema:"a"`
+	}
+	outer := &onceOuter{}
+	if err := NewDecoder().Decode(&two{B: &outer.In, A: outer}, map[string][]string{"b.leaf.v": {"0"}, "b.n": {"0"}}); err != nil {
+		t.Fatal(err)
+	}
+	if outer.In.Leaf.V != 0 || outer.In.N != 0 || outer.M != 3 {
+		t.Errorf("with what it holds: got v=%d n=%d m=%d, want the zeros sent and the default 3", outer.In.Leaf.V, outer.In.N, outer.M)
+	}
+}
+
+type onceFirst struct {
+	V int `schema:"v,default:1"`
+}
+
+// onceFirstHolder holds a onceFirst as its first field, so at its own address,
+// and a pointer to one, which makes it a struct the walk records.
+type onceFirstHolder struct {
+	First onceFirst        `schema:"first"`
+	Other *onceFirst       `schema:"other"`
+	Next  *onceFirstHolder `schema:"next"`
+}
+
+// A struct and its first field lie at one address and are two structs: the
+// walk that has come to the one has not come to the other. The chain is longer
+// than the structs the walk keeps inline, where they are compared one way, so
+// that the last ones are compared the other way.
+func TestDefaultsWalkTellsStructFromItsFirstField(t *testing.T) {
+	t.Parallel()
+
+	var head *onceFirstHolder
+	for range len(defaultsWalk{}.walked) + 4 {
+		head = &onceFirstHolder{Next: head}
+	}
+	if err := NewDecoder().Decode(head, map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+	for at, depth := head, 0; at != nil; at, depth = at.Next, depth+1 {
+		if at.First.V != 1 {
+			t.Errorf("%d levels down: v=%d, want the default 1", depth, at.First.V)
+		}
+	}
+}
+
+// Nothing is recorded until the walk follows a pointer, and then only the
+// structs a pointer can lead to: until then no struct can be reached twice,
+// and the others never can.
+func TestDefaultsWalkRecordsOnlyWhatCanBeReachedTwice(t *testing.T) {
+	t.Parallel()
+
+	type dest struct {
+		In   onceHolder  `schema:"in"`
+		Self onceSelf    `schema:"self"`
+		P    *onceFinder `schema:"p"`
+		Q    *onceSelf   `schema:"q"`
+	}
+	d := NewDecoder()
+	walk := func(v *dest) *defaultsWalk {
+		rv := reflect.ValueOf(v).Elem()
+		info := d.cache.get(rv.Type())
+		w := &defaultsWalk{root: info, n: 1}
+		w.walked[0] = structAt(rv.Addr().UnsafePointer(), rv.Type())
+		if errs := d.setDefaults(info, rv, w, &source{m: map[string][]string{}}, "", "", 0); errs != nil {
+			t.Fatal(errs)
+		}
+		return w
+	}
+	// No pointer is set: the destination alone.
+	if w := walk(&dest{}); w.tracking || w.n != 1 {
+		t.Errorf("no pointer set: tracking=%v with %d structs recorded, want false and 1", w.tracking, w.n)
+	}
+	// A pointer is followed: the destination, the struct behind the pointer,
+	// and of the two held by value the one a pointer can lead to. The leaf in
+	// the other could be pointed to as well, and is recorded for itself.
+	if w := walk(&dest{Q: &onceSelf{}}); !w.tracking || w.n != 4 {
+		t.Errorf("pointer set: tracking=%v with %d structs recorded, want true and 4", w.tracking, w.n)
 	}
 }

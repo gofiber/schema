@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"mime/multipart"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -249,7 +250,10 @@ func (d *Decoder) decodeSource(dst any, src *source, multipartFiles map[string][
 		}
 	}
 	if rootInfo.needsDefaultsWalk {
-		errs = mergeErrors(errs, d.setDefaults(t, v, src, "", "", 0))
+		// The walk starts in the destination, which a pointer can lead back to.
+		w := defaultsWalk{root: rootInfo, n: 1}
+		w.walked[0] = structAt(reflect.ValueOf(dst).UnsafePointer(), t)
+		errs = mergeErrors(errs, d.setDefaults(rootInfo, v, &w, src, "", "", 0))
 	}
 	errs = mergeErrors(errs, missingRequired(rootInfo.requiredGroups, satisfied, pending))
 	if len(errs) > 0 {
@@ -346,29 +350,197 @@ func (f *fieldInfo) resolveDefault() {
 	}
 }
 
-// setDefaults runs the planned walk of t, reached under prefix, the shortest
-// path, and under long, the fully spelled one, depth levels below the root.
-func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, prefix, long string, depth int) MultiError {
-	struc := d.cache.get(t)
-	// Skip the walk entirely when it can have no effect (no default tags and
-	// no anonymous embedded pointers to allocate anywhere in the tree) — the
-	// overwhelmingly common case.
-	if !struc.needsDefaultsWalk {
-		return nil
-	}
+// defaultsWalk is the state of one setDefaults walk: the structs walked so
+// far. A destination the caller filled can hold a struct in several places,
+// under two pointers, or under a pointer and by value in another struct, and
+// can hold a pointer back to a struct the walk is inside. Each struct is
+// walked once, by the walk that reaches it first. A second walk would look
+// for the keys of its fields under another prefix and miss them, so that a
+// zero they set takes its default, and around a cycle it would recurse until
+// the stack ran out, a fatal error no recover catches.
+//
+// A struct is reached through a pointer the walk follows, or by the walk of
+// the struct that holds it, by value or behind an embedded pointer: when that
+// walk starts, so that no pointer followed from there takes it first.
+//
+// The source whose keys the walk checks is not part of it. The structs
+// recorded go to the heap when there are many, and what is kept beside them
+// is then taken to go there as well, which would move the source off the
+// stack Decode keeps it on.
+type defaultsWalk struct {
+	// root describes the destination, for pointed.
+	root *structInfo
+	// tracking is set once a struct can be reached a second time: from the
+	// first pointer the walk follows, or from the start for a plan in which
+	// two structs can be one (see defaultsPlan.aliases). Until then nothing
+	// but the destination is recorded, which is what nearly every walk does.
+	tracking bool
+	// pointed holds the types of the structs a pointer can lead to, once
+	// the walk has asked for them; see cache.pointedTypes.
+	pointed *pointedSet
+	// walked holds the first structs walked, and all of them move to more
+	// when there are more than fit. Every set pointer to a struct with
+	// something to default takes a place, so there is room for those of a
+	// wide destination.
+	walked [16]walkedStruct
+	n      int
+	more   walkedSet
+}
 
+// walkedStruct is a struct by address and type: a struct and its first field
+// share an address. Structs of size zero can share one too, but hold nothing
+// a default can be set in. The address stays a pointer, which the runtime
+// keeps right should the struct lie on a stack that moves; the type is kept
+// as typeAddr gives it, in one word, as type descriptors stay where they are.
+type walkedStruct struct {
+	p unsafe.Pointer
+	t uintptr
+}
+
+// structAt returns the walkedStruct of the struct of type t at p.
+func structAt(p unsafe.Pointer, t reflect.Type) walkedStruct {
+	return walkedStruct{p: p, t: typeAddr(t)}
+}
+
+// walkedSet is a set of structs for a walk that has many: a destination that
+// another decoder filled can be thousands of structs deep, and each is one
+// insertion. The slots are probed from the one the address hashes to, and the
+// set doubles when three quarters of them are taken.
+type walkedSet struct {
+	slots []walkedStruct // a power of two long; the zero value is a free slot
+	n     int
+}
+
+// add puts s in the set and reports whether it was not in it.
+func (set *walkedSet) add(s walkedStruct) bool {
+	if 4*(set.n+1) > 3*len(set.slots) {
+		old := set.slots
+		set.slots, set.n = make([]walkedStruct, max(2*len(old), 64)), 0
+		for _, moved := range old {
+			if moved != (walkedStruct{}) {
+				set.put(moved)
+			}
+		}
+	}
+	return set.put(s)
+}
+
+// put is add for a set with a free slot.
+func (set *walkedSet) put(s walkedStruct) bool {
+	mask := len(set.slots) - 1
+	// Structs lie words apart, so the low bits of an address say little
+	// about it; the product spreads them over the high ones.
+	for i := int(uint64(uintptr(s.p))*0x9E3779B97F4A7C15>>32) & mask; ; i = (i + 1) & mask {
+		switch set.slots[i] {
+		case s:
+			return false
+		case walkedStruct{}:
+			set.slots[i] = s
+			set.n++
+			return true
+		}
+	}
+}
+
+// enter marks s walked, and reports whether it was not.
+func (w *defaultsWalk) enter(s walkedStruct) bool {
+	if w.more.slots != nil {
+		return w.more.add(s)
+	}
+	if slices.Contains(w.walked[:w.n], s) {
+		return false
+	}
+	if w.n < len(w.walked) {
+		w.walked[w.n] = s
+		w.n++
+		return true
+	}
+	for _, moved := range w.walked {
+		w.more.add(moved)
+	}
+	return w.more.add(s)
+}
+
+// claims reports whether the plan holds a struct that the walk has to claim:
+// one of a type that a pointer leads to somewhere in the destination. No
+// other walk can have reached a struct of another type, or will, and that is
+// most of them.
+func (w *defaultsWalk) claims(c *cache, plan *defaultsPlan) bool {
+	if w.pointed == nil {
+		w.pointed = c.pointedTypes(w.root)
+	}
+	return plan.types&w.pointed.bits != 0
+}
+
+// claim marks the structs the plan reaches in v without a pointer step as
+// walked. It returns the ones that were walked already as a set of bits, bit
+// i&63 of word i>>6 for plan.structs[i], or nil when there is none: their
+// steps are left to the walk that reached them first, and so are the steps of
+// the structs they hold, which that walk reached with them.
+func (w *defaultsWalk) claim(plan *defaultsPlan, v reflect.Value) []uint64 {
+	var taken []uint64
+	for i := range plan.structs {
+		s := &plan.structs[i]
+		if s.parent < 0 || taken == nil || taken[s.parent>>6]&(1<<(s.parent&63)) == 0 {
+			if !slices.Contains(w.pointed.types, s.typ) {
+				continue
+			}
+			held, _ := walkIndexChain(v, s.index, nil)
+			if !held.IsValid() || s.ptr && held.IsNil() {
+				// Behind a nil pointer that cannot be set, where no step
+				// finds anything either.
+				continue
+			}
+			p := held
+			if !s.ptr {
+				p = held.Addr()
+			}
+			if w.enter(walkedStruct{p: p.UnsafePointer(), t: s.typ}) {
+				continue
+			}
+		}
+		if taken == nil {
+			taken = make([]uint64, (len(plan.structs)+63)>>6)
+		}
+		taken[i>>6] |= 1 << (i & 63)
+	}
+	return taken
+}
+
+// setDefaults runs the planned walk of v, the struct struc describes, reached
+// under prefix, the shortest path, and under long, the fully spelled one,
+// depth levels below the destination, with the keys of src. The caller has
+// found that the walk can have an effect: it is skipped entirely where
+// struc.needsDefaultsWalk is unset (no default tags and no anonymous embedded
+// pointers to allocate anywhere in the tree), the overwhelmingly common case.
+func (d *Decoder) setDefaults(struc *structInfo, v reflect.Value, w *defaultsWalk, src *source, prefix, long string, depth int) MultiError {
 	var errs MultiError
+	plan := &struc.defaults
 
 	// Allocate nil anonymous embedded pointer fields so their promoted
 	// fields stay reachable. One that cannot be set, as in a struct held by
 	// an unexported named field, stays nil: Set would panic.
-	for _, chain := range struc.defaults.allocs {
+	for _, chain := range plan.allocs {
 		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() && field.CanSet() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
 	}
 
-	for _, s := range struc.defaults.steps {
+	// The structs of the plan that another walk reached first. A plan that
+	// holds no struct has none, which is asked here to spare most walks a
+	// call.
+	var taken []uint64
+	if plan.types != 0 && (w.tracking || plan.aliases) {
+		if w.tracking = true; w.claims(d.cache, plan) {
+			taken = w.claim(plan, v)
+		}
+	}
+
+	for i := range plan.steps {
+		s := &plan.steps[i]
+		if taken != nil && s.in >= 0 && taken[s.in>>6]&(1<<(s.in&63)) != 0 {
+			continue
+		}
 		f := s.field
 		vCurrent, _ := walkIndexChain(v, s.index, nil) // nothing to refuse without a tracker
 		if !vCurrent.IsValid() {
@@ -378,7 +550,25 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 
 		def := f.def
 		if def == nil {
-			if !vCurrent.IsNil() {
+			if vCurrent.IsNil() {
+				continue
+			}
+			// A struct the walk can do nothing in is neither walked nor
+			// recorded: only a struct that is walked can be walked twice.
+			elem := f.typ.Elem()
+			next := d.cache.get(elem)
+			if !next.needsDefaultsWalk {
+				continue
+			}
+			if !w.tracking {
+				// The first pointer followed: what this walk holds is its
+				// own from here on. A walk that starts later claims what it
+				// holds as it starts.
+				if w.tracking = true; plan.types != 0 && w.claims(d.cache, plan) {
+					taken = w.claim(plan, v)
+				}
+			}
+			if w.enter(structAt(vCurrent.UnsafePointer(), elem)) {
 				// Mixed spellings would multiply per level, and recursive types nest without limit.
 				np, nl := prefix, long
 				// No key names more than maxPathDepth fields, so a deeper prefix could never match; a
@@ -390,7 +580,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 						nl = long + s.keys[len(s.keys)-1]
 					}
 				}
-				errs = mergeErrors(errs, d.setDefaults(f.typ.Elem(), vCurrent.Elem(), src, np, nl, depth+1))
+				errs = mergeErrors(errs, d.setDefaults(next, vCurrent.Elem(), w, src, np, nl, depth+1))
 			}
 			continue
 		}
