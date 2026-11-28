@@ -838,3 +838,173 @@ func TestDefaultsWalkRecordsOnlyWhatCanBeReachedTwice(t *testing.T) {
 		t.Errorf("pointer set: tracking=%v with %d structs recorded, want true and 4", w.tracking, w.n)
 	}
 }
+
+type encodeNode struct {
+	N    int         `schema:"n"`
+	Next *encodeNode `schema:"next"`
+}
+
+// encodeChain links n nodes numbered from 0, the last one to the node at
+// index back, or to none if back is negative.
+func encodeChain(n, back int) []*encodeNode {
+	nodes := make([]*encodeNode, n)
+	for i := range nodes {
+		nodes[i] = &encodeNode{N: i}
+	}
+	for i, node := range nodes[:n-1] {
+		node.Next = nodes[i+1]
+	}
+	if back >= 0 {
+		nodes[n-1].Next = nodes[back]
+	}
+	return nodes
+}
+
+type encodeInner struct {
+	Up *encodeOuter `schema:"up"`
+	I  int          `schema:"i"`
+}
+
+type encodeOuter struct {
+	In encodeInner `schema:"in"`
+	O  int         `schema:"o"`
+}
+
+type encodeHub struct {
+	A, B, C *encodeHub
+	N       int `schema:"n"`
+}
+
+type encodeFirst struct {
+	N int `schema:"n"`
+}
+
+// encodeHolder holds an encodeFirst as its first field, so at its own address.
+type encodeHolder struct {
+	First encodeFirst   `schema:"first"`
+	Self  *encodeFirst  `schema:"self"`
+	Down  *encodeHolder `schema:"down"`
+}
+
+// A value in which a pointer leads back into a struct that holds it made
+// Encode follow the pointer without end, until the stack ran out: a fatal
+// error that kills the process. Encode ends with an error instead, once it
+// has gone round.
+func TestEncodeEndsOnPointerCycles(t *testing.T) {
+	t.Parallel()
+
+	const want = "schema: encountered a cycle via *schema.encodeNode"
+	check := func(name string, src any, round int) {
+		t.Helper()
+		dst := map[string][]string{}
+		err := NewEncoder().Encode(src, dst)
+		var cyc *cycleError
+		if !errors.As(err, &cyc) || err.Error() != want {
+			t.Errorf("%s: got error %v, want %s", name, err, want)
+		}
+		// The round is found before the way down is three times as deep as
+		// it is long, counted from where the trail starts, and a short one
+		// where it closes.
+		most := untrailed + 1 + 3*round
+		if round <= len(encodeTrail{}.last) {
+			most = untrailed + 1 + round
+		}
+		if got := len(dst["n"]); got < round || got > most {
+			t.Errorf("%s: encoded %d structs for a round of %d, want at most %d", name, got, round, most)
+		}
+	}
+	for _, size := range []int{1, 2, 3, 4, 5, 7, 16, 100} {
+		check(fmt.Sprintf("ring of %d", size), encodeChain(size, 0)[0], size)
+	}
+	// A round that the value given leads to but is not on, and one behind a
+	// struct given by value, which is a copy no pointer leads back to.
+	check("chain into a ring", encodeChain(12, 9)[0], 3)
+	check("chain into a long ring", encodeChain(90, 30)[0], 60)
+	check("by value", *encodeChain(3, 0)[0], 3)
+
+	// A pointer back from a struct held by value.
+	outer := &encodeOuter{O: 1}
+	outer.In.Up = outer
+	dst := map[string][]string{}
+	err := NewEncoder().Encode(outer, dst)
+	if cyc := new(*cycleError); !errors.As(err, cyc) || len(dst["o"]) > untrailed+4 {
+		t.Errorf("through a struct value: got %v after %d structs", err, len(dst["o"]))
+	}
+
+	// Every struct holds several pointers back: the first round found ends
+	// the call, where trying the other pointers too would take without end.
+	hubs := make([]*encodeHub, 6)
+	for i := range hubs {
+		hubs[i] = &encodeHub{N: i}
+	}
+	for i, h := range hubs {
+		h.A, h.B, h.C = hubs[(i+1)%len(hubs)], hubs[(i+2)%len(hubs)], hubs[(i+3)%len(hubs)]
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(hubs[0], dst); !errors.As(err, new(*cycleError)) || len(dst["n"]) > untrailed+1+3*len(hubs) {
+		t.Errorf("several pointers back: got %v after %d structs", err, len(dst["n"]))
+	}
+}
+
+// A struct that is held twice but does not hold itself is encoded twice, as it
+// always was, and a chain of pointers is encoded to its end, however long: on
+// the trail as well, which only the structs encode is inside of are on.
+func TestEncodeFollowsPointersThatDoNotLeadBack(t *testing.T) {
+	t.Parallel()
+
+	type pair struct {
+		A, B *encodeNode
+	}
+	shared := &encodeNode{N: 5}
+	dst := map[string][]string{}
+	if err := NewEncoder().Encode(&pair{A: shared, B: shared}, dst); err != nil || !reflect.DeepEqual(dst["n"], []string{"5", "5"}) {
+		t.Errorf("held twice: got %v, %v, want nil and two values", err, dst["n"])
+	}
+
+	// The same once the trail has started: a struct is off it again when
+	// encode has left it.
+	leaf := &encodeHub{N: -1}
+	top := &encodeHub{A: leaf, B: leaf, C: leaf}
+	for range untrailed + 2 {
+		top = &encodeHub{A: top}
+	}
+	dst = map[string][]string{}
+	err := NewEncoder().Encode(top, dst)
+	held := 0
+	for _, n := range dst["n"] {
+		if n == "-1" {
+			held++
+		}
+	}
+	if err != nil || held != 3 {
+		t.Errorf("held three times, deep: got %v and %d values, want nil and 3", err, held)
+	}
+
+	// A pointer to the first field of a struct on the trail has its address,
+	// but leads to another struct, which does not hold the one on the trail.
+	var holder *encodeHolder
+	for i := range untrailed + 3 {
+		holder = &encodeHolder{First: encodeFirst{N: i}, Down: holder}
+		holder.Self = &holder.First
+	}
+	dst = map[string][]string{}
+	if err := NewEncoder().Encode(holder, dst); err != nil || len(dst["n"]) != 2*(untrailed+3) {
+		t.Errorf("pointer to a first field: got %v and %d values, want nil and %d", err, len(dst["n"]), 2*(untrailed+3))
+	}
+
+	long := encodeChain(5000, -1)
+	enc := NewEncoder()
+	dst = map[string][]string{}
+	if err := enc.Encode(long[0], dst); err != nil || len(dst["n"]) != len(long) || dst["n"][len(long)-1] != "4999" {
+		t.Errorf("long chain: got %v and %d values, want nil and %d", err, len(dst["n"]), len(long))
+	}
+
+	// A round found leaves the encoder as it was.
+	if err := enc.Encode(encodeChain(2, 0)[0], map[string][]string{}); err == nil {
+		t.Error("ring: got no error")
+	}
+	dst = map[string][]string{}
+	if err := enc.Encode(&encodeNode{N: 7}, dst); err != nil || !reflect.DeepEqual(dst, map[string][]string{"n": {"7"}, "next": {"null"}}) {
+		t.Errorf("after a ring: got %v, %v", err, dst)
+	}
+}

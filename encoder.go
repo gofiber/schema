@@ -102,6 +102,11 @@ func NewEncoder() *Encoder {
 // Encode encodes a struct into map[string][]string.
 //
 // Intended for use with url.Values.
+//
+// A value in which a pointer leads back into a struct that holds it has no
+// encoding. Encode ends with an error once it finds that it is going round;
+// dst by then holds the values of the structs on the round, some of them more
+// than once.
 func (e *Encoder) Encode(src any, dst map[string][]string) (err error) {
 	if dst == nil {
 		return errNilDst
@@ -121,7 +126,7 @@ func (e *Encoder) Encode(src any, dst map[string][]string) (err error) {
 
 	v := reflect.ValueOf(src)
 
-	return e.encode(v, dst)
+	return e.encode(v, dst, 0, nil)
 }
 
 // RegisterEncoder registers a converter for encoding a custom type.
@@ -319,7 +324,99 @@ func isZero(v reflect.Value) bool {
 	return v.IsZero()
 }
 
-func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
+// cycleError is Encode's error for a pointer that leads back into a struct
+// being encoded. It ends the call, where other errors are collected: going on
+// would mean trying every other way round the same structs. encode panics
+// with it for Encode to recover, which keeps the way out off the loop every
+// struct is encoded by.
+type cycleError struct {
+	via reflect.Type // the type of the pointer
+}
+
+func (e *cycleError) Error() string {
+	return "schema: encountered a cycle via " + e.via.String()
+}
+
+// encodeTrail follows the structs encode is inside of and entered through a
+// pointer, in the order it entered them, once it is untrailed pointers deep.
+// Following a pointer back into one would go round without end, until the
+// stack ran out: a fatal error no recover catches. A struct that is held twice
+// but does not hold itself is off the trail by the second time, and is encoded
+// again, as it always was.
+//
+// The trail itself is not kept: comparing a pointer with all of it would cost
+// a long chain of pointers its length at every link. Kept are its last few
+// structs, which finds the short rounds where they close: a struct that points
+// to itself, or to the one that points to it. A longer round is found by the
+// mark, the struct at the last of the places 0, 1, 2, 4, 8 and so on of the
+// trail. A way down that goes round without end keeps repeating the same
+// structs, so it comes back to its mark once the next mark is further away
+// than the round is long, which is before the trail is three times as long as
+// it was where the round first closed.
+type encodeTrail struct {
+	n    int // how many structs are on the trail
+	mark walkedStruct
+	// last holds the last structs of the trail, the one at place i in
+	// last[i%len(last)], and zero values while the trail is shorter.
+	last [4]walkedStruct
+}
+
+// untrailed is how many struct pointers deep encode goes before it starts a
+// trail. Hardly any value is nested that deep, so hardly any pays for the
+// trail, and one that leads back into itself is that deep after a few rounds.
+const untrailed = 8
+
+// leadsBack reports whether a pointer to s leads back into the trail, as far
+// as the trail is kept.
+func (t *encodeTrail) leadsBack(s walkedStruct) bool {
+	return t.mark == s || t.last[0] == s || t.last[1] == s || t.last[2] == s || t.last[3] == s
+}
+
+// encodeBehind encodes the struct behind ptr, a pointer depth struct pointers
+// below the value Encode was given. Once there is a trail, the struct goes on
+// it for as long as encode is inside it, and a pointer that leads back into
+// the trail ends the call to Encode.
+func (e *Encoder) encodeBehind(ptr reflect.Value, dst map[string][]string, depth int, trail *encodeTrail) error {
+	if trail == nil {
+		if depth < untrailed {
+			return e.encode(ptr.Elem(), dst, depth+1, nil)
+		}
+		return e.encodeTrailed(ptr, dst, depth)
+	}
+	elem := ptr.Elem()
+	to := structAt(ptr.UnsafePointer(), elem.Type())
+	if trail.leadsBack(to) {
+		panic(&cycleError{via: ptr.Type()})
+	}
+	// It takes the place among the last few of the struct that leaves them
+	// with it, which gets the place back afterwards.
+	at, mark := trail.n, trail.mark
+	last := &trail.last[at%len(trail.last)]
+	left := *last
+	*last, trail.n = to, at+1
+	if at&(at-1) == 0 {
+		trail.mark = to
+	}
+	err := e.encode(elem, dst, depth+1, trail)
+	*last, trail.n, trail.mark = left, at, mark
+	return err
+}
+
+// encodeTrailed is encodeBehind where the trail starts. The trail is a
+// variable of this function and not of one that every struct or every pointer
+// goes through, which would clear room for it each time; inlined, it would be
+// one again.
+//
+//go:noinline
+func (e *Encoder) encodeTrailed(ptr reflect.Value, dst map[string][]string, depth int) error {
+	var trail encodeTrail
+	return e.encodeBehind(ptr, dst, depth, &trail)
+}
+
+// encode encodes the struct v, or the one v points to, into dst. depth is how
+// many struct pointers were followed to reach it, and trail is nil until the
+// trail starts.
+func (e *Encoder) encode(v reflect.Value, dst map[string][]string, depth int, trail *encodeTrail) error {
 	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
@@ -370,7 +467,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 
 		// Encode struct pointer types if the field is a valid pointer and a struct.
 		if f.recurseStructPtr && !fieldValue.IsNil() {
-			if err := e.encode(fieldValue.Elem(), dst); err != nil {
+			if err := e.encodeBehind(fieldValue, dst, depth, trail); err != nil {
 				errs = setError(errs, fieldValue.Elem().Type().String(), err)
 			}
 			continue
@@ -395,7 +492,7 @@ func (e *Encoder) encode(v reflect.Value, dst map[string][]string) error {
 		}
 
 		if f.isStruct {
-			if err := e.encode(fieldValue, dst); err != nil {
+			if err := e.encode(fieldValue, dst, depth, trail); err != nil {
 				errs = setError(errs, fieldValue.Type().String(), err)
 			}
 			continue
