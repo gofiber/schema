@@ -360,9 +360,10 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 	var errs MultiError
 
 	// Allocate nil anonymous embedded pointer fields so their promoted
-	// fields stay reachable.
+	// fields stay reachable. One that cannot be set, as in a struct held by
+	// an unexported named field, stays nil: Set would panic.
 	for _, chain := range struc.defaults.allocs {
-		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() {
+		if field, _ := walkIndexChain(v, chain, nil); field.IsValid() && field.IsNil() && field.CanSet() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
 	}
@@ -401,6 +402,11 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			continue
 		}
 		kind := f.typ.Kind()
+		// A field that cannot be set, as an unexported one, or one of a
+		// struct held by an unexported named field, keeps its zero value, as
+		// it does when a key names it: Set would panic. Only the errors of
+		// its default are reported.
+		settable := vCurrent.CanSet()
 		// The default itself was resolved when the metadata was built; see
 		// resolveDefault. Only the per-call parts remain: the errors a kind
 		// that takes no default reports, and a fresh pointer or slice so no
@@ -416,6 +422,9 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			if def.err != nil {
 				errs = appendError(errs, "default-"+f.name, def.err)
 			}
+			if !settable {
+				continue
+			}
 			fresh := reflect.MakeSlice(f.typ, def.slice.Len(), def.slice.Cap())
 			reflect.Copy(fresh, def.slice)
 			vCurrent.Set(fresh)
@@ -424,7 +433,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 			if t1.Kind() == reflect.Struct || t1.Kind() == reflect.Slice {
 				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
 			}
-			if def.val.IsValid() {
+			if def.val.IsValid() && settable {
 				// *elem is assignable to the field even when the field's
 				// type is itself a named pointer type (type MyIntPtr *MyInt),
 				// where converting a *int directly would panic.
@@ -435,7 +444,7 @@ func (d *Decoder) setDefaults(t reflect.Type, v reflect.Value, src *source, pref
 		default:
 			if getBuiltinConverter(kind) == nil {
 				errs = appendError(errs, "default-"+f.name, errUnsupportedDefault)
-			} else if def.val.IsValid() {
+			} else if def.val.IsValid() && settable {
 				vCurrent.Set(def.val)
 			}
 		}
@@ -879,8 +888,9 @@ func isMultipartField(typ reflect.Type) bool {
 
 // walkHops follows a path to the target field, dereferencing pointers and
 // allocating the embedded pointers promoted fields need on the way. It
-// returns the zero Value when an unsettable nil embedded pointer blocks the
-// walk, and an error once the call's allocation budget is spent.
+// returns the zero Value when a nil pointer that cannot be set, named or
+// embedded, blocks the walk, and an error once the call's allocation budget
+// is spent.
 func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value, error) {
 	var err error
 	for _, hop := range hops {
@@ -891,6 +901,11 @@ func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value
 		}
 		if v.Kind() == reflect.Pointer {
 			if v.IsNil() {
+				// An unexported struct pointer cannot be allocated: Set would
+				// panic, so what a key names below it is unreachable.
+				if !v.CanSet() {
+					return reflect.Value{}, nil
+				}
 				if err = grow.alloc(v, v.Type().Elem()); err != nil {
 					return v, err
 				}
@@ -901,6 +916,10 @@ func walkHops(v reflect.Value, hops []pathHop, grow *growTracker) (reflect.Value
 		// Allocate embedded anonymous pointers required for promoted fields.
 		for _, idx := range hop.ensure {
 			if f := v.Field(idx); f.IsNil() {
+				// Below an unexported named pointer the caller set, nothing is settable.
+				if !f.CanSet() {
+					return reflect.Value{}, nil
+				}
 				if err = grow.alloc(f, f.Type().Elem()); err != nil {
 					return v, err
 				}
